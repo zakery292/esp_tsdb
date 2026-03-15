@@ -113,22 +113,25 @@ esp_err_t tsdb_write(uint32_t timestamp, const int16_t *values) {
     esp_err_t ret = tsdb_read_block(g_state.file, block_num, block);
 
     // Initialize block if new or read failed
-    if (ret != ESP_OK || block->block_magic != 0x424C4B54) {
+    uint8_t *raw_blk = (uint8_t *)block;
+    if (ret != ESP_OK || TSDB_BLOCK_MAGIC(raw_blk) != 0x424C4B54) {
         ESP_LOGD(TAG, "Initializing new block %lu", (unsigned long)block_num);
-        memset(block, 0, sizeof(tsdb_block_t));
-        block->block_magic = 0x424C4B54;  // "BLKT"
-        block->record_count = 0;
+        memset(block, 0, TSDB_BLOCK_SIZE);
+        TSDB_BLOCK_MAGIC(raw_blk) = 0x424C4B54;  // "BLKT"
+        TSDB_BLOCK_COUNT(raw_blk) = 0;
     }
 
-    // Write data in columnar format
-    block->timestamps[offset_in_block] = timestamp;
+    // Write data in columnar format (runtime offsets for correct disk layout)
+    uint16_t rpb = g_state.header.records_per_block;
+    uint8_t *raw = (uint8_t *)block;
+    TSDB_BLOCK_TS(raw, offset_in_block) = timestamp;
     for (uint8_t i = 0; i < g_state.header.num_params; i++) {
-        block->params[i][offset_in_block] = values[i];
+        TSDB_BLOCK_PARAM(raw, rpb, i, offset_in_block) = values[i];
     }
 
     // Update block record count
-    if (offset_in_block >= block->record_count) {
-        block->record_count = offset_in_block + 1;
+    if (offset_in_block >= TSDB_BLOCK_COUNT(raw)) {
+        TSDB_BLOCK_COUNT(raw) = offset_in_block + 1;
     }
 
     // Write block back to file
@@ -177,7 +180,7 @@ esp_err_t tsdb_write(uint32_t timestamp, const int16_t *values) {
         }
 
         if (tsdb_read_block(g_state.file, oldest_block, oldest_block_data) == ESP_OK) {
-            g_state.header.oldest_timestamp = oldest_block_data->timestamps[oldest_offset];
+            g_state.header.oldest_timestamp = TSDB_BLOCK_TS((uint8_t *)oldest_block_data, oldest_offset);
         }
     } else if (g_state.header.total_records == 1) {
         g_state.header.oldest_timestamp = timestamp;

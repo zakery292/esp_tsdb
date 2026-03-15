@@ -127,11 +127,11 @@ esp_err_t tsdb_query_next(tsdb_query_t *query,
 
             ESP_LOGD(TAG, "Loaded block %lu: %d records",
                      (unsigned long)query->current_block_num,
-                     query->block_buffer->record_count);
+                     TSDB_BLOCK_COUNT((uint8_t *)query->block_buffer));
         }
 
         // Check if we've exhausted this block
-        if (query->offset_in_block >= query->block_buffer->record_count) {
+        if (query->offset_in_block >= TSDB_BLOCK_COUNT((uint8_t *)query->block_buffer)) {
             // Move to next block
             query->current_block_num++;
             query->block_loaded = false;
@@ -151,7 +151,9 @@ esp_err_t tsdb_query_next(tsdb_query_t *query,
         }
 
         // Read timestamp from current position
-        uint32_t ts = query->block_buffer->timestamps[query->offset_in_block];
+        uint8_t *qraw = (uint8_t *)query->block_buffer;
+        uint16_t qrpb = query->header.records_per_block;
+        uint32_t ts = TSDB_BLOCK_TS(qraw, query->offset_in_block);
 
         // Advance position
         query->offset_in_block++;
@@ -193,7 +195,7 @@ esp_err_t tsdb_query_next(tsdb_query_t *query,
             for (uint8_t i = 0; i < query->num_params_to_fetch; i++) {
                 uint8_t param_idx = query->param_indices[i];
                 if (param_idx < query->header.num_params) {
-                    values[i] = query->block_buffer->params[param_idx][query->offset_in_block - 1];
+                    values[i] = TSDB_BLOCK_PARAM(qraw, qrpb, param_idx, query->offset_in_block - 1);
                 } else if (g_state.extra_param_count > 0 &&
                            param_idx < (query->header.num_params + g_state.extra_param_count) &&
                            abs_record_idx >= g_state.first_overflow_record_idx) {

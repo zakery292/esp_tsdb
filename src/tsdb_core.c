@@ -150,13 +150,14 @@ static esp_err_t tsdb_reconstruct_header(FILE *file, tsdb_header_t *header,
         }
 
         // Check if block is valid
-        if (block.block_magic != 0x424C4B54 || block.record_count == 0) {
+        uint8_t *rraw = (uint8_t *)&block;
+        if (TSDB_BLOCK_MAGIC(rraw) != 0x424C4B54 || TSDB_BLOCK_COUNT(rraw) == 0) {
             continue;
         }
 
         // Scan records in this block
-        for (uint16_t i = 0; i < block.record_count && i < header->records_per_block; i++) {
-            uint32_t ts = block.timestamps[i];
+        for (uint16_t i = 0; i < TSDB_BLOCK_COUNT(rraw) && i < header->records_per_block; i++) {
+            uint32_t ts = TSDB_BLOCK_TS(rraw, i);
 
             if (ts == 0) continue;  // Skip empty records
 
@@ -350,6 +351,74 @@ esp_err_t tsdb_init(const tsdb_config_t *config) {
                 ESP_LOGW(TAG, "Parameter count mismatch: file has %d, config has %d",
                          g_state.header.num_params, config->num_params);
                 // Allow opening but warn
+            }
+
+            // V2->V3 block layout migration: fix databases where records_per_block > 38
+            // V2 used struct-based offsets (timestamps[38], params[16][38]) which are wrong
+            // when records_per_block > 38. V3 uses runtime-calculated offsets.
+            if (g_state.header.version < 3 && g_state.header.records_per_block > 38) {
+                ESP_LOGW(TAG, "Migrating V2 block layout (rpb=%d) to V3",
+                         g_state.header.records_per_block);
+
+                uint16_t rpb = g_state.header.records_per_block;
+                uint8_t np = g_state.header.num_params;
+                uint32_t total_blocks = (g_state.header.max_records + rpb - 1) / rpb;
+
+                // Old struct-based offsets
+                #define OLD_TS_OFFSET(r)       (8 + (r) * 4)
+                #define OLD_PARAM_OFFSET(p, r) (160 + (p) * 76 + (r) * 2)
+
+                uint8_t disk_block[TSDB_BLOCK_SIZE];
+                uint8_t new_block[TSDB_BLOCK_SIZE];
+
+                for (uint32_t b = 0; b < total_blocks; b++) {
+                    uint32_t blk_offset = tsdb_calc_block_offset(&g_state.header, b);
+                    fseek(g_state.file, blk_offset, SEEK_SET);
+                    if (fread(disk_block, TSDB_BLOCK_SIZE, 1, g_state.file) != 1) continue;
+                    if (TSDB_BLOCK_MAGIC(disk_block) != 0x424C4B54) continue;
+
+                    uint16_t count = TSDB_BLOCK_COUNT(disk_block);
+                    if (count == 0) continue;
+
+                    memset(new_block, 0, TSDB_BLOCK_SIZE);
+                    TSDB_BLOCK_MAGIC(new_block) = 0x424C4B54;
+                    TSDB_BLOCK_COUNT(new_block) = count;
+
+                    for (uint16_t r = 0; r < count && r < rpb; r++) {
+                        // Timestamps at same offset in both layouts
+                        TSDB_BLOCK_TS(new_block, r) = *(uint32_t*)(disk_block + OLD_TS_OFFSET(r));
+
+                        for (uint8_t p = 0; p < np; p++) {
+                            uint32_t old_off = OLD_PARAM_OFFSET(p, r);
+                            int16_t val = (old_off + 2 <= TSDB_BLOCK_SIZE) ?
+                                          *(int16_t*)(disk_block + old_off) : 0;
+                            TSDB_BLOCK_PARAM(new_block, rpb, p, r) = val;
+                        }
+                    }
+
+                    fseek(g_state.file, blk_offset, SEEK_SET);
+                    fwrite(new_block, TSDB_BLOCK_SIZE, 1, g_state.file);
+
+                    if (b % 100 == 0 && b > 0) {
+                        ESP_LOGI(TAG, "  Block migration: %lu / %lu",
+                                 (unsigned long)b, (unsigned long)total_blocks);
+                    }
+                }
+
+                #undef OLD_TS_OFFSET
+                #undef OLD_PARAM_OFFSET
+
+                fflush(g_state.file);
+                fsync(fileno(g_state.file));
+
+                g_state.header.version = 3;
+                tsdb_write_header(g_state.file, &g_state.header);
+                ESP_LOGI(TAG, "V2->V3 block layout migration complete (%lu blocks)",
+                         (unsigned long)total_blocks);
+            } else if (g_state.header.version < 3) {
+                // No migration needed (rpb <= 38), just bump version
+                g_state.header.version = 3;
+                tsdb_write_header(g_state.file, &g_state.header);
             }
 
             // Load overflow state from header

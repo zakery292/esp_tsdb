@@ -24,7 +24,7 @@ extern "C" {
 
 #define TSDB_MAX_PARAMS 64          // Maximum parameters supported
 #define TSDB_MAGIC 0x45545344       // "ETSD" (ESP Time-Series DB)
-#define TSDB_VERSION 2              // File format version
+#define TSDB_VERSION 3              // File format version
 #define TSDB_BLOCK_SIZE 1024        // Block size in bytes
 #define TSDB_OVERFLOW_MAGIC 0x4F564652  // "OVFR"
 #define TSDB_MAX_EXTRA_PARAMS 48
@@ -206,6 +206,23 @@ typedef struct {
     // Note: Actual usable records_per_block calculated at init based on num_params
     // This structure is sized for worst case (max params)
 } __attribute__((packed)) tsdb_block_t;
+
+/**
+ * @brief Runtime block access macros
+ *
+ * The tsdb_block_t struct is used as a memory buffer only.
+ * These macros calculate correct byte offsets for the on-disk
+ * columnar layout based on actual records_per_block.
+ */
+#define TSDB_BLOCK_HEADER_SIZE 8  // magic(4) + record_count(2) + flags(2)
+
+// Access block fields from raw buffer
+#define TSDB_BLOCK_MAGIC(buf)         (*(uint32_t*)(buf))
+#define TSDB_BLOCK_COUNT(buf)         (*(uint16_t*)((uint8_t*)(buf) + 4))
+#define TSDB_BLOCK_FLAGS(buf)         (*(uint16_t*)((uint8_t*)(buf) + 6))
+#define TSDB_BLOCK_TS(buf, rec)       (*(uint32_t*)((uint8_t*)(buf) + 8 + (rec) * 4))
+#define TSDB_BLOCK_PARAM(buf, rpb, param_idx, rec) \
+    (*(int16_t*)((uint8_t*)(buf) + 8 + (rpb) * 4 + (param_idx) * (rpb) * 2 + (rec) * 2))
 
 // ============================================================================
 // QUERY OPERATIONS
