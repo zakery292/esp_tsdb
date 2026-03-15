@@ -116,7 +116,8 @@ static esp_err_t tsdb_reconstruct_header(FILE *file, tsdb_header_t *header,
     header->max_records = config->max_records;
     header->index_stride = config->index_stride > 0 ? config->index_stride : 380;
     header->index_offset = 512;
-    header->index_entries = (config->max_records / header->index_stride) + 1;
+    header->index_entries = config->max_records > 0 ?
+        (config->max_records / header->index_stride) + 1 : 256;
 
     // Copy parameter names
     if (config->param_names) {
@@ -362,7 +363,9 @@ esp_err_t tsdb_init(const tsdb_config_t *config) {
 
                 uint16_t rpb = g_state.header.records_per_block;
                 uint8_t np = g_state.header.num_params;
-                uint32_t total_blocks = (g_state.header.max_records + rpb - 1) / rpb;
+                uint32_t max_recs = g_state.header.max_records > 0 ?
+                    g_state.header.max_records : g_state.header.total_records;
+                uint32_t total_blocks = (max_recs + rpb - 1) / rpb;
 
                 // Old struct-based offsets
                 #define OLD_TS_OFFSET(r)       (8 + (r) * 4)
@@ -473,7 +476,8 @@ esp_err_t tsdb_init(const tsdb_config_t *config) {
 
         // Calculate index offset (right after 512-byte header)
         g_state.header.index_offset = 512;
-        g_state.header.index_entries = (config->max_records / g_state.header.index_stride) + 1;
+        g_state.header.index_entries = config->max_records > 0 ?
+            (config->max_records / g_state.header.index_stride) + 1 : 256;  // 256 default for unlimited
 
         ESP_LOGI(TAG, "Index: %lu entries, stride=%lu",
                  (unsigned long)g_state.header.index_entries,
@@ -558,7 +562,8 @@ esp_err_t tsdb_get_stats(tsdb_stats_t *stats) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    stats->total_records = (g_state.header.total_records < g_state.header.max_records) ?
+    stats->total_records = (g_state.header.max_records == 0 ||
+                            g_state.header.total_records < g_state.header.max_records) ?
                            g_state.header.total_records : g_state.header.max_records;
     stats->max_records = g_state.header.max_records;
     stats->oldest_timestamp = g_state.header.oldest_timestamp;

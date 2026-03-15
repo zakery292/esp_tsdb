@@ -84,12 +84,15 @@ esp_err_t tsdb_query_init(tsdb_query_t *query,
     }
 
     // Calculate record index range
-    uint32_t available_records = (query->header.total_records < query->header.max_records) ?
-                                 query->header.total_records : query->header.max_records;
+    bool unlimited = (query->header.max_records == 0);
+    uint32_t available_records = unlimited ? query->header.total_records :
+                                 ((query->header.total_records < query->header.max_records) ?
+                                  query->header.total_records : query->header.max_records);
 
     query->current_record_idx = query->header.oldest_record_idx;
-    query->end_record_idx = (query->header.oldest_record_idx + available_records) %
-                           query->header.max_records;
+    query->end_record_idx = unlimited ? available_records :
+                           ((query->header.oldest_record_idx + available_records) %
+                            query->header.max_records);
 
     query->offset_in_block = 0;
     query->block_loaded = false;
@@ -139,8 +142,10 @@ esp_err_t tsdb_query_next(tsdb_query_t *query,
 
             // Check if we've scanned all available records
             uint32_t total_scanned = query->current_record_idx - query->header.oldest_record_idx;
-            uint32_t available = (query->header.total_records < query->header.max_records) ?
-                                query->header.total_records : query->header.max_records;
+            bool q_unlimited = (query->header.max_records == 0);
+            uint32_t available = q_unlimited ? query->header.total_records :
+                                ((query->header.total_records < query->header.max_records) ?
+                                 query->header.total_records : query->header.max_records);
 
             if (total_scanned >= available) {
                 ESP_LOGD(TAG, "Scanned all available records");
@@ -186,8 +191,10 @@ esp_err_t tsdb_query_next(tsdb_query_t *query,
             // Calculate absolute record index for overflow lookups
             uint32_t abs_record_idx = 0;
             if (need_overflow && g_state.extra_param_count > 0) {
-                uint32_t available = (query->header.total_records < query->header.max_records) ?
-                                     query->header.total_records : query->header.max_records;
+                bool ovf_unlimited = (query->header.max_records == 0);
+                uint32_t available = ovf_unlimited ? query->header.total_records :
+                                     ((query->header.total_records < query->header.max_records) ?
+                                      query->header.total_records : query->header.max_records);
                 abs_record_idx = (query->header.total_records - available) +
                                  (query->current_record_idx - 1 - query->header.oldest_record_idx);
             }

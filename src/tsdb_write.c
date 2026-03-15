@@ -76,11 +76,13 @@ esp_err_t tsdb_write(uint32_t timestamp, const int16_t *values) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    // Calculate record index in ring buffer
-    uint32_t record_idx = g_state.header.total_records % g_state.header.max_records;
+    // Calculate record index (ring buffer or unlimited)
+    bool unlimited = (g_state.header.max_records == 0);
+    uint32_t record_idx = unlimited ? g_state.header.total_records :
+                          (g_state.header.total_records % g_state.header.max_records);
 
-    // Determine if this overwrites old data (LRU eviction)
-    bool is_eviction = (g_state.header.total_records >= g_state.header.max_records);
+    // Determine if this overwrites old data (LRU eviction) — never in unlimited mode
+    bool is_eviction = (!unlimited && g_state.header.total_records >= g_state.header.max_records);
 
     if (is_eviction) {
         g_state.header.total_evictions++;
