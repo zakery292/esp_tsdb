@@ -291,22 +291,22 @@ tsdb_t *tsdb_open(const tsdb_config_t *config) {
              db->stream_buffer_offset,
              db->stream_buffer_size);
 
-    // Check if file exists
-    struct stat st;
-    bool file_exists = (stat(config->filepath, &st) == 0);
+    // Check if file exists by trying to open it for read+write. stat() is
+    // unreliable on esp_littlefs (joltwallet) — empirical test on 1.21.1
+    // showed stat() returning ENOENT for files that fopen("rb") successfully
+    // reads bytes back from. Falling back to stat() here would have us call
+    // fopen("w+b") on existing files, truncating them on every boot.
+    bool file_exists = false;
     bool db_opened_successfully = false;
 
-    if (file_exists) {
-        // Open existing file
+    db->file = fopen(config->filepath, "r+b");
+    if (db->file != NULL) {
+        file_exists = true;
         ESP_LOGI(TAG, "Opening existing database file");
-        db->file = fopen(config->filepath, "r+b");
-        if (db->file == NULL) {
-            ESP_LOGE(TAG, "Failed to open existing file");
-            tsdb_free_buffer_pool(&db->pool);
-            vSemaphoreDelete(db->mutex);
-            free(db);
-            return NULL;
-        }
+    }
+
+    if (file_exists) {
+        // db->file is already set above
 
         // Read and validate header
         bool needs_reconstruction = false;
