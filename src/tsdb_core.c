@@ -5,6 +5,7 @@
 
 #include "tsdb_internal.h"
 #include "esp_log.h"
+#include <stdlib.h>
 #include <string.h>
 #include <stddef.h>
 #include <sys/stat.h>
@@ -13,8 +14,9 @@
 
 static const char *TAG = "TSDB_CORE";
 
-// Global state
-tsdb_state_t g_state = {0};
+// Legacy single-DB handle backing the v2 global API. Allocated on the first
+// tsdb_init() call; freed by tsdb_close().
+tsdb_t *g_default_handle = NULL;
 
 // ============================================================================
 // INTERNAL HELPERS
@@ -218,29 +220,36 @@ static esp_err_t tsdb_reconstruct_header(FILE *file, tsdb_header_t *header,
 }
 
 // ============================================================================
-// PUBLIC API
+// HANDLE LIFECYCLE
 // ============================================================================
 
-esp_err_t tsdb_init(const tsdb_config_t *config) {
-    // Validation
+tsdb_t *tsdb_open(const tsdb_config_t *config) {
     if (config == NULL || config->filepath == NULL) {
         ESP_LOGE(TAG, "Invalid config");
-        return ESP_ERR_INVALID_ARG;
+        return NULL;
     }
 
     if (config->num_params == 0 || config->num_params > 16) {
         ESP_LOGE(TAG, "Invalid num_params: %d (must be 1-16)", config->num_params);
-        return ESP_ERR_INVALID_ARG;
+        return NULL;
     }
 
     if (config->buffer_pool_size == 0) {
         ESP_LOGE(TAG, "buffer_pool_size must be > 0");
-        return ESP_ERR_INVALID_ARG;
+        return NULL;
     }
 
-    if (g_state.is_open) {
-        ESP_LOGW(TAG, "Already initialized");
-        return ESP_OK;
+    tsdb_t *db = (tsdb_t *)calloc(1, sizeof(tsdb_t));
+    if (db == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate handle");
+        return NULL;
+    }
+
+    db->mutex = xSemaphoreCreateMutex();
+    if (db->mutex == NULL) {
+        ESP_LOGE(TAG, "Failed to create handle mutex");
+        free(db);
+        return NULL;
     }
 
     ESP_LOGI(TAG, "Initializing TSDB: %s", config->filepath);
@@ -249,88 +258,94 @@ esp_err_t tsdb_init(const tsdb_config_t *config) {
              config->buffer_pool_size / 1024);
 
     // Allocate buffer pool
-    esp_err_t ret = tsdb_alloc_buffer_pool(&g_state.pool,
+    esp_err_t ret = tsdb_alloc_buffer_pool(&db->pool,
                                            config->buffer_pool_size,
                                            config->use_paged_allocation,
                                            config->page_size,
                                            config->alloc_strategy);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to allocate buffer pool");
-        return ret;
+        vSemaphoreDelete(db->mutex);
+        free(db);
+        return NULL;
     }
 
     // Partition buffer pool into logical regions
     size_t offset = 0;
-    g_state.read_buffer_offset = offset;
+    db->read_buffer_offset = offset;
     offset += TSDB_BLOCK_SIZE;
 
-    g_state.write_cache_offset = offset;
+    db->write_cache_offset = offset;
     offset += TSDB_BLOCK_SIZE;
 
-    g_state.query_buffer_offset = offset;
+    db->query_buffer_offset = offset;
     offset += TSDB_BLOCK_SIZE;
 
-    g_state.stream_buffer_offset = offset;
-    g_state.stream_buffer_size = g_state.pool.total_size - offset;
+    db->stream_buffer_offset = offset;
+    db->stream_buffer_size = db->pool.total_size - offset;
 
     ESP_LOGI(TAG, "Buffer regions: read=%d, write=%d, query=%d, stream=%d (%d bytes)",
-             g_state.read_buffer_offset,
-             g_state.write_cache_offset,
-             g_state.query_buffer_offset,
-             g_state.stream_buffer_offset,
-             g_state.stream_buffer_size);
+             db->read_buffer_offset,
+             db->write_cache_offset,
+             db->query_buffer_offset,
+             db->stream_buffer_offset,
+             db->stream_buffer_size);
 
-    // Check if file exists
-    struct stat st;
-    bool file_exists = (stat(config->filepath, &st) == 0);
+    // Check if file exists by trying to open it for read+write. stat() is
+    // unreliable on esp_littlefs (joltwallet) — empirical test on 1.21.1
+    // showed stat() returning ENOENT for files that fopen("rb") successfully
+    // reads bytes back from. Falling back to stat() here would have us call
+    // fopen("w+b") on existing files, truncating them on every boot.
+    bool file_exists = false;
     bool db_opened_successfully = false;
 
-    if (file_exists) {
-        // Open existing file
+    db->file = fopen(config->filepath, "r+b");
+    if (db->file != NULL) {
+        file_exists = true;
         ESP_LOGI(TAG, "Opening existing database file");
-        g_state.file = fopen(config->filepath, "r+b");
-        if (g_state.file == NULL) {
-            ESP_LOGE(TAG, "Failed to open existing file");
-            tsdb_free_buffer_pool(&g_state.pool);
-            return ESP_FAIL;
-        }
+    }
+
+    if (file_exists) {
+        // db->file is already set above
 
         // Read and validate header
         bool needs_reconstruction = false;
 
-        if (tsdb_read_header(g_state.file, &g_state.header) != ESP_OK) {
+        if (tsdb_read_header(db->file, &db->header) != ESP_OK) {
             ESP_LOGW(TAG, "Failed to read header - will attempt reconstruction");
             needs_reconstruction = true;
-        } else if (g_state.header.magic != TSDB_MAGIC) {
+        } else if (db->header.magic != TSDB_MAGIC) {
             ESP_LOGW(TAG, "Invalid magic number: 0x%08lX (expected 0x%08X) - will attempt reconstruction",
-                     (unsigned long)g_state.header.magic, TSDB_MAGIC);
+                     (unsigned long)db->header.magic, TSDB_MAGIC);
             needs_reconstruction = true;
         }
 
         if (needs_reconstruction) {
             // Check file size - if too small, delete and recreate
-            fseek(g_state.file, 0, SEEK_END);
-            long file_size = ftell(g_state.file);
+            fseek(db->file, 0, SEEK_END);
+            long file_size = ftell(db->file);
 
             if (file_size < 512) {
                 ESP_LOGW(TAG, "File too small (%ld bytes) - deleting and recreating", file_size);
-                fclose(g_state.file);
+                fclose(db->file);
                 unlink(config->filepath);
                 file_exists = false;
             } else {
                 // Attempt to reconstruct header from data blocks
-                if (tsdb_reconstruct_header(g_state.file, &g_state.header, config) != ESP_OK) {
+                if (tsdb_reconstruct_header(db->file, &db->header, config) != ESP_OK) {
                     ESP_LOGE(TAG, "Header reconstruction failed - deleting and recreating");
-                    fclose(g_state.file);
+                    fclose(db->file);
                     unlink(config->filepath);
                     file_exists = false;
                 } else {
                     // Write reconstructed header to disk
-                    if (tsdb_write_header(g_state.file, &g_state.header) != ESP_OK) {
+                    if (tsdb_write_header(db->file, &db->header) != ESP_OK) {
                         ESP_LOGE(TAG, "Failed to write reconstructed header");
-                        fclose(g_state.file);
-                        tsdb_free_buffer_pool(&g_state.pool);
-                        return ESP_FAIL;
+                        fclose(db->file);
+                        tsdb_free_buffer_pool(&db->pool);
+                        vSemaphoreDelete(db->mutex);
+                        free(db);
+                        return NULL;
                     }
 
                     ESP_LOGI(TAG, "Header successfully reconstructed and saved");
@@ -344,27 +359,27 @@ esp_err_t tsdb_init(const tsdb_config_t *config) {
 
         if (db_opened_successfully) {
             // V1 backward compatibility: base_params was reserved (0)
-            if (g_state.header.base_params == 0) {
-                g_state.header.base_params = g_state.header.num_params;
+            if (db->header.base_params == 0) {
+                db->header.base_params = db->header.num_params;
             }
 
-            if (g_state.header.num_params != config->num_params) {
+            if (db->header.num_params != config->num_params) {
                 ESP_LOGW(TAG, "Parameter count mismatch: file has %d, config has %d",
-                         g_state.header.num_params, config->num_params);
+                         db->header.num_params, config->num_params);
                 // Allow opening but warn
             }
 
             // V2->V3 block layout migration: fix databases where records_per_block > 38
             // V2 used struct-based offsets (timestamps[38], params[16][38]) which are wrong
             // when records_per_block > 38. V3 uses runtime-calculated offsets.
-            if (g_state.header.version < 3 && g_state.header.records_per_block > 38) {
+            if (db->header.version < 3 && db->header.records_per_block > 38) {
                 ESP_LOGW(TAG, "Migrating V2 block layout (rpb=%d) to V3",
-                         g_state.header.records_per_block);
+                         db->header.records_per_block);
 
-                uint16_t rpb = g_state.header.records_per_block;
-                uint8_t np = g_state.header.num_params;
-                uint32_t max_recs = g_state.header.max_records > 0 ?
-                    g_state.header.max_records : g_state.header.total_records;
+                uint16_t rpb = db->header.records_per_block;
+                uint8_t np = db->header.num_params;
+                uint32_t max_recs = db->header.max_records > 0 ?
+                    db->header.max_records : db->header.total_records;
                 uint32_t total_blocks = (max_recs + rpb - 1) / rpb;
 
                 // Old struct-based offsets
@@ -375,9 +390,9 @@ esp_err_t tsdb_init(const tsdb_config_t *config) {
                 uint8_t new_block[TSDB_BLOCK_SIZE];
 
                 for (uint32_t b = 0; b < total_blocks; b++) {
-                    uint32_t blk_offset = tsdb_calc_block_offset(&g_state.header, b);
-                    fseek(g_state.file, blk_offset, SEEK_SET);
-                    if (fread(disk_block, TSDB_BLOCK_SIZE, 1, g_state.file) != 1) continue;
+                    uint32_t blk_offset = tsdb_calc_block_offset(&db->header, b);
+                    fseek(db->file, blk_offset, SEEK_SET);
+                    if (fread(disk_block, TSDB_BLOCK_SIZE, 1, db->file) != 1) continue;
                     if (TSDB_BLOCK_MAGIC(disk_block) != 0x424C4B54) continue;
 
                     uint16_t count = TSDB_BLOCK_COUNT(disk_block);
@@ -399,8 +414,8 @@ esp_err_t tsdb_init(const tsdb_config_t *config) {
                         }
                     }
 
-                    fseek(g_state.file, blk_offset, SEEK_SET);
-                    fwrite(new_block, TSDB_BLOCK_SIZE, 1, g_state.file);
+                    fseek(db->file, blk_offset, SEEK_SET);
+                    fwrite(new_block, TSDB_BLOCK_SIZE, 1, db->file);
 
                     if (b % 100 == 0 && b > 0) {
                         ESP_LOGI(TAG, "  Block migration: %lu / %lu",
@@ -411,34 +426,34 @@ esp_err_t tsdb_init(const tsdb_config_t *config) {
                 #undef OLD_TS_OFFSET
                 #undef OLD_PARAM_OFFSET
 
-                fflush(g_state.file);
-                fsync(fileno(g_state.file));
+                fflush(db->file);
+                fsync(fileno(db->file));
 
-                g_state.header.version = 3;
-                tsdb_write_header(g_state.file, &g_state.header);
+                db->header.version = 3;
+                tsdb_write_header(db->file, &db->header);
                 ESP_LOGI(TAG, "V2->V3 block layout migration complete (%lu blocks)",
                          (unsigned long)total_blocks);
-            } else if (g_state.header.version < 3) {
+            } else if (db->header.version < 3) {
                 // No migration needed (rpb <= 38), just bump version
-                g_state.header.version = 3;
-                tsdb_write_header(g_state.file, &g_state.header);
+                db->header.version = 3;
+                tsdb_write_header(db->file, &db->header);
             }
 
             // Load overflow state from header
-            if (g_state.header.extra_param_count > 0 && g_state.header.overflow_offset > 0) {
-                g_state.extra_param_count = g_state.header.extra_param_count;
-                g_state.overflow_record_size = g_state.header.overflow_record_size;
-                g_state.first_overflow_record_idx = g_state.header.first_overflow_record_idx;
-                g_state.overflow_data_offset = g_state.header.overflow_offset + TSDB_OVERFLOW_HEADER_SIZE;
+            if (db->header.extra_param_count > 0 && db->header.overflow_offset > 0) {
+                db->extra_param_count = db->header.extra_param_count;
+                db->overflow_record_size = db->header.overflow_record_size;
+                db->first_overflow_record_idx = db->header.first_overflow_record_idx;
+                db->overflow_data_offset = db->header.overflow_offset + TSDB_OVERFLOW_HEADER_SIZE;
                 ESP_LOGI(TAG, "Overflow active: %d extra params, first_idx=%lu",
-                         g_state.extra_param_count,
-                         (unsigned long)g_state.first_overflow_record_idx);
+                         db->extra_param_count,
+                         (unsigned long)db->first_overflow_record_idx);
             }
 
             ESP_LOGI(TAG, "Opened existing database: %lu records, %lu writes, %lu evictions",
-                     (unsigned long)g_state.header.total_records,
-                     (unsigned long)g_state.header.total_writes,
-                     (unsigned long)g_state.header.total_evictions);
+                     (unsigned long)db->header.total_records,
+                     (unsigned long)db->header.total_writes,
+                     (unsigned long)db->header.total_evictions);
         }
     }
 
@@ -446,115 +461,160 @@ esp_err_t tsdb_init(const tsdb_config_t *config) {
     if (!file_exists || !db_opened_successfully) {
         // Create new file
         ESP_LOGI(TAG, "Creating new database file");
-        g_state.file = fopen(config->filepath, "w+b");
-        if (g_state.file == NULL) {
+        db->file = fopen(config->filepath, "w+b");
+        if (db->file == NULL) {
             ESP_LOGE(TAG, "Failed to create new file");
-            tsdb_free_buffer_pool(&g_state.pool);
-            return ESP_FAIL;
+            tsdb_free_buffer_pool(&db->pool);
+            vSemaphoreDelete(db->mutex);
+            free(db);
+            return NULL;
         }
 
         // Initialize header
-        memset(&g_state.header, 0, sizeof(tsdb_header_t));
-        g_state.header.magic = TSDB_MAGIC;
-        g_state.header.version = TSDB_VERSION;
-        g_state.header.num_params = config->num_params;
-        g_state.header.base_params = config->num_params;
-        g_state.header.param_size = sizeof(int16_t);
-        g_state.header.record_size = 4 + (config->num_params * 2);
+        memset(&db->header, 0, sizeof(tsdb_header_t));
+        db->header.magic = TSDB_MAGIC;
+        db->header.version = TSDB_VERSION;
+        db->header.num_params = config->num_params;
+        db->header.base_params = config->num_params;
+        db->header.param_size = sizeof(int16_t);
+        db->header.record_size = 4 + (config->num_params * 2);
 
         // Calculate records per block
         // Block has: 4 bytes magic + 2 bytes count + 2 bytes flags = 8 bytes overhead
         // Then: timestamps array (4 bytes each) + params arrays (2 bytes each)
         size_t overhead = 8;
         size_t per_record = 4 + (config->num_params * 2);  // timestamp + params
-        g_state.header.records_per_block = (TSDB_BLOCK_SIZE - overhead) / per_record;
+        db->header.records_per_block = (TSDB_BLOCK_SIZE - overhead) / per_record;
 
-        ESP_LOGI(TAG, "Records per block: %d", g_state.header.records_per_block);
+        ESP_LOGI(TAG, "Records per block: %d", db->header.records_per_block);
 
-        g_state.header.max_records = config->max_records;
-        g_state.header.index_stride = config->index_stride > 0 ? config->index_stride : 380;
+        db->header.max_records = config->max_records;
+        db->header.index_stride = config->index_stride > 0 ? config->index_stride : 380;
 
         // Calculate index offset (right after 512-byte header)
-        g_state.header.index_offset = 512;
-        g_state.header.index_entries = config->max_records > 0 ?
-            (config->max_records / g_state.header.index_stride) + 1 : 256;  // 256 default for unlimited
+        db->header.index_offset = 512;
+        db->header.index_entries = config->max_records > 0 ?
+            (config->max_records / db->header.index_stride) + 1 : 256;  // 256 default for unlimited
 
         ESP_LOGI(TAG, "Index: %lu entries, stride=%lu",
-                 (unsigned long)g_state.header.index_entries,
-                 (unsigned long)g_state.header.index_stride);
+                 (unsigned long)db->header.index_entries,
+                 (unsigned long)db->header.index_stride);
 
         // Copy parameter names if provided
         if (config->param_names) {
             for (int i = 0; i < config->num_params && i < 16; i++) {
-                strncpy(g_state.header.param_names[i], config->param_names[i], 31);
-                g_state.header.param_names[i][31] = '\0';
+                strncpy(db->header.param_names[i], config->param_names[i], 31);
+                db->header.param_names[i][31] = '\0';
             }
         }
 
         // Write initial header
-        if (tsdb_write_header(g_state.file, &g_state.header) != ESP_OK) {
+        if (tsdb_write_header(db->file, &db->header) != ESP_OK) {
             ESP_LOGE(TAG, "Failed to write header");
-            fclose(g_state.file);
-            tsdb_free_buffer_pool(&g_state.pool);
-            return ESP_FAIL;
+            fclose(db->file);
+            tsdb_free_buffer_pool(&db->pool);
+            vSemaphoreDelete(db->mutex);
+            free(db);
+            return NULL;
         }
 
         // Pre-allocate index space (write zeros)
-        fseek(g_state.file, g_state.header.index_offset, SEEK_SET);
+        fseek(db->file, db->header.index_offset, SEEK_SET);
         tsdb_index_entry_t zero_entry = {0};
-        for (uint32_t i = 0; i < g_state.header.index_entries; i++) {
-            fwrite(&zero_entry, sizeof(zero_entry), 1, g_state.file);
+        for (uint32_t i = 0; i < db->header.index_entries; i++) {
+            fwrite(&zero_entry, sizeof(zero_entry), 1, db->file);
         }
-        tsdb_flush_and_sync(g_state.file);
+        tsdb_flush_and_sync(db->file);
 
         ESP_LOGI(TAG, "New database created successfully");
     }
 
     // Save filepath
-    strncpy(g_state.filepath, config->filepath, sizeof(g_state.filepath) - 1);
-    g_state.is_open = true;
+    strncpy(db->filepath, config->filepath, sizeof(db->filepath) - 1);
+    db->is_open = true;
 
     ESP_LOGI(TAG, "TSDB initialized successfully");
 
-    return ESP_OK;
+    return db;
 }
 
-esp_err_t tsdb_close(void) {
-    if (!g_state.is_open) {
+esp_err_t tsdb_close_h(tsdb_t *db) {
+    if (db == NULL) {
+        return ESP_OK;
+    }
+    if (!db->is_open) {
+        // Nothing to flush, but still free the handle
+        if (db->mutex) vSemaphoreDelete(db->mutex);
+        free(db);
         return ESP_OK;
     }
 
     ESP_LOGI(TAG, "Closing TSDB");
 
     // Flush any cached writes
-    if (g_state.cache_dirty) {
+    if (db->cache_dirty) {
         ESP_LOGW(TAG, "Flushing dirty cache on close");
         // TODO: Implement write cache flush
     }
 
     // Update header
-    tsdb_write_header(g_state.file, &g_state.header);
+    tsdb_write_header(db->file, &db->header);
 
     // Close file
-    fclose(g_state.file);
-    g_state.file = NULL;
+    fclose(db->file);
+    db->file = NULL;
 
     // Free buffer pool
-    tsdb_free_buffer_pool(&g_state.pool);
+    tsdb_free_buffer_pool(&db->pool);
 
-    g_state.is_open = false;
+    db->is_open = false;
+
+    if (db->mutex) vSemaphoreDelete(db->mutex);
+    free(db);
 
     ESP_LOGI(TAG, "TSDB closed");
 
     return ESP_OK;
 }
 
-bool tsdb_is_initialized(void) {
-    return g_state.is_open;
+esp_err_t tsdb_sync_h(tsdb_t *db) {
+    if (db == NULL || !db->is_open || db->file == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (db->mutex && xSemaphoreTake(db->mutex, portMAX_DELAY) != pdTRUE) {
+        return ESP_FAIL;
+    }
+
+    fflush(db->file);
+    fsync(fileno(db->file));
+    if (fclose(db->file) != 0) {
+        db->file = NULL;
+        db->is_open = false;
+        if (db->mutex) xSemaphoreGive(db->mutex);
+        ESP_LOGE(TAG, "tsdb_sync_h: fclose failed for %s", db->filepath);
+        return ESP_FAIL;
+    }
+    db->file = NULL;
+
+    db->file = fopen(db->filepath, "r+b");
+    if (db->file == NULL) {
+        db->is_open = false;
+        if (db->mutex) xSemaphoreGive(db->mutex);
+        ESP_LOGE(TAG, "tsdb_sync_h: reopen failed for %s", db->filepath);
+        return ESP_FAIL;
+    }
+
+    if (db->mutex) xSemaphoreGive(db->mutex);
+    return ESP_OK;
 }
 
-esp_err_t tsdb_get_stats(tsdb_stats_t *stats) {
-    if (!g_state.is_open) {
+bool tsdb_is_initialized_h(const tsdb_t *db) {
+    return db != NULL && db->is_open;
+}
+
+esp_err_t tsdb_get_stats_h(tsdb_t *db, tsdb_stats_t *stats) {
+    if (db == NULL || !db->is_open) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -562,78 +622,84 @@ esp_err_t tsdb_get_stats(tsdb_stats_t *stats) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    stats->total_records = (g_state.header.max_records == 0 ||
-                            g_state.header.total_records < g_state.header.max_records) ?
-                           g_state.header.total_records : g_state.header.max_records;
-    stats->max_records = g_state.header.max_records;
-    stats->oldest_timestamp = g_state.header.oldest_timestamp;
-    stats->newest_timestamp = g_state.header.newest_timestamp;
-    stats->total_writes = g_state.header.total_writes;
-    stats->total_evictions = g_state.header.total_evictions;
-    stats->num_params = g_state.header.num_params;
-    stats->extra_params = g_state.extra_param_count;
-    stats->buffer_pool_size = g_state.pool.total_size;
-    stats->using_paged_allocation = g_state.pool.is_paged;
+    xSemaphoreTake(db->mutex, portMAX_DELAY);
+
+    stats->total_records = (db->header.max_records == 0 ||
+                            db->header.total_records < db->header.max_records) ?
+                           db->header.total_records : db->header.max_records;
+    stats->max_records = db->header.max_records;
+    stats->oldest_timestamp = db->header.oldest_timestamp;
+    stats->newest_timestamp = db->header.newest_timestamp;
+    stats->total_writes = db->header.total_writes;
+    stats->total_evictions = db->header.total_evictions;
+    stats->num_params = db->header.num_params;
+    stats->extra_params = db->extra_param_count;
+    stats->buffer_pool_size = db->pool.total_size;
+    stats->using_paged_allocation = db->pool.is_paged;
 
     // Get file size
     struct stat st;
-    if (stat(g_state.filepath, &st) == 0) {
+    if (stat(db->filepath, &st) == 0) {
         stats->storage_bytes = st.st_size;
     } else {
         stats->storage_bytes = 0;
     }
 
+    xSemaphoreGive(db->mutex);
     return ESP_OK;
 }
 
-esp_err_t tsdb_clear(void) {
-    if (!g_state.is_open) {
+esp_err_t tsdb_clear_h(tsdb_t *db) {
+    if (db == NULL || !db->is_open) {
         return ESP_ERR_INVALID_STATE;
     }
+
+    xSemaphoreTake(db->mutex, portMAX_DELAY);
 
     ESP_LOGW(TAG, "Clearing all data");
 
     // Reset header counters
-    g_state.header.total_records = 0;
-    g_state.header.oldest_record_idx = 0;
-    g_state.header.newest_record_idx = 0;
-    g_state.header.oldest_timestamp = 0;
-    g_state.header.newest_timestamp = 0;
-    g_state.header.total_writes = 0;
-    g_state.header.total_evictions = 0;
+    db->header.total_records = 0;
+    db->header.oldest_record_idx = 0;
+    db->header.newest_record_idx = 0;
+    db->header.oldest_timestamp = 0;
+    db->header.newest_timestamp = 0;
+    db->header.total_writes = 0;
+    db->header.total_evictions = 0;
 
     // Reset overflow if present
-    if (g_state.header.overflow_offset > 0) {
-        g_state.header.first_overflow_record_idx = 0;
-        g_state.first_overflow_record_idx = 0;
+    if (db->header.overflow_offset > 0) {
+        db->header.first_overflow_record_idx = 0;
+        db->first_overflow_record_idx = 0;
     }
 
     // Clear index
-    fseek(g_state.file, g_state.header.index_offset, SEEK_SET);
+    fseek(db->file, db->header.index_offset, SEEK_SET);
     tsdb_index_entry_t zero_entry = {0};
-    for (uint32_t i = 0; i < g_state.header.index_entries; i++) {
-        fwrite(&zero_entry, sizeof(zero_entry), 1, g_state.file);
+    for (uint32_t i = 0; i < db->header.index_entries; i++) {
+        fwrite(&zero_entry, sizeof(zero_entry), 1, db->file);
     }
 
     // Write updated header
-    tsdb_write_header(g_state.file, &g_state.header);
-    tsdb_flush_and_sync(g_state.file);
+    tsdb_write_header(db->file, &db->header);
+    tsdb_flush_and_sync(db->file);
 
     ESP_LOGI(TAG, "Database cleared");
 
+    xSemaphoreGive(db->mutex);
     return ESP_OK;
 }
 
-esp_err_t tsdb_delete(void) {
-    if (!g_state.is_open) {
+esp_err_t tsdb_delete_h(tsdb_t *db) {
+    if (db == NULL || !db->is_open) {
         return ESP_ERR_INVALID_STATE;
     }
 
     char filepath_copy[128];
-    strncpy(filepath_copy, g_state.filepath, sizeof(filepath_copy));
+    strncpy(filepath_copy, db->filepath, sizeof(filepath_copy));
 
-    // Close first
-    tsdb_close();
+    // Close (frees the handle)
+    tsdb_close_h(db);
 
     // Delete file
     if (unlink(filepath_copy) != 0) {
@@ -650,30 +716,32 @@ esp_err_t tsdb_delete(void) {
 // OVERFLOW PARAMETER API
 // ============================================================================
 
-esp_err_t tsdb_add_extra_params(const char **param_names, uint8_t count) {
-    if (!g_state.is_open) {
+esp_err_t tsdb_add_extra_params_h(tsdb_t *db, const char **param_names, uint8_t count) {
+    if (db == NULL || !db->is_open) {
         return ESP_ERR_INVALID_STATE;
     }
     if (count == 0 || count > TSDB_MAX_EXTRA_PARAMS || param_names == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (g_state.extra_param_count > 0) {
-        ESP_LOGW(TAG, "Overflow already active with %d params", g_state.extra_param_count);
+    if (db->extra_param_count > 0) {
+        ESP_LOGW(TAG, "Overflow already active with %d params", db->extra_param_count);
         return ESP_ERR_INVALID_STATE;
     }
+
+    xSemaphoreTake(db->mutex, portMAX_DELAY);
 
     ESP_LOGI(TAG, "Adding %d extra parameters (overflow region)", count);
 
     // Calculate overflow offset = end of current file
-    fseek(g_state.file, 0, SEEK_END);
-    uint32_t overflow_offset = (uint32_t)ftell(g_state.file);
+    fseek(db->file, 0, SEEK_END);
+    uint32_t overflow_offset = (uint32_t)ftell(db->file);
 
     // Build overflow header
     tsdb_overflow_header_t ovf_header;
     memset(&ovf_header, 0, sizeof(ovf_header));
     ovf_header.magic = TSDB_OVERFLOW_MAGIC;
     ovf_header.param_count = count;
-    ovf_header.first_record_idx = g_state.header.total_records;
+    ovf_header.first_record_idx = db->header.total_records;
 
     for (uint8_t i = 0; i < count; i++) {
         strncpy(ovf_header.param_names[i], param_names[i], 19);
@@ -681,43 +749,46 @@ esp_err_t tsdb_add_extra_params(const char **param_names, uint8_t count) {
     }
 
     // Write overflow header
-    fseek(g_state.file, overflow_offset, SEEK_SET);
-    if (fwrite(&ovf_header, sizeof(ovf_header), 1, g_state.file) != 1) {
+    fseek(db->file, overflow_offset, SEEK_SET);
+    if (fwrite(&ovf_header, sizeof(ovf_header), 1, db->file) != 1) {
         ESP_LOGE(TAG, "Failed to write overflow header");
+        xSemaphoreGive(db->mutex);
         return ESP_FAIL;
     }
-    fflush(g_state.file);
-    fsync(fileno(g_state.file));
+    fflush(db->file);
+    fsync(fileno(db->file));
 
     // Update main header
-    g_state.header.extra_param_count = count;
-    g_state.header.overflow_record_size = count * sizeof(int16_t);
-    g_state.header.overflow_offset = overflow_offset;
-    g_state.header.first_overflow_record_idx = g_state.header.total_records;
+    db->header.extra_param_count = count;
+    db->header.overflow_record_size = count * sizeof(int16_t);
+    db->header.overflow_offset = overflow_offset;
+    db->header.first_overflow_record_idx = db->header.total_records;
 
-    if (tsdb_write_header(g_state.file, &g_state.header) != ESP_OK) {
+    if (tsdb_write_header(db->file, &db->header) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to update header with overflow info");
+        xSemaphoreGive(db->mutex);
         return ESP_FAIL;
     }
 
     // Update runtime state
-    g_state.extra_param_count = count;
-    g_state.overflow_record_size = count * sizeof(int16_t);
-    g_state.first_overflow_record_idx = g_state.header.total_records;
-    g_state.overflow_data_offset = overflow_offset + TSDB_OVERFLOW_HEADER_SIZE;
+    db->extra_param_count = count;
+    db->overflow_record_size = count * sizeof(int16_t);
+    db->first_overflow_record_idx = db->header.total_records;
+    db->overflow_data_offset = overflow_offset + TSDB_OVERFLOW_HEADER_SIZE;
 
     ESP_LOGI(TAG, "Overflow region created: offset=%lu, %d params, record_size=%d",
-             (unsigned long)overflow_offset, count, g_state.overflow_record_size);
+             (unsigned long)overflow_offset, count, db->overflow_record_size);
 
+    xSemaphoreGive(db->mutex);
     return ESP_OK;
 }
 
-esp_err_t tsdb_migrate_overflow(const char **new_names, uint8_t new_count) {
-    if (!g_state.is_open) return ESP_ERR_INVALID_STATE;
+esp_err_t tsdb_migrate_overflow_h(tsdb_t *db, const char **new_names, uint8_t new_count) {
+    if (db == NULL || !db->is_open) return ESP_ERR_INVALID_STATE;
     if (new_count > TSDB_MAX_EXTRA_PARAMS) return ESP_ERR_INVALID_ARG;
     if (new_count > 0 && new_names == NULL) return ESP_ERR_INVALID_ARG;
 
-    uint8_t old_count = g_state.extra_param_count;
+    uint8_t old_count = db->extra_param_count;
 
     // Case: nothing to nothing
     if (old_count == 0 && new_count == 0) {
@@ -725,25 +796,28 @@ esp_err_t tsdb_migrate_overflow(const char **new_names, uint8_t new_count) {
         return ESP_OK;
     }
 
-    // Case: no existing overflow, just add
+    // Case: no existing overflow, just add (delegates, takes its own lock)
     if (old_count == 0 && new_count > 0) {
         ESP_LOGI(TAG, "No existing overflow, creating new with %d params", new_count);
-        return tsdb_add_extra_params(new_names, new_count);
+        return tsdb_add_extra_params_h(db, new_names, new_count);
     }
+
+    xSemaphoreTake(db->mutex, portMAX_DELAY);
 
     // Case: remove overflow entirely
     if (new_count == 0) {
         ESP_LOGI(TAG, "Removing overflow region (%d params)", old_count);
-        g_state.header.extra_param_count = 0;
-        g_state.header.overflow_record_size = 0;
-        g_state.header.overflow_offset = 0;
-        g_state.header.first_overflow_record_idx = 0;
-        g_state.extra_param_count = 0;
-        g_state.overflow_record_size = 0;
-        g_state.overflow_data_offset = 0;
-        g_state.first_overflow_record_idx = 0;
-        tsdb_write_header(g_state.file, &g_state.header);
+        db->header.extra_param_count = 0;
+        db->header.overflow_record_size = 0;
+        db->header.overflow_offset = 0;
+        db->header.first_overflow_record_idx = 0;
+        db->extra_param_count = 0;
+        db->overflow_record_size = 0;
+        db->overflow_data_offset = 0;
+        db->first_overflow_record_idx = 0;
+        tsdb_write_header(db->file, &db->header);
         ESP_LOGI(TAG, "Overflow removed");
+        xSemaphoreGive(db->mutex);
         return ESP_OK;
     }
 
@@ -752,13 +826,15 @@ esp_err_t tsdb_migrate_overflow(const char **new_names, uint8_t new_count) {
 
     // 1. Read old overflow header to get old param names
     tsdb_overflow_header_t old_ovf;
-    fseek(g_state.file, g_state.header.overflow_offset, SEEK_SET);
-    if (fread(&old_ovf, sizeof(old_ovf), 1, g_state.file) != 1) {
+    fseek(db->file, db->header.overflow_offset, SEEK_SET);
+    if (fread(&old_ovf, sizeof(old_ovf), 1, db->file) != 1) {
         ESP_LOGE(TAG, "Failed to read old overflow header");
+        xSemaphoreGive(db->mutex);
         return ESP_FAIL;
     }
     if (old_ovf.magic != TSDB_OVERFLOW_MAGIC) {
         ESP_LOGE(TAG, "Old overflow header corrupted (magic=0x%08lX)", (unsigned long)old_ovf.magic);
+        xSemaphoreGive(db->mutex);
         return ESP_FAIL;
     }
 
@@ -773,6 +849,7 @@ esp_err_t tsdb_migrate_overflow(const char **new_names, uint8_t new_count) {
         }
         if (match) {
             ESP_LOGI(TAG, "Overflow already matches requested layout, skipping migration");
+            xSemaphoreGive(db->mutex);
             return ESP_OK;
         }
     }
@@ -794,37 +871,38 @@ esp_err_t tsdb_migrate_overflow(const char **new_names, uint8_t new_count) {
     }
 
     // 3. New overflow goes at end of file
-    fseek(g_state.file, 0, SEEK_END);
-    uint32_t new_overflow_offset = (uint32_t)ftell(g_state.file);
+    fseek(db->file, 0, SEEK_END);
+    uint32_t new_overflow_offset = (uint32_t)ftell(db->file);
 
     // 4. Write new overflow header
     tsdb_overflow_header_t new_ovf;
     memset(&new_ovf, 0, sizeof(new_ovf));
     new_ovf.magic = TSDB_OVERFLOW_MAGIC;
     new_ovf.param_count = new_count;
-    new_ovf.first_record_idx = g_state.first_overflow_record_idx;
+    new_ovf.first_record_idx = db->first_overflow_record_idx;
     for (uint8_t i = 0; i < new_count; i++) {
         strncpy(new_ovf.param_names[i], new_names[i], 19);
         new_ovf.param_names[i][19] = '\0';
     }
 
-    fseek(g_state.file, new_overflow_offset, SEEK_SET);
-    if (fwrite(&new_ovf, sizeof(new_ovf), 1, g_state.file) != 1) {
+    fseek(db->file, new_overflow_offset, SEEK_SET);
+    if (fwrite(&new_ovf, sizeof(new_ovf), 1, db->file) != 1) {
         ESP_LOGE(TAG, "Failed to write new overflow header");
+        xSemaphoreGive(db->mutex);
         return ESP_FAIL;
     }
-    fflush(g_state.file);
-    fsync(fileno(g_state.file));
+    fflush(db->file);
+    fsync(fileno(db->file));
 
     // 5. Migrate data record by record
     uint32_t new_data_offset = new_overflow_offset + TSDB_OVERFLOW_HEADER_SIZE;
     uint16_t new_record_size = new_count * sizeof(int16_t);
-    uint16_t old_record_size = g_state.overflow_record_size;
-    uint32_t old_data_offset = g_state.overflow_data_offset;
+    uint16_t old_record_size = db->overflow_record_size;
+    uint32_t old_data_offset = db->overflow_data_offset;
 
     uint32_t overflow_records = 0;
-    if (g_state.header.total_records > g_state.first_overflow_record_idx) {
-        overflow_records = g_state.header.total_records - g_state.first_overflow_record_idx;
+    if (db->header.total_records > db->first_overflow_record_idx) {
+        overflow_records = db->header.total_records - db->first_overflow_record_idx;
     }
 
     ESP_LOGI(TAG, "Migrating %lu overflow records", (unsigned long)overflow_records);
@@ -835,9 +913,9 @@ esp_err_t tsdb_migrate_overflow(const char **new_names, uint8_t new_count) {
     for (uint32_t r = 0; r < overflow_records; r++) {
         // Read old record
         uint32_t old_pos = old_data_offset + (r * old_record_size);
-        fseek(g_state.file, old_pos, SEEK_SET);
+        fseek(db->file, old_pos, SEEK_SET);
         memset(old_vals, 0, sizeof(old_vals));
-        if (fread(old_vals, sizeof(int16_t), old_count, g_state.file) != old_count) {
+        if (fread(old_vals, sizeof(int16_t), old_count, db->file) != old_count) {
             // Partial read — fill with zeros
         }
 
@@ -851,69 +929,141 @@ esp_err_t tsdb_migrate_overflow(const char **new_names, uint8_t new_count) {
 
         // Write to new position
         uint32_t new_pos = new_data_offset + (r * new_record_size);
-        fseek(g_state.file, new_pos, SEEK_SET);
-        fwrite(new_vals, sizeof(int16_t), new_count, g_state.file);
+        fseek(db->file, new_pos, SEEK_SET);
+        fwrite(new_vals, sizeof(int16_t), new_count, db->file);
 
         if (r > 0 && r % 10000 == 0) {
             ESP_LOGI(TAG, "  Migrated %lu / %lu records", (unsigned long)r, (unsigned long)overflow_records);
-            fflush(g_state.file);
-            fsync(fileno(g_state.file));
+            fflush(db->file);
+            fsync(fileno(db->file));
         }
     }
 
-    fflush(g_state.file);
-    fsync(fileno(g_state.file));
+    fflush(db->file);
+    fsync(fileno(db->file));
 
     // 6. Update header — this is the commit point (crash-safe)
-    g_state.header.overflow_offset = new_overflow_offset;
-    g_state.header.extra_param_count = new_count;
-    g_state.header.overflow_record_size = new_record_size;
+    db->header.overflow_offset = new_overflow_offset;
+    db->header.extra_param_count = new_count;
+    db->header.overflow_record_size = new_record_size;
     // first_overflow_record_idx stays the same
 
-    tsdb_write_header(g_state.file, &g_state.header);
+    tsdb_write_header(db->file, &db->header);
 
     // 7. Update runtime state
-    g_state.extra_param_count = new_count;
-    g_state.overflow_record_size = new_record_size;
-    g_state.overflow_data_offset = new_data_offset;
+    db->extra_param_count = new_count;
+    db->overflow_record_size = new_record_size;
+    db->overflow_data_offset = new_data_offset;
 
     ESP_LOGI(TAG, "Migration complete: %d params, %lu records migrated",
              new_count, (unsigned long)overflow_records);
 
+    xSemaphoreGive(db->mutex);
     return ESP_OK;
 }
 
-uint8_t tsdb_get_total_params(void) {
-    if (!g_state.is_open) return 0;
-    return g_state.header.num_params + g_state.extra_param_count;
+uint8_t tsdb_get_total_params_h(const tsdb_t *db) {
+    if (db == NULL || !db->is_open) return 0;
+    return db->header.num_params + db->extra_param_count;
 }
 
-const char* tsdb_get_param_name(uint8_t index) {
-    if (!g_state.is_open) return NULL;
+const char* tsdb_get_param_name_h(const tsdb_t *db, uint8_t index) {
+    if (db == NULL || !db->is_open) return NULL;
 
-    if (index < g_state.header.num_params) {
-        return g_state.header.param_names[index];
+    if (index < db->header.num_params) {
+        return db->header.param_names[index];
     }
 
     // Extra param -- read from overflow header in file
-    uint8_t extra_idx = index - g_state.header.num_params;
-    if (extra_idx >= g_state.extra_param_count || g_state.header.overflow_offset == 0) {
+    uint8_t extra_idx = index - db->header.num_params;
+    if (extra_idx >= db->extra_param_count || db->header.overflow_offset == 0) {
         return NULL;
     }
 
-    // Read the name from overflow header on file
+    // Read the name from overflow header on file. NOTE: returns a pointer to
+    // a static buffer; not thread-safe. Callers should copy if they need to
+    // hold the value across other tsdb calls. (Pre-existing behaviour.)
     static char name_buf[20];
-    uint32_t name_offset = g_state.header.overflow_offset +
+    uint32_t name_offset = db->header.overflow_offset +
                            offsetof(tsdb_overflow_header_t, param_names) +
                            (extra_idx * 20);
-    fseek(g_state.file, name_offset, SEEK_SET);
-    if (fread(name_buf, 20, 1, g_state.file) != 1) {
+    fseek(db->file, name_offset, SEEK_SET);
+    if (fread(name_buf, 20, 1, db->file) != 1) {
         return NULL;
     }
     name_buf[19] = '\0';
     return name_buf;
 }
 
+bool tsdb_has_overflow_h(const tsdb_t *db) {
+    return db != NULL && db->is_open && db->extra_param_count > 0;
+}
+
+// ============================================================================
+// LEGACY GLOBAL API (v2.0.x backward compatibility)
+// ============================================================================
+//
+// These wrappers operate on a single internal handle (g_default_handle) for
+// callers written against the v2 API. Mixing the legacy API with the new
+// _h-suffixed API on the same handle is supported (the wrappers just pass
+// g_default_handle through), but you cannot have more than one default
+// handle open at a time.
+
+esp_err_t tsdb_init(const tsdb_config_t *config) {
+    if (g_default_handle != NULL && g_default_handle->is_open) {
+        ESP_LOGW(TAG, "Already initialized");
+        return ESP_OK;
+    }
+    if (g_default_handle != NULL) {
+        // Stale (closed) handle — free it before opening fresh.
+        free(g_default_handle);
+        g_default_handle = NULL;
+    }
+    g_default_handle = tsdb_open(config);
+    return g_default_handle != NULL ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t tsdb_close(void) {
+    if (g_default_handle == NULL) return ESP_OK;
+    esp_err_t ret = tsdb_close_h(g_default_handle);
+    g_default_handle = NULL;
+    return ret;
+}
+
+bool tsdb_is_initialized(void) {
+    return tsdb_is_initialized_h(g_default_handle);
+}
+
+esp_err_t tsdb_get_stats(tsdb_stats_t *stats) {
+    return tsdb_get_stats_h(g_default_handle, stats);
+}
+
+esp_err_t tsdb_clear(void) {
+    return tsdb_clear_h(g_default_handle);
+}
+
+esp_err_t tsdb_delete(void) {
+    esp_err_t ret = tsdb_delete_h(g_default_handle);
+    g_default_handle = NULL;
+    return ret;
+}
+
+esp_err_t tsdb_add_extra_params(const char **param_names, uint8_t count) {
+    return tsdb_add_extra_params_h(g_default_handle, param_names, count);
+}
+
+esp_err_t tsdb_migrate_overflow(const char **new_names, uint8_t new_count) {
+    return tsdb_migrate_overflow_h(g_default_handle, new_names, new_count);
+}
+
+uint8_t tsdb_get_total_params(void) {
+    return tsdb_get_total_params_h(g_default_handle);
+}
+
+const char *tsdb_get_param_name(uint8_t index) {
+    return tsdb_get_param_name_h(g_default_handle, index);
+}
+
 bool tsdb_has_overflow(void) {
-    return g_state.is_open && g_state.extra_param_count > 0;
+    return tsdb_has_overflow_h(g_default_handle);
 }
