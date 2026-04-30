@@ -562,6 +562,29 @@ tsdb_t *tsdb_open(const tsdb_config_t *config);
  */
 esp_err_t tsdb_close_h(tsdb_t *db);
 
+/**
+ * @brief Force a directory-entry commit by close+reopen of the underlying FILE*.
+ *
+ * On esp_littlefs (joltwallet/littlefs), files held open with fopen("r+b")
+ * across many writes never trigger a directory commit even with fflush+fsync
+ * after each write — only fclose actually publishes the dir entry to disk.
+ * Without this, every reboot finds the file "missing" and tsdb_open recreates
+ * it from scratch, losing all history.
+ *
+ * tsdb_sync_h takes the per-handle mutex, fcloses db->file, reopens it with
+ * "r+b", and re-validates the on-disk header against the in-memory copy. The
+ * handle and all internal state survive — callers may continue using db after
+ * this returns successfully. Cost is one filesystem round-trip (~30-50 ms on
+ * LittleFS); cheap enough to call after every tsdb_write_h on snapshot
+ * cadences (5-min) or every N writes on faster cadences.
+ *
+ * Returns ESP_ERR_INVALID_STATE if db is null or not open, ESP_FAIL if the
+ * close+reopen cycle leaves the file in an inconsistent state (rare; in that
+ * case the handle's is_open is set false and callers should treat the DB as
+ * closed).
+ */
+esp_err_t tsdb_sync_h(tsdb_t *db);
+
 bool tsdb_is_initialized_h(const tsdb_t *db);
 
 esp_err_t tsdb_write_h(tsdb_t *db, uint32_t timestamp, const int16_t *values);

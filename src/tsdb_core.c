@@ -577,6 +577,44 @@ esp_err_t tsdb_close_h(tsdb_t *db) {
     return ESP_OK;
 }
 
+esp_err_t tsdb_sync_h(tsdb_t *db) {
+    if (db == NULL || !db->is_open || db->file == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (db->mutex && xSemaphoreTake(db->mutex, portMAX_DELAY) != pdTRUE) {
+        return ESP_FAIL;
+    }
+
+    // Re-state: stronger fsync via fclose. On esp_littlefs, fclose is what
+    // commits the file's directory entry — fflush+fsync alone don't on
+    // long-lived r+b handles.
+    fflush(db->file);
+    fsync(fileno(db->file));
+    if (fclose(db->file) != 0) {
+        // fclose failed; handle is now in a bad state.
+        db->file = NULL;
+        db->is_open = false;
+        if (db->mutex) xSemaphoreGive(db->mutex);
+        ESP_LOGE(TAG, "tsdb_sync_h: fclose failed for %s", db->filepath);
+        return ESP_FAIL;
+    }
+    db->file = NULL;
+
+    // Reopen for read+write at the same path. If this fails the handle is
+    // unusable — caller can detect via tsdb_is_initialized_h returning false.
+    db->file = fopen(db->filepath, "r+b");
+    if (db->file == NULL) {
+        db->is_open = false;
+        if (db->mutex) xSemaphoreGive(db->mutex);
+        ESP_LOGE(TAG, "tsdb_sync_h: reopen failed for %s", db->filepath);
+        return ESP_FAIL;
+    }
+
+    if (db->mutex) xSemaphoreGive(db->mutex);
+    return ESP_OK;
+}
+
 bool tsdb_is_initialized_h(const tsdb_t *db) {
     return db != NULL && db->is_open;
 }
