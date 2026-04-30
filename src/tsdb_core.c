@@ -586,13 +586,9 @@ esp_err_t tsdb_sync_h(tsdb_t *db) {
         return ESP_FAIL;
     }
 
-    // Re-state: stronger fsync via fclose. On esp_littlefs, fclose is what
-    // commits the file's directory entry — fflush+fsync alone don't on
-    // long-lived r+b handles.
     fflush(db->file);
     fsync(fileno(db->file));
     if (fclose(db->file) != 0) {
-        // fclose failed; handle is now in a bad state.
         db->file = NULL;
         db->is_open = false;
         if (db->mutex) xSemaphoreGive(db->mutex);
@@ -601,8 +597,34 @@ esp_err_t tsdb_sync_h(tsdb_t *db) {
     }
     db->file = NULL;
 
-    // Reopen for read+write at the same path. If this fails the handle is
-    // unusable — caller can detect via tsdb_is_initialized_h returning false.
+    // Pulse: create+close+unlink a sibling file in the same directory.
+    // Empirical: fclose on long-lived r+b handles does NOT publish the
+    // file's dir entry on esp_littlefs (joltwallet) — only operations
+    // that touch the directory tree do. A wb-mode create+close+unlink
+    // pair forces a journal commit that bundles in any pending dir
+    // entries (incl. the tsdb file we just closed). A sibling file
+    // written via plain fopen("wb")+fclose is known to persist (the
+    // /tsdb/shutdown_marker.json smoke test confirmed it), so the pulse
+    // pattern matches the working case.
+    //
+    // Path is built from filepath: ".../foo.tsdb" → ".../foo.tsdb.pulse"
+    // — keeps the pulse next to its DB so multiple DBs sharing one
+    // directory don't collide on a global pulse name.
+    {
+        char pulse_path[160];
+        snprintf(pulse_path, sizeof(pulse_path), "%s.pulse", db->filepath);
+        FILE *p = fopen(pulse_path, "wb");
+        if (p != NULL) {
+            fputc('1', p);
+            fflush(p);
+            fsync(fileno(p));
+            fclose(p);
+            unlink(pulse_path);
+        } else {
+            ESP_LOGW(TAG, "tsdb_sync_h: pulse create failed for %s", pulse_path);
+        }
+    }
+
     db->file = fopen(db->filepath, "r+b");
     if (db->file == NULL) {
         db->is_open = false;
