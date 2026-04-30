@@ -17,15 +17,15 @@ static const char *TAG = "TSDB_WRITE";
 /**
  * @brief Read a data block from file
  */
-esp_err_t tsdb_read_block(FILE *file, uint32_t block_num, tsdb_block_t *block) {
-    if (file == NULL || block == NULL) {
+esp_err_t tsdb_read_block(tsdb_t *db, uint32_t block_num, tsdb_block_t *block) {
+    if (db == NULL || db->file == NULL || block == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    uint32_t block_offset = tsdb_calc_block_offset(&g_state.header, block_num);
+    uint32_t block_offset = tsdb_calc_block_offset(&db->header, block_num);
 
-    fseek(file, block_offset, SEEK_SET);
-    size_t read = fread(block, TSDB_BLOCK_SIZE, 1, file);
+    fseek(db->file, block_offset, SEEK_SET);
+    size_t read = fread(block, TSDB_BLOCK_SIZE, 1, db->file);
 
     if (read != 1) {
         ESP_LOGD(TAG, "Block %lu not found or uninitialized", (unsigned long)block_num);
@@ -38,17 +38,17 @@ esp_err_t tsdb_read_block(FILE *file, uint32_t block_num, tsdb_block_t *block) {
 /**
  * @brief Write a data block to file
  */
-esp_err_t tsdb_write_block(FILE *file, uint32_t block_num, const tsdb_block_t *block) {
-    if (file == NULL || block == NULL) {
+esp_err_t tsdb_write_block(tsdb_t *db, uint32_t block_num, const tsdb_block_t *block) {
+    if (db == NULL || db->file == NULL || block == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    uint32_t block_offset = tsdb_calc_block_offset(&g_state.header, block_num);
+    uint32_t block_offset = tsdb_calc_block_offset(&db->header, block_num);
 
-    fseek(file, block_offset, SEEK_SET);
-    size_t written = fwrite(block, TSDB_BLOCK_SIZE, 1, file);
-    fflush(file);
-    fsync(fileno(file));
+    fseek(db->file, block_offset, SEEK_SET);
+    size_t written = fwrite(block, TSDB_BLOCK_SIZE, 1, db->file);
+    fflush(db->file);
+    fsync(fileno(db->file));
 
     if (written != 1) {
         ESP_LOGE(TAG, "Failed to write block %lu", (unsigned long)block_num);
@@ -65,8 +65,8 @@ esp_err_t tsdb_write_block(FILE *file, uint32_t block_num, const tsdb_block_t *b
 // WRITE OPERATIONS
 // ============================================================================
 
-esp_err_t tsdb_write(uint32_t timestamp, const int16_t *values) {
-    if (!g_state.is_open) {
+esp_err_t tsdb_write_h(tsdb_t *db, uint32_t timestamp, const int16_t *values) {
+    if (db == NULL || !db->is_open) {
         ESP_LOGE(TAG, "Not initialized");
         return ESP_ERR_INVALID_STATE;
     }
@@ -76,33 +76,35 @@ esp_err_t tsdb_write(uint32_t timestamp, const int16_t *values) {
         return ESP_ERR_INVALID_ARG;
     }
 
+    xSemaphoreTake(db->mutex, portMAX_DELAY);
+
     // Calculate record index (ring buffer or unlimited)
-    bool unlimited = (g_state.header.max_records == 0);
-    uint32_t record_idx = unlimited ? g_state.header.total_records :
-                          (g_state.header.total_records % g_state.header.max_records);
+    bool unlimited = (db->header.max_records == 0);
+    uint32_t record_idx = unlimited ? db->header.total_records :
+                          (db->header.total_records % db->header.max_records);
 
     // Determine if this overwrites old data (LRU eviction) — never in unlimited mode
-    bool is_eviction = (!unlimited && g_state.header.total_records >= g_state.header.max_records);
+    bool is_eviction = (!unlimited && db->header.total_records >= db->header.max_records);
 
     if (is_eviction) {
-        g_state.header.total_evictions++;
-        g_state.header.oldest_record_idx = (g_state.header.oldest_record_idx + 1) %
-                                           g_state.header.max_records;
+        db->header.total_evictions++;
+        db->header.oldest_record_idx = (db->header.oldest_record_idx + 1) %
+                                           db->header.max_records;
         ESP_LOGD(TAG, "LRU eviction: oldest_idx=%lu",
-                 (unsigned long)g_state.header.oldest_record_idx);
+                 (unsigned long)db->header.oldest_record_idx);
     }
 
     // Calculate block number and offset within block
-    uint32_t block_num = record_idx / g_state.header.records_per_block;
-    uint16_t offset_in_block = record_idx % g_state.header.records_per_block;
+    uint32_t block_num = record_idx / db->header.records_per_block;
+    uint16_t offset_in_block = record_idx % db->header.records_per_block;
 
     ESP_LOGD(TAG, "Writing record %lu: block=%lu, offset=%d",
-             (unsigned long)g_state.header.total_records,
+             (unsigned long)db->header.total_records,
              (unsigned long)block_num, offset_in_block);
 
     // Get pointer to write buffer in pool
-    tsdb_block_t *block = (tsdb_block_t*)tsdb_get_buffer_ptr(&g_state.pool,
-                                                              g_state.write_cache_offset,
+    tsdb_block_t *block = (tsdb_block_t*)tsdb_get_buffer_ptr(&db->pool,
+                                                              db->write_cache_offset,
                                                               sizeof(tsdb_block_t));
 
     tsdb_block_t temp_block;
@@ -112,7 +114,7 @@ esp_err_t tsdb_write(uint32_t timestamp, const int16_t *values) {
     }
 
     // Read existing block
-    esp_err_t ret = tsdb_read_block(g_state.file, block_num, block);
+    esp_err_t ret = tsdb_read_block(db, block_num, block);
 
     // Initialize block if new or read failed
     uint8_t *raw_blk = (uint8_t *)block;
@@ -124,10 +126,10 @@ esp_err_t tsdb_write(uint32_t timestamp, const int16_t *values) {
     }
 
     // Write data in columnar format (runtime offsets for correct disk layout)
-    uint16_t rpb = g_state.header.records_per_block;
+    uint16_t rpb = db->header.records_per_block;
     uint8_t *raw = (uint8_t *)block;
     TSDB_BLOCK_TS(raw, offset_in_block) = timestamp;
-    for (uint8_t i = 0; i < g_state.header.num_params; i++) {
+    for (uint8_t i = 0; i < db->header.num_params; i++) {
         TSDB_BLOCK_PARAM(raw, rpb, i, offset_in_block) = values[i];
     }
 
@@ -137,70 +139,71 @@ esp_err_t tsdb_write(uint32_t timestamp, const int16_t *values) {
     }
 
     // Write block back to file
-    ret = tsdb_write_block(g_state.file, block_num, block);
+    ret = tsdb_write_block(db, block_num, block);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to write block");
+        xSemaphoreGive(db->mutex);
         return ret;
     }
 
     // Write overflow data if active
-    if (g_state.extra_param_count > 0 &&
-        g_state.header.total_records >= g_state.first_overflow_record_idx) {
-        uint32_t overflow_idx = g_state.header.total_records - g_state.first_overflow_record_idx;
-        uint32_t ovf_offset = g_state.overflow_data_offset +
-                              (overflow_idx * g_state.overflow_record_size);
+    if (db->extra_param_count > 0 &&
+        db->header.total_records >= db->first_overflow_record_idx) {
+        uint32_t overflow_idx = db->header.total_records - db->first_overflow_record_idx;
+        uint32_t ovf_offset = db->overflow_data_offset +
+                              (overflow_idx * db->overflow_record_size);
 
-        fseek(g_state.file, ovf_offset, SEEK_SET);
-        size_t ovf_written = fwrite(&values[g_state.header.num_params],
+        fseek(db->file, ovf_offset, SEEK_SET);
+        size_t ovf_written = fwrite(&values[db->header.num_params],
                                      sizeof(int16_t),
-                                     g_state.extra_param_count,
-                                     g_state.file);
-        if (ovf_written != g_state.extra_param_count) {
+                                     db->extra_param_count,
+                                     db->file);
+        if (ovf_written != db->extra_param_count) {
             ESP_LOGE(TAG, "Failed to write overflow data");
             // Don't fail the whole write -- base data is already written
         }
     }
 
     // Update header
-    g_state.header.total_records++;
-    g_state.header.total_writes++;
-    g_state.header.newest_record_idx = record_idx;
-    g_state.header.newest_timestamp = timestamp;
+    db->header.total_records++;
+    db->header.total_writes++;
+    db->header.newest_record_idx = record_idx;
+    db->header.newest_timestamp = timestamp;
 
     // Update oldest timestamp if needed
     if (is_eviction) {
         // Read oldest timestamp from file
-        uint32_t oldest_block = g_state.header.oldest_record_idx / g_state.header.records_per_block;
-        uint16_t oldest_offset = g_state.header.oldest_record_idx % g_state.header.records_per_block;
+        uint32_t oldest_block = db->header.oldest_record_idx / db->header.records_per_block;
+        uint16_t oldest_offset = db->header.oldest_record_idx % db->header.records_per_block;
 
-        tsdb_block_t *oldest_block_data = (tsdb_block_t*)tsdb_get_buffer_ptr(&g_state.pool,
-                                                                              g_state.read_buffer_offset,
+        tsdb_block_t *oldest_block_data = (tsdb_block_t*)tsdb_get_buffer_ptr(&db->pool,
+                                                                              db->read_buffer_offset,
                                                                               sizeof(tsdb_block_t));
         tsdb_block_t temp_oldest;
         if (oldest_block_data == NULL) {
             oldest_block_data = &temp_oldest;
         }
 
-        if (tsdb_read_block(g_state.file, oldest_block, oldest_block_data) == ESP_OK) {
-            g_state.header.oldest_timestamp = TSDB_BLOCK_TS((uint8_t *)oldest_block_data, oldest_offset);
+        if (tsdb_read_block(db, oldest_block, oldest_block_data) == ESP_OK) {
+            db->header.oldest_timestamp = TSDB_BLOCK_TS((uint8_t *)oldest_block_data, oldest_offset);
         }
-    } else if (g_state.header.total_records == 1) {
-        g_state.header.oldest_timestamp = timestamp;
+    } else if (db->header.total_records == 1) {
+        db->header.oldest_timestamp = timestamp;
     }
 
     // Update sparse index if at stride boundary
-    if (record_idx % g_state.header.index_stride == 0) {
-        uint32_t index_entry_num = record_idx / g_state.header.index_stride;
+    if (record_idx % db->header.index_stride == 0) {
+        uint32_t index_entry_num = record_idx / db->header.index_stride;
         tsdb_index_entry_t entry = {
             .timestamp = timestamp,
             .block_number = block_num
         };
 
-        uint32_t index_file_offset = g_state.header.index_offset +
+        uint32_t index_file_offset = db->header.index_offset +
                                      (index_entry_num * sizeof(tsdb_index_entry_t));
 
-        fseek(g_state.file, index_file_offset, SEEK_SET);
-        fwrite(&entry, sizeof(tsdb_index_entry_t), 1, g_state.file);
+        fseek(db->file, index_file_offset, SEEK_SET);
+        fwrite(&entry, sizeof(tsdb_index_entry_t), 1, db->file);
 
         ESP_LOGD(TAG, "Updated index entry %lu: timestamp=%lu, block=%lu",
                  (unsigned long)index_entry_num,
@@ -209,21 +212,23 @@ esp_err_t tsdb_write(uint32_t timestamp, const int16_t *values) {
     }
 
     // Update header in file
-    tsdb_write_header(g_state.file, &g_state.header);
-    fflush(g_state.file);
-    fsync(fileno(g_state.file));
+    tsdb_write_header(db->file, &db->header);
+    fflush(db->file);
+    fsync(fileno(db->file));
 
     ESP_LOGD(TAG, "Write complete: total_records=%lu, newest_ts=%lu",
-             (unsigned long)g_state.header.total_records,
-             (unsigned long)g_state.header.newest_timestamp);
+             (unsigned long)db->header.total_records,
+             (unsigned long)db->header.newest_timestamp);
 
+    xSemaphoreGive(db->mutex);
     return ESP_OK;
 }
 
-esp_err_t tsdb_write_batch(const uint32_t *timestamps,
-                            const int16_t **values,
-                            uint32_t count) {
-    if (!g_state.is_open) {
+esp_err_t tsdb_write_batch_h(tsdb_t *db,
+                              const uint32_t *timestamps,
+                              const int16_t **values,
+                              uint32_t count) {
+    if (db == NULL || !db->is_open) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -233,10 +238,10 @@ esp_err_t tsdb_write_batch(const uint32_t *timestamps,
 
     ESP_LOGI(TAG, "Batch writing %lu records", (unsigned long)count);
 
-    // Write records one by one
-    // TODO: Optimize by batching block writes
+    // Write records one by one. tsdb_write_h takes the mutex per call.
+    // TODO: Optimize by batching block writes under a single lock acquire.
     for (uint32_t i = 0; i < count; i++) {
-        esp_err_t ret = tsdb_write(timestamps[i], values[i]);
+        esp_err_t ret = tsdb_write_h(db, timestamps[i], values[i]);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "Failed to write record %lu in batch", (unsigned long)i);
             return ret;
@@ -246,4 +251,18 @@ esp_err_t tsdb_write_batch(const uint32_t *timestamps,
     ESP_LOGI(TAG, "Batch write complete: %lu records", (unsigned long)count);
 
     return ESP_OK;
+}
+
+// ============================================================================
+// LEGACY GLOBAL API
+// ============================================================================
+
+esp_err_t tsdb_write(uint32_t timestamp, const int16_t *values) {
+    return tsdb_write_h(g_default_handle, timestamp, values);
+}
+
+esp_err_t tsdb_write_batch(const uint32_t *timestamps,
+                            const int16_t **values,
+                            uint32_t count) {
+    return tsdb_write_batch_h(g_default_handle, timestamps, values, count);
 }

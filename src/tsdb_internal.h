@@ -7,6 +7,8 @@
 #define TSDB_INTERNAL_H
 
 #include "esp_tsdb.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include <stdio.h>
 
 // ============================================================================
@@ -51,13 +53,20 @@ void tsdb_buffer_read(tsdb_buffer_pool_t *pool, size_t offset, void *dest, size_
 void tsdb_buffer_write(tsdb_buffer_pool_t *pool, size_t offset, const void *src, size_t size);
 
 // ============================================================================
-// GLOBAL STATE
+// PER-INSTANCE STATE
 // ============================================================================
 
 /**
- * @brief Internal state
+ * @brief Database handle internals.
+ *
+ * Forward-declared as `tsdb_t` (opaque) in esp_tsdb.h so multiple instances
+ * can be opened simultaneously. Each handle carries its own file descriptor,
+ * header cache, buffer pool, overflow state, and FreeRTOS mutex.
+ *
+ * v2 single-DB callers see a static `g_default_handle` of this type wrapped
+ * by the legacy global API (tsdb_init/tsdb_write/etc).
  */
-typedef struct {
+struct tsdb_s {
     FILE *file;
     tsdb_header_t header;
     char filepath[128];
@@ -82,10 +91,16 @@ typedef struct {
     uint32_t overflow_data_offset;      // overflow_offset + TSDB_OVERFLOW_HEADER_SIZE
     uint32_t first_overflow_record_idx;
     uint16_t overflow_record_size;
-} tsdb_state_t;
 
-// Global state (defined in tsdb_core.c)
-extern tsdb_state_t g_state;
+    // Per-handle serialization. Acquired by every public _h-suffixed call so
+    // concurrent writers/queriers on the same handle are safe; different
+    // handles are fully independent.
+    SemaphoreHandle_t mutex;
+};
+
+// Legacy single-DB handle backing the v2 global API. Allocated lazily on the
+// first tsdb_init() call; freed by tsdb_close().
+extern tsdb_t *g_default_handle;
 
 // ============================================================================
 // INTERNAL FUNCTIONS
@@ -97,8 +112,8 @@ esp_err_t tsdb_read_header(FILE *file, tsdb_header_t *header);
 esp_err_t tsdb_write_header(FILE *file, const tsdb_header_t *header);
 
 // Block operations (tsdb_write.c, tsdb_query.c)
-esp_err_t tsdb_read_block(FILE *file, uint32_t block_num, tsdb_block_t *block);
-esp_err_t tsdb_write_block(FILE *file, uint32_t block_num, const tsdb_block_t *block);
+esp_err_t tsdb_read_block(tsdb_t *db, uint32_t block_num, tsdb_block_t *block);
+esp_err_t tsdb_write_block(tsdb_t *db, uint32_t block_num, const tsdb_block_t *block);
 uint32_t tsdb_calc_block_offset(const tsdb_header_t *header, uint32_t block_num);
 
 // Index operations (tsdb_index.c)

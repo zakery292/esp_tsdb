@@ -14,12 +14,13 @@ static const char *TAG = "TSDB_QUERY";
 // QUERY OPERATIONS
 // ============================================================================
 
-esp_err_t tsdb_query_init(tsdb_query_t *query,
-                          uint32_t start_time,
-                          uint32_t end_time,
-                          const uint8_t *param_indices,
-                          uint8_t num_params_to_fetch) {
-    if (!g_state.is_open || query == NULL) {
+esp_err_t tsdb_query_init_h(tsdb_t *db,
+                            tsdb_query_t *query,
+                            uint32_t start_time,
+                            uint32_t end_time,
+                            const uint8_t *param_indices,
+                            uint8_t num_params_to_fetch) {
+    if (db == NULL || !db->is_open || query == NULL) {
         ESP_LOGE(TAG, "Invalid state or NULL query");
         return ESP_ERR_INVALID_STATE;
     }
@@ -31,18 +32,23 @@ esp_err_t tsdb_query_init(tsdb_query_t *query,
 
     memset(query, 0, sizeof(tsdb_query_t));
 
+    // Bind handle to the query iterator. tsdb_query_next() / _close() use
+    // this to access the underlying file + overflow state without a separate
+    // handle parameter (preserves the v2 API shape).
+    query->db = db;
+
     // Copy header
-    memcpy(&query->header, &g_state.header, sizeof(tsdb_header_t));
+    memcpy(&query->header, &db->header, sizeof(tsdb_header_t));
 
     // Set query parameters
     query->start_time = start_time;
     query->end_time = end_time;
-    query->file = g_state.file;
+    query->file = db->file;
 
     // Setup parameter indices
     if (param_indices == NULL) {
         // Fetch all parameters (base + extra)
-        uint8_t total = query->header.num_params + g_state.extra_param_count;
+        uint8_t total = query->header.num_params + db->extra_param_count;
         query->num_params_to_fetch = total;
         for (uint8_t i = 0; i < total; i++) {
             query->param_indices[i] = i;
@@ -57,8 +63,8 @@ esp_err_t tsdb_query_init(tsdb_query_t *query,
     }
 
     // Try to use query buffer from pool
-    query->block_buffer = (tsdb_block_t*)tsdb_get_buffer_ptr(&g_state.pool,
-                                                              g_state.query_buffer_offset,
+    query->block_buffer = (tsdb_block_t*)tsdb_get_buffer_ptr(&db->pool,
+                                                              db->query_buffer_offset,
                                                               sizeof(tsdb_block_t));
 
     if (query->block_buffer == NULL) {
@@ -77,7 +83,7 @@ esp_err_t tsdb_query_init(tsdb_query_t *query,
 
     // Find starting block using sparse index
     uint32_t start_block = 0;
-    if (tsdb_find_block_for_timestamp(g_state.file, &query->header,
+    if (tsdb_find_block_for_timestamp(db->file, &query->header,
                                       start_time, &start_block) == ESP_OK) {
         query->current_block_num = start_block;
         ESP_LOGD(TAG, "Starting block: %lu", (unsigned long)start_block);
@@ -109,15 +115,17 @@ esp_err_t tsdb_query_init(tsdb_query_t *query,
 esp_err_t tsdb_query_next(tsdb_query_t *query,
                           uint32_t *timestamp,
                           int16_t *values) {
-    if (query == NULL || timestamp == NULL || values == NULL) {
+    if (query == NULL || query->db == NULL || timestamp == NULL || values == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
+
+    tsdb_t *db = query->db;
 
     // Main query loop
     while (true) {
         // Load block if needed
         if (!query->block_loaded) {
-            esp_err_t ret = tsdb_read_block(query->file, query->current_block_num,
+            esp_err_t ret = tsdb_read_block(db, query->current_block_num,
                                            query->block_buffer);
             if (ret != ESP_OK) {
                 ESP_LOGD(TAG, "Block %lu not found or empty",
@@ -190,7 +198,7 @@ esp_err_t tsdb_query_next(tsdb_query_t *query,
 
             // Calculate absolute record index for overflow lookups
             uint32_t abs_record_idx = 0;
-            if (need_overflow && g_state.extra_param_count > 0) {
+            if (need_overflow && db->extra_param_count > 0) {
                 bool ovf_unlimited = (query->header.max_records == 0);
                 uint32_t available = ovf_unlimited ? query->header.total_records :
                                      ((query->header.total_records < query->header.max_records) ?
@@ -203,13 +211,13 @@ esp_err_t tsdb_query_next(tsdb_query_t *query,
                 uint8_t param_idx = query->param_indices[i];
                 if (param_idx < query->header.num_params) {
                     values[i] = TSDB_BLOCK_PARAM(qraw, qrpb, param_idx, query->offset_in_block - 1);
-                } else if (g_state.extra_param_count > 0 &&
-                           param_idx < (query->header.num_params + g_state.extra_param_count) &&
-                           abs_record_idx >= g_state.first_overflow_record_idx) {
-                    uint32_t overflow_idx = abs_record_idx - g_state.first_overflow_record_idx;
+                } else if (db->extra_param_count > 0 &&
+                           param_idx < (query->header.num_params + db->extra_param_count) &&
+                           abs_record_idx >= db->first_overflow_record_idx) {
+                    uint32_t overflow_idx = abs_record_idx - db->first_overflow_record_idx;
                     uint8_t extra_idx = param_idx - query->header.num_params;
-                    uint32_t ovf_offset = g_state.overflow_data_offset +
-                                         (overflow_idx * g_state.overflow_record_size) +
+                    uint32_t ovf_offset = db->overflow_data_offset +
+                                         (overflow_idx * db->overflow_record_size) +
                                          (extra_idx * sizeof(int16_t));
 
                     long saved_pos = ftell(query->file);
@@ -249,10 +257,11 @@ void tsdb_query_close(tsdb_query_t *query) {
     memset(query, 0, sizeof(tsdb_query_t));
 }
 
-esp_err_t tsdb_query_count(uint32_t start_time,
-                           uint32_t end_time,
-                           uint32_t *count) {
-    if (!g_state.is_open || count == NULL) {
+esp_err_t tsdb_query_count_h(tsdb_t *db,
+                             uint32_t start_time,
+                             uint32_t end_time,
+                             uint32_t *count) {
+    if (db == NULL || !db->is_open || count == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -260,7 +269,7 @@ esp_err_t tsdb_query_count(uint32_t start_time,
 
     // Initialize query
     tsdb_query_t query;
-    esp_err_t ret = tsdb_query_init(&query, start_time, end_time, NULL, 0);
+    esp_err_t ret = tsdb_query_init_h(db, &query, start_time, end_time, NULL, 0);
     if (ret != ESP_OK) {
         return ret;
     }
@@ -285,16 +294,17 @@ esp_err_t tsdb_query_count(uint32_t start_time,
 // AGGREGATION OPERATIONS
 // ============================================================================
 
-esp_err_t tsdb_aggregate(uint32_t start_time,
-                         uint32_t end_time,
-                         uint8_t param_index,
-                         tsdb_agg_type_t agg_type,
-                         int32_t *result) {
-    if (!g_state.is_open || result == NULL) {
+esp_err_t tsdb_aggregate_h(tsdb_t *db,
+                           uint32_t start_time,
+                           uint32_t end_time,
+                           uint8_t param_index,
+                           tsdb_agg_type_t agg_type,
+                           int32_t *result) {
+    if (db == NULL || !db->is_open || result == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (param_index >= (g_state.header.num_params + g_state.extra_param_count)) {
+    if (param_index >= (db->header.num_params + db->extra_param_count)) {
         ESP_LOGE(TAG, "Invalid parameter index: %d", param_index);
         return ESP_ERR_INVALID_ARG;
     }
@@ -302,7 +312,7 @@ esp_err_t tsdb_aggregate(uint32_t start_time,
     // Initialize query for single parameter
     uint8_t params[] = {param_index};
     tsdb_query_t query;
-    esp_err_t ret = tsdb_query_init(&query, start_time, end_time, params, 1);
+    esp_err_t ret = tsdb_query_init_h(db, &query, start_time, end_time, params, 1);
     if (ret != ESP_OK) {
         return ret;
     }
@@ -374,12 +384,13 @@ esp_err_t tsdb_aggregate(uint32_t start_time,
     return ESP_OK;
 }
 
-esp_err_t tsdb_aggregate_multi(uint32_t start_time,
-                                uint32_t end_time,
-                                tsdb_agg_request_t *requests,
-                                uint8_t num_requests,
-                                uint32_t *record_count) {
-    if (!g_state.is_open || requests == NULL || num_requests == 0) {
+esp_err_t tsdb_aggregate_multi_h(tsdb_t *db,
+                                  uint32_t start_time,
+                                  uint32_t end_time,
+                                  tsdb_agg_request_t *requests,
+                                  uint8_t num_requests,
+                                  uint32_t *record_count) {
+    if (db == NULL || !db->is_open || requests == NULL || num_requests == 0) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -387,7 +398,7 @@ esp_err_t tsdb_aggregate_multi(uint32_t start_time,
     uint8_t unique_params[TSDB_MAX_PARAMS];
     uint8_t num_unique = 0;
     for (uint8_t i = 0; i < num_requests; i++) {
-        if (requests[i].param_index >= (g_state.header.num_params + g_state.extra_param_count)) {
+        if (requests[i].param_index >= (db->header.num_params + db->extra_param_count)) {
             ESP_LOGE(TAG, "Invalid parameter index: %d", requests[i].param_index);
             return ESP_ERR_INVALID_ARG;
         }
@@ -406,7 +417,7 @@ esp_err_t tsdb_aggregate_multi(uint32_t start_time,
 
     // Open single query for all needed params
     tsdb_query_t query;
-    esp_err_t ret = tsdb_query_init(&query, start_time, end_time, unique_params, num_unique);
+    esp_err_t ret = tsdb_query_init_h(db, &query, start_time, end_time, unique_params, num_unique);
     if (ret != ESP_OK) {
         return ret;
     }
@@ -487,4 +498,41 @@ esp_err_t tsdb_aggregate_multi(uint32_t start_time,
              num_requests, (unsigned long)count);
 
     return ESP_OK;
+}
+
+// ============================================================================
+// LEGACY GLOBAL API
+// ============================================================================
+
+esp_err_t tsdb_query_init(tsdb_query_t *query,
+                          uint32_t start_time,
+                          uint32_t end_time,
+                          const uint8_t *param_indices,
+                          uint8_t num_params_to_fetch) {
+    return tsdb_query_init_h(g_default_handle, query, start_time, end_time,
+                             param_indices, num_params_to_fetch);
+}
+
+esp_err_t tsdb_query_count(uint32_t start_time,
+                           uint32_t end_time,
+                           uint32_t *count) {
+    return tsdb_query_count_h(g_default_handle, start_time, end_time, count);
+}
+
+esp_err_t tsdb_aggregate(uint32_t start_time,
+                         uint32_t end_time,
+                         uint8_t param_index,
+                         tsdb_agg_type_t agg_type,
+                         int32_t *result) {
+    return tsdb_aggregate_h(g_default_handle, start_time, end_time,
+                            param_index, agg_type, result);
+}
+
+esp_err_t tsdb_aggregate_multi(uint32_t start_time,
+                                uint32_t end_time,
+                                tsdb_agg_request_t *requests,
+                                uint8_t num_requests,
+                                uint32_t *record_count) {
+    return tsdb_aggregate_multi_h(g_default_handle, start_time, end_time,
+                                   requests, num_requests, record_count);
 }
