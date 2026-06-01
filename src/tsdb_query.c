@@ -75,33 +75,36 @@ esp_err_t tsdb_query_init(tsdb_query_t *query,
         ESP_LOGD(TAG, "Using query buffer from pool at %p", query->block_buffer);
     }
 
-    // Find starting block using sparse index
-    uint32_t start_block = 0;
-    if (tsdb_find_block_for_timestamp(g_state.file, &query->header,
-                                      start_time, &start_block) == ESP_OK) {
-        query->current_block_num = start_block;
-        ESP_LOGD(TAG, "Starting block: %lu", (unsigned long)start_block);
-    }
-
-    // Calculate record index range
+    // Walk the ring in logical (time-ascending) order. Records are written at
+    // slot = total_records % max_records, and on eviction oldest_record_idx
+    // advances, so reading slots oldest_record_idx, +1, +2, ... (mod
+    // max_records) yields strictly ascending timestamps.
+    //
+    // We do NOT use the sparse index to seek to start_time: once the ring has
+    // wrapped, index entries are ordered by physical slot (the slot they were
+    // last written at), not by timestamp, so a binary search on them is
+    // invalid and lands in the wrong place. A full logical scan with an
+    // early-exit once ts > end_time is correct for every range and is bounded
+    // by `available` record reads (one pass over the ring).
     bool unlimited = (query->header.max_records == 0);
     uint32_t available_records = unlimited ? query->header.total_records :
                                  ((query->header.total_records < query->header.max_records) ?
                                   query->header.total_records : query->header.max_records);
 
-    query->current_record_idx = query->header.oldest_record_idx;
-    query->end_record_idx = unlimited ? available_records :
-                           ((query->header.oldest_record_idx + available_records) %
-                            query->header.max_records);
+    uint16_t rpb = query->header.records_per_block;
+    uint32_t first_slot = unlimited ? 0 : query->header.oldest_record_idx;
 
-    query->offset_in_block = 0;
+    query->current_record_idx = first_slot;       // current absolute ring slot
+    query->end_record_idx = available_records;     // total records to scan
+    query->records_scanned = 0;                    // ring slots consumed so far
+    query->current_block_num = rpb ? (first_slot / rpb) : 0;
+    query->offset_in_block = rpb ? (first_slot % rpb) : 0;
     query->block_loaded = false;
 
-    ESP_LOGI(TAG, "Query initialized: time=[%lu, %lu], params=%d, records=%lu-%lu",
+    ESP_LOGD(TAG, "Query init: time=[%lu, %lu], params=%d, scan %lu records from slot %lu",
              (unsigned long)start_time, (unsigned long)end_time,
              query->num_params_to_fetch,
-             (unsigned long)query->current_record_idx,
-             (unsigned long)query->end_record_idx);
+             (unsigned long)available_records, (unsigned long)first_slot);
 
     return ESP_OK;
 }
@@ -113,125 +116,89 @@ esp_err_t tsdb_query_next(tsdb_query_t *query,
         return ESP_ERR_INVALID_ARG;
     }
 
-    // Main query loop
-    while (true) {
-        // Load block if needed
+    bool unlimited = (query->header.max_records == 0);
+    uint32_t available = query->end_record_idx;   // total records to scan (fixed)
+    uint16_t qrpb = query->header.records_per_block;
+
+    // Walk the ring one slot at a time in logical (time-ascending) order,
+    // wrapping the physical slot/block modulo max_records. Stop once we've
+    // visited every retained record or passed end_time.
+    while (query->records_scanned < available) {
         if (!query->block_loaded) {
-            esp_err_t ret = tsdb_read_block(query->file, query->current_block_num,
-                                           query->block_buffer);
-            if (ret != ESP_OK) {
-                ESP_LOGD(TAG, "Block %lu not found or empty",
+            if (tsdb_read_block(query->file, query->current_block_num,
+                                query->block_buffer) != ESP_OK) {
+                // Every slot inside the ring has a backing block; a read
+                // failure here means truncation/corruption -- stop cleanly.
+                ESP_LOGD(TAG, "Block %lu unreadable mid-ring",
                          (unsigned long)query->current_block_num);
                 return ESP_ERR_NOT_FOUND;
             }
-
             query->block_loaded = true;
-            query->offset_in_block = 0;
-
-            ESP_LOGD(TAG, "Loaded block %lu: %d records",
-                     (unsigned long)query->current_block_num,
-                     TSDB_BLOCK_COUNT((uint8_t *)query->block_buffer));
         }
 
-        // Check if we've exhausted this block
-        if (query->offset_in_block >= TSDB_BLOCK_COUNT((uint8_t *)query->block_buffer)) {
-            // Move to next block
-            query->current_block_num++;
-            query->block_loaded = false;
-            // Note: current_record_idx already incremented per-record in the loop below
-
-            // Check if we've scanned all available records
-            uint32_t total_scanned = query->current_record_idx - query->header.oldest_record_idx;
-            bool q_unlimited = (query->header.max_records == 0);
-            uint32_t available = q_unlimited ? query->header.total_records :
-                                ((query->header.total_records < query->header.max_records) ?
-                                 query->header.total_records : query->header.max_records);
-
-            if (total_scanned >= available) {
-                ESP_LOGD(TAG, "Scanned all available records");
-                return ESP_ERR_NOT_FOUND;
-            }
-
-            continue;
-        }
-
-        // Read timestamp from current position
         uint8_t *qraw = (uint8_t *)query->block_buffer;
-        uint16_t qrpb = query->header.records_per_block;
-        uint32_t ts = TSDB_BLOCK_TS(qraw, query->offset_in_block);
+        uint16_t cur_off = query->offset_in_block;
+        uint32_t ts = TSDB_BLOCK_TS(qraw, cur_off);
 
-        // Advance position
-        query->offset_in_block++;
-        query->current_record_idx++;
+        // Absolute record index (in total_records space) of the slot we are
+        // about to read; the k-th oldest retained record maps to
+        // (total_records - available) + k. Needed for overflow lookups.
+        uint32_t abs_record_idx = (query->header.total_records - available) +
+                                  query->records_scanned;
 
-        // Check if timestamp is valid (non-zero)
-        if (ts == 0) {
-            continue;  // Skip uninitialized records
+        // Advance the ring cursor to the next slot (wrap modulo max_records).
+        uint32_t next_slot = unlimited ? (query->current_record_idx + 1) :
+                             ((query->current_record_idx + 1) % query->header.max_records);
+        uint32_t next_block = qrpb ? (next_slot / qrpb) : 0;
+        if (next_block != query->current_block_num) {
+            query->current_block_num = next_block;
+            query->block_loaded = false;
         }
+        query->offset_in_block = qrpb ? (next_slot % qrpb) : 0;
+        query->current_record_idx = next_slot;
+        query->records_scanned++;
 
-        // Check if beyond end time (optimization: stop early)
-        if (ts > query->end_time) {
-            ESP_LOGD(TAG, "Reached end time");
-            return ESP_ERR_NOT_FOUND;
-        }
+        if (ts == 0)
+            continue;                       // uninitialized slot
+        if (ts > query->end_time)
+            return ESP_ERR_NOT_FOUND;       // ascending order -> no later matches
+        if (ts < query->start_time)
+            continue;                       // before the window
 
-        // Check if in range
-        if (ts >= query->start_time && ts <= query->end_time) {
-            *timestamp = ts;
+        // In range -> emit this record.
+        *timestamp = ts;
+        for (uint8_t i = 0; i < query->num_params_to_fetch; i++) {
+            uint8_t param_idx = query->param_indices[i];
+            if (param_idx < query->header.num_params) {
+                values[i] = TSDB_BLOCK_PARAM(qraw, qrpb, param_idx, cur_off);
+            } else if (g_state.extra_param_count > 0 &&
+                       param_idx < (query->header.num_params + g_state.extra_param_count) &&
+                       abs_record_idx >= g_state.first_overflow_record_idx) {
+                uint32_t overflow_idx = abs_record_idx - g_state.first_overflow_record_idx;
+                uint8_t extra_idx = param_idx - query->header.num_params;
+                uint32_t ovf_offset = g_state.overflow_data_offset +
+                                     (overflow_idx * g_state.overflow_record_size) +
+                                     (extra_idx * sizeof(int16_t));
 
-            // Extract requested parameters (columnar read for base, overflow for extra)
-            bool need_overflow = false;
-            for (uint8_t i = 0; i < query->num_params_to_fetch; i++) {
-                if (query->param_indices[i] >= query->header.num_params) {
-                    need_overflow = true;
-                    break;
-                }
-            }
-
-            // Calculate absolute record index for overflow lookups
-            uint32_t abs_record_idx = 0;
-            if (need_overflow && g_state.extra_param_count > 0) {
-                bool ovf_unlimited = (query->header.max_records == 0);
-                uint32_t available = ovf_unlimited ? query->header.total_records :
-                                     ((query->header.total_records < query->header.max_records) ?
-                                      query->header.total_records : query->header.max_records);
-                abs_record_idx = (query->header.total_records - available) +
-                                 (query->current_record_idx - 1 - query->header.oldest_record_idx);
-            }
-
-            for (uint8_t i = 0; i < query->num_params_to_fetch; i++) {
-                uint8_t param_idx = query->param_indices[i];
-                if (param_idx < query->header.num_params) {
-                    values[i] = TSDB_BLOCK_PARAM(qraw, qrpb, param_idx, query->offset_in_block - 1);
-                } else if (g_state.extra_param_count > 0 &&
-                           param_idx < (query->header.num_params + g_state.extra_param_count) &&
-                           abs_record_idx >= g_state.first_overflow_record_idx) {
-                    uint32_t overflow_idx = abs_record_idx - g_state.first_overflow_record_idx;
-                    uint8_t extra_idx = param_idx - query->header.num_params;
-                    uint32_t ovf_offset = g_state.overflow_data_offset +
-                                         (overflow_idx * g_state.overflow_record_size) +
-                                         (extra_idx * sizeof(int16_t));
-
-                    long saved_pos = ftell(query->file);
-                    fseek(query->file, ovf_offset, SEEK_SET);
-                    int16_t extra_val = 0;
-                    if (fread(&extra_val, sizeof(int16_t), 1, query->file) == 1) {
-                        values[i] = extra_val;
-                    } else {
-                        values[i] = 0;
-                    }
-                    fseek(query->file, saved_pos, SEEK_SET);
+                long saved_pos = ftell(query->file);
+                fseek(query->file, ovf_offset, SEEK_SET);
+                int16_t extra_val = 0;
+                if (fread(&extra_val, sizeof(int16_t), 1, query->file) == 1) {
+                    values[i] = extra_val;
                 } else {
-                    values[i] = 0;  // Pre-overflow or invalid index
+                    values[i] = 0;
                 }
+                fseek(query->file, saved_pos, SEEK_SET);
+            } else {
+                values[i] = 0;  // Pre-overflow or invalid index
             }
-
-            ESP_LOGD(TAG, "Found record: ts=%lu", (unsigned long)ts);
-            return ESP_OK;
         }
 
-        // Skip record (before start_time)
+        ESP_LOGD(TAG, "Found record: ts=%lu", (unsigned long)ts);
+        return ESP_OK;
     }
+
+    return ESP_ERR_NOT_FOUND;
 }
 
 void tsdb_query_close(tsdb_query_t *query) {

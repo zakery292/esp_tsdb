@@ -246,6 +246,7 @@ struct tsdb_query_s {
     // Iterator state
     uint32_t current_record_idx;
     uint32_t end_record_idx;
+    uint32_t records_scanned;       // ring slots consumed so far this query
     uint32_t current_block_num;
     uint16_t offset_in_block;
 
