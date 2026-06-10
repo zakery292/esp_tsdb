@@ -6,6 +6,7 @@
 #include "tsdb_internal.h"
 #include "esp_log.h"
 #include <string.h>
+#include <stdlib.h>
 #include <stddef.h>
 #include <sys/stat.h>
 #include <unistd.h>

@@ -6,3 +6,4 @@ typedef uint32_t TickType_t; typedef uint8_t StackType_t;
 #define pdTRUE 1
 #define pdFALSE 0
 static inline UBaseType_t uxTaskGetStackHighWaterMark(void*t){(void)t;return 4096;}
+#define pdMS_TO_TICKS(x) (x)
