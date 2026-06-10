@@ -7,6 +7,9 @@
 #define TSDB_INTERNAL_H
 
 #include "esp_tsdb.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "esp_log.h"
 #include <stdio.h>
 
 // ============================================================================
@@ -82,10 +85,36 @@ typedef struct {
     uint32_t overflow_data_offset;      // overflow_offset + TSDB_OVERFLOW_HEADER_SIZE
     uint32_t first_overflow_record_idx;
     uint16_t overflow_record_size;
+
+    // Global mutex serialising every public mutating + reading API. The HTTP
+    // handler that calls tsdb_clear()/tsdb_close() races the inverter poller
+    // mid-tsdb_write() — without this lock, close() invalidates g_state.file
+    // while a writer is still using it (crash / corruption). Recursive so the
+    // close→delete→init chain from migration paths doesn't self-deadlock.
+    SemaphoreHandle_t lock;
 } tsdb_state_t;
 
 // Global state (defined in tsdb_core.c)
 extern tsdb_state_t g_state;
+
+// Lock helpers (defined in tsdb_core.c). Recursive mutex — same task may
+// re-enter via close→delete→init or write→header chains without deadlock.
+static inline bool tsdb_lock(uint32_t timeout_ms) {
+    if (g_state.lock == NULL) return true;  // pre-init paths
+    return xSemaphoreTakeRecursive(g_state.lock, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
+}
+
+static inline void tsdb_unlock(void) {
+    if (g_state.lock != NULL) {
+        xSemaphoreGiveRecursive(g_state.lock);
+    }
+}
+
+#define TSDB_LOCK_OR_RETURN(timeout_ms, errval) \
+    do { if (!tsdb_lock(timeout_ms)) { \
+        ESP_LOGE(TAG, "%s: lock timeout", __func__); \
+        return (errval); \
+    } } while (0)
 
 // ============================================================================
 // INTERNAL FUNCTIONS

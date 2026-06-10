@@ -7,8 +7,13 @@
 #include "esp_log.h"
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
 
 static const char *TAG = "TSDB_WRITE";
+
+// Adaptive capacity: once we've shrunk max_records in response to ENOSPC,
+// don't keep shrinking on every subsequent write. Reset per boot.
+static bool g_capacity_adapted = false;
 
 // ============================================================================
 // BLOCK I/O
@@ -37,6 +42,9 @@ esp_err_t tsdb_read_block(FILE *file, uint32_t block_num, tsdb_block_t *block) {
 
 /**
  * @brief Write a data block to file
+ *
+ * Returns ESP_ERR_NO_MEM specifically when the filesystem is full (ENOSPC),
+ * so the caller can adapt capacity and retry via LRU eviction.
  */
 esp_err_t tsdb_write_block(FILE *file, uint32_t block_num, const tsdb_block_t *block) {
     if (file == NULL || block == NULL) {
@@ -46,12 +54,21 @@ esp_err_t tsdb_write_block(FILE *file, uint32_t block_num, const tsdb_block_t *b
     uint32_t block_offset = tsdb_calc_block_offset(&g_state.header, block_num);
 
     fseek(file, block_offset, SEEK_SET);
+    errno = 0;
     size_t written = fwrite(block, TSDB_BLOCK_SIZE, 1, file);
+    int write_errno = errno;
     fflush(file);
     fsync(fileno(file));
 
     if (written != 1) {
-        ESP_LOGE(TAG, "Failed to write block %lu", (unsigned long)block_num);
+        if (write_errno == ENOSPC) {
+            ESP_LOGW(TAG, "Block %lu write: filesystem full (ENOSPC)",
+                     (unsigned long)block_num);
+            clearerr(file);
+            return ESP_ERR_NO_MEM;
+        }
+        ESP_LOGE(TAG, "Failed to write block %lu (errno=%d)",
+                 (unsigned long)block_num, write_errno);
         return ESP_FAIL;
     }
 
@@ -66,16 +83,21 @@ esp_err_t tsdb_write_block(FILE *file, uint32_t block_num, const tsdb_block_t *b
 // ============================================================================
 
 esp_err_t tsdb_write(uint32_t timestamp, const int16_t *values) {
+    TSDB_LOCK_OR_RETURN(5000, ESP_ERR_TIMEOUT);
     if (!g_state.is_open) {
         ESP_LOGE(TAG, "Not initialized");
+        tsdb_unlock();
         return ESP_ERR_INVALID_STATE;
     }
 
     if (values == NULL) {
         ESP_LOGE(TAG, "NULL values pointer");
+        tsdb_unlock();
         return ESP_ERR_INVALID_ARG;
     }
 
+retry_write:
+    {}  // label target — allow re-entry after adaptive shrink
     // Calculate record index (ring buffer or unlimited)
     bool unlimited = (g_state.header.max_records == 0);
     uint32_t record_idx = unlimited ? g_state.header.total_records :
@@ -138,8 +160,26 @@ esp_err_t tsdb_write(uint32_t timestamp, const int16_t *values) {
 
     // Write block back to file
     ret = tsdb_write_block(g_state.file, block_num, block);
+    if (ret == ESP_ERR_NO_MEM && !is_eviction && !g_capacity_adapted &&
+        g_state.header.total_records > 0) {
+        // Filesystem full while still growing. Cap max_records to what we've
+        // already written so future writes reuse existing blocks via LRU
+        // instead of allocating new ones. Header rewrite is in-place (512 bytes)
+        // so it doesn't need new space.
+        uint32_t old_max = g_state.header.max_records;
+        g_state.header.max_records = g_state.header.total_records;
+        g_capacity_adapted = true;
+        ESP_LOGW(TAG, "Adaptive capacity: %lu -> %lu records (LRU from now on)",
+                 (unsigned long)old_max,
+                 (unsigned long)g_state.header.max_records);
+        // Persist the new cap. If this fails we still retry - the in-memory
+        // header is authoritative for the retry path.
+        tsdb_write_header(g_state.file, &g_state.header);
+        goto retry_write;
+    }
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to write block");
+        tsdb_unlock();
         return ret;
     }
 
@@ -217,6 +257,7 @@ esp_err_t tsdb_write(uint32_t timestamp, const int16_t *values) {
              (unsigned long)g_state.header.total_records,
              (unsigned long)g_state.header.newest_timestamp);
 
+    tsdb_unlock();
     return ESP_OK;
 }
 

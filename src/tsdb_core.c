@@ -16,6 +16,9 @@ static const char *TAG = "TSDB_CORE";
 // Global state
 tsdb_state_t g_state = {0};
 
+// Locking helpers (tsdb_lock / tsdb_unlock / TSDB_LOCK_OR_RETURN) live in
+// tsdb_internal.h so all TUs can use them.
+
 // ============================================================================
 // INTERNAL HELPERS
 // ============================================================================
@@ -31,6 +34,62 @@ static void tsdb_flush_and_sync(FILE *file) {
     if (file == NULL) return;
     fflush(file);
     fsync(fileno(file));
+}
+
+/**
+ * @brief Cross-field sanity check on a header that already passed the magic
+ * check. Defends against the case where SD or flash returns stale/torn bytes
+ * that happen to contain a valid magic word but garbage in other fields.
+ *
+ * Without this, a corrupt header can pass init then crash later with:
+ *   - division by zero (records_per_block == 0) in tsdb_index.c
+ *   - out-of-bounds reads (records_per_block huge) via TSDB_BLOCK_PARAM macro
+ *   - infinite loops creating index entries (index_entries == 0xFFFFFFFF)
+ *   - wild fseek offsets (index_offset/index_entries inflated)
+ *
+ * Returns true if the header is plausible. False means treat as corrupt and
+ * reconstruct.
+ */
+static bool tsdb_header_is_sane(const tsdb_header_t *h) {
+    if (h == NULL) return false;
+
+    // num_params must be in the supported range
+    if (h->num_params == 0 || h->num_params > 16) return false;
+    if (h->base_params != 0 && h->base_params > h->num_params) return false;
+
+    // param_size must be exactly 2 (int16_t)
+    if (h->param_size != 0 && h->param_size != 2) return false;
+
+    // record_size = 4 (timestamp) + num_params * 2
+    uint16_t expected_rs = 4 + (h->num_params * 2);
+    if (h->record_size != 0 && h->record_size != expected_rs) return false;
+
+    // records_per_block: must be > 0 and fit in the block (after 8B overhead)
+    uint16_t max_rpb = (TSDB_BLOCK_SIZE - 8) / expected_rs;
+    if (h->records_per_block == 0 || h->records_per_block > max_rpb) return false;
+
+    // index_offset: must be at least header size (512), and reasonable
+    if (h->index_offset < 512 || h->index_offset > 0x10000) return false;
+
+    // index_entries: cap to something sane (1M = ~8MB of index)
+    if (h->index_entries > 0x100000) return false;
+
+    // index_stride: 0 means future divide-by-zero
+    if (h->index_stride == 0) return false;
+
+    // max_records: cap at 100M (more than enough for years of 5min data)
+    if (h->max_records > 100000000UL) return false;
+
+    // total_records can't exceed max_records (when set)
+    if (h->max_records > 0 && h->total_records > h->max_records * 2) return false;
+
+    // overflow record size, when overflow is enabled, must be plausible
+    if (h->extra_param_count > 0) {
+        if (h->extra_param_count > 48) return false;
+        if (h->overflow_record_size == 0 || h->overflow_record_size > TSDB_BLOCK_SIZE) return false;
+    }
+
+    return true;
 }
 
 /**
@@ -116,8 +175,45 @@ static esp_err_t tsdb_reconstruct_header(FILE *file, tsdb_header_t *header,
     header->max_records = config->max_records;
     header->index_stride = config->index_stride > 0 ? config->index_stride : 380;
     header->index_offset = 512;
-    header->index_entries = config->max_records > 0 ?
+
+    // index_entries: try the value derived from config first, but verify it
+    // points at a real data region. If the file was created with a different
+    // max_records (e.g. capacity recalc on reboot, or a config change since
+    // the file was made), the config-derived index_entries puts data_offset
+    // in the wrong place and the block scan finds nothing → silent data wipe.
+    //
+    // Probe several plausible index_entries values and accept the first one
+    // where the candidate data_offset has a valid block magic (TSDB_BLOCK_MAGIC).
+    // Fallback to the config-derived value if no probe matches (caller will
+    // then proceed, and if the DB really is empty we report 0 records — same
+    // outcome as before, no worse).
+    uint32_t cfg_entries = config->max_records > 0 ?
         (config->max_records / header->index_stride) + 1 : 256;
+    uint32_t candidate_entries[] = {
+        cfg_entries,
+        256,                // legacy default for "unlimited" databases
+        128, 138, 165, 200, // observed values from prior captures
+        512, 1024, 2048,
+    };
+    uint32_t probed_entries = 0;
+    for (size_t i = 0; i < sizeof(candidate_entries) / sizeof(candidate_entries[0]); i++) {
+        uint32_t entries = candidate_entries[i];
+        uint32_t probe_offset = 512 + (entries * (uint32_t)sizeof(tsdb_index_entry_t));
+        if (probe_offset + TSDB_BLOCK_SIZE > (uint32_t)file_size) continue;
+        fseek(file, probe_offset, SEEK_SET);
+        uint32_t magic = 0;
+        if (fread(&magic, sizeof(magic), 1, file) == 1 && magic == 0x424C4B54) {
+            probed_entries = entries;
+            ESP_LOGI(TAG, "Reconstruct: probed index_entries=%lu (data starts at offset %lu, magic OK)",
+                     (unsigned long)entries, (unsigned long)probe_offset);
+            break;
+        }
+    }
+    header->index_entries = probed_entries > 0 ? probed_entries : cfg_entries;
+    if (probed_entries == 0) {
+        ESP_LOGW(TAG, "Reconstruct: no block magic found at any probe offset — falling back to config-derived index_entries=%lu",
+                 (unsigned long)cfg_entries);
+    }
 
     // Copy parameter names
     if (config->param_names) {
@@ -238,8 +334,24 @@ esp_err_t tsdb_init(const tsdb_config_t *config) {
         return ESP_ERR_INVALID_ARG;
     }
 
+    // Create the recursive mutex on first init. Survives close()/re-init so
+    // the lock is stable across clear-all (which calls close + unlink + init).
+    if (g_state.lock == NULL) {
+        g_state.lock = xSemaphoreCreateRecursiveMutex();
+        if (g_state.lock == NULL) {
+            ESP_LOGE(TAG, "Failed to create state mutex");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    // Hold the lock for the rest of init — concurrent callers will see is_open
+    // either false (we're about to set it) or true (we set it just below) and
+    // skip cleanly.
+    TSDB_LOCK_OR_RETURN(5000, ESP_ERR_TIMEOUT);
+
     if (g_state.is_open) {
         ESP_LOGW(TAG, "Already initialized");
+        tsdb_unlock();
         return ESP_OK;
     }
 
@@ -256,6 +368,7 @@ esp_err_t tsdb_init(const tsdb_config_t *config) {
                                            config->alloc_strategy);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to allocate buffer pool");
+        tsdb_unlock();
         return ret;
     }
 
@@ -292,11 +405,13 @@ esp_err_t tsdb_init(const tsdb_config_t *config) {
         if (g_state.file == NULL) {
             ESP_LOGE(TAG, "Failed to open existing file");
             tsdb_free_buffer_pool(&g_state.pool);
+            tsdb_unlock();
             return ESP_FAIL;
         }
 
         // Read and validate header
         bool needs_reconstruction = false;
+        bool torn_migration = false;
 
         if (tsdb_read_header(g_state.file, &g_state.header) != ESP_OK) {
             ESP_LOGW(TAG, "Failed to read header - will attempt reconstruction");
@@ -305,9 +420,35 @@ esp_err_t tsdb_init(const tsdb_config_t *config) {
             ESP_LOGW(TAG, "Invalid magic number: 0x%08lX (expected 0x%08X) - will attempt reconstruction",
                      (unsigned long)g_state.header.magic, TSDB_MAGIC);
             needs_reconstruction = true;
+        } else if (g_state.header.version == 99) {
+            // Sentinel set by V2->V3 migration before it started rewriting
+            // blocks in place. If we see it on boot, the previous migration
+            // was interrupted (power cut) and the file is now a mix of V2
+            // and V3 blocks — unrecoverable. Recreate from scratch.
+            ESP_LOGE(TAG, "Torn V2->V3 migration detected (version=99) — recreating DB");
+            torn_migration = true;
+        } else if (!tsdb_header_is_sane(&g_state.header)) {
+            // Magic check passed but field values are implausible. This is the
+            // smoking gun for brownout-during-write or SD-returns-stale-bytes:
+            // header bytes look superficially valid but downstream code would
+            // divide by zero, infinite-loop, or read out of bounds.
+            ESP_LOGW(TAG,
+                "Header magic OK but field values insane (np=%u rpb=%u stride=%lu idx_off=%lu idx_ent=%lu) — reconstructing",
+                g_state.header.num_params,
+                g_state.header.records_per_block,
+                (unsigned long)g_state.header.index_stride,
+                (unsigned long)g_state.header.index_offset,
+                (unsigned long)g_state.header.index_entries);
+            needs_reconstruction = true;
         }
 
-        if (needs_reconstruction) {
+        if (torn_migration) {
+            // No salvage path — close, unlink, fall through to fresh-create
+            // branch below.
+            fclose(g_state.file);
+            unlink(config->filepath);
+            file_exists = false;
+        } else if (needs_reconstruction) {
             // Check file size - if too small, delete and recreate
             fseek(g_state.file, 0, SEEK_END);
             long file_size = ftell(g_state.file);
@@ -330,6 +471,7 @@ esp_err_t tsdb_init(const tsdb_config_t *config) {
                         ESP_LOGE(TAG, "Failed to write reconstructed header");
                         fclose(g_state.file);
                         tsdb_free_buffer_pool(&g_state.pool);
+                        tsdb_unlock();
                         return ESP_FAIL;
                     }
 
@@ -371,8 +513,36 @@ esp_err_t tsdb_init(const tsdb_config_t *config) {
                 #define OLD_TS_OFFSET(r)       (8 + (r) * 4)
                 #define OLD_PARAM_OFFSET(p, r) (160 + (p) * 76 + (r) * 2)
 
-                uint8_t disk_block[TSDB_BLOCK_SIZE];
-                uint8_t new_block[TSDB_BLOCK_SIZE];
+                // Heap-allocated rather than stack: two TSDB_BLOCK_SIZE arrays
+                // would consume 2KB of the 4.6KB main task stack — fine in
+                // isolation but tsdb_init is called with significant frames
+                // already pushed (from app_main path).
+                uint8_t *disk_block = malloc(TSDB_BLOCK_SIZE);
+                uint8_t *new_block = malloc(TSDB_BLOCK_SIZE);
+                if (!disk_block || !new_block) {
+                    ESP_LOGE(TAG, "Migration alloc failed — keeping V2 layout (will retry next boot)");
+                    free(disk_block);
+                    free(new_block);
+                    // DO NOT bump the version. Previous code did
+                    // `header.version = 3` here to "avoid retrying", but that
+                    // marked the file as V3 while the on-disk blocks were
+                    // still V2 — subsequent reads via TSDB_BLOCK_PARAM read
+                    // garbage offsets. Leaving version=2 means we'll attempt
+                    // migration again next boot when memory might be available.
+                    goto migration_done;
+                }
+
+                // Atomic-migration sentinel: write version=99 BEFORE we start
+                // rewriting blocks in place. If a power cut leaves the file
+                // mid-migration with some V2 and some V3 blocks, the next
+                // boot will see version=99 and know the data is corrupted →
+                // unlink + recreate (handled at the top of this function).
+                uint8_t saved_version = g_state.header.version;
+                g_state.header.version = 99;
+                tsdb_write_header(g_state.file, &g_state.header);
+                fflush(g_state.file);
+                fsync(fileno(g_state.file));
+                (void)saved_version;
 
                 for (uint32_t b = 0; b < total_blocks; b++) {
                     uint32_t blk_offset = tsdb_calc_block_offset(&g_state.header, b);
@@ -411,6 +581,9 @@ esp_err_t tsdb_init(const tsdb_config_t *config) {
                 #undef OLD_TS_OFFSET
                 #undef OLD_PARAM_OFFSET
 
+                free(disk_block);
+                free(new_block);
+
                 fflush(g_state.file);
                 fsync(fileno(g_state.file));
 
@@ -418,6 +591,7 @@ esp_err_t tsdb_init(const tsdb_config_t *config) {
                 tsdb_write_header(g_state.file, &g_state.header);
                 ESP_LOGI(TAG, "V2->V3 block layout migration complete (%lu blocks)",
                          (unsigned long)total_blocks);
+migration_done: ;
             } else if (g_state.header.version < 3) {
                 // No migration needed (rpb <= 38), just bump version
                 g_state.header.version = 3;
@@ -450,6 +624,7 @@ esp_err_t tsdb_init(const tsdb_config_t *config) {
         if (g_state.file == NULL) {
             ESP_LOGE(TAG, "Failed to create new file");
             tsdb_free_buffer_pool(&g_state.pool);
+            tsdb_unlock();
             return ESP_FAIL;
         }
 
@@ -496,6 +671,7 @@ esp_err_t tsdb_init(const tsdb_config_t *config) {
             ESP_LOGE(TAG, "Failed to write header");
             fclose(g_state.file);
             tsdb_free_buffer_pool(&g_state.pool);
+            tsdb_unlock();
             return ESP_FAIL;
         }
 
@@ -516,20 +692,28 @@ esp_err_t tsdb_init(const tsdb_config_t *config) {
 
     ESP_LOGI(TAG, "TSDB initialized successfully");
 
+    tsdb_unlock();
     return ESP_OK;
 }
 
 esp_err_t tsdb_close(void) {
+    TSDB_LOCK_OR_RETURN(5000, ESP_ERR_TIMEOUT);
+
     if (!g_state.is_open) {
+        tsdb_unlock();
         return ESP_OK;
     }
 
     ESP_LOGI(TAG, "Closing TSDB");
 
-    // Flush any cached writes
+    // No write cache is currently used — every tsdb_write() in tsdb_write.c
+    // does its own fflush+fsync. cache_dirty is never set to true today.
+    // If a future deferred-write path is added, set cache_dirty=true on
+    // dirty and flush it here. Removed the stale TODO so it doesn't
+    // accidentally silently drop data if cache_dirty ever becomes true.
     if (g_state.cache_dirty) {
-        ESP_LOGW(TAG, "Flushing dirty cache on close");
-        // TODO: Implement write cache flush
+        ESP_LOGE(TAG, "tsdb_close: cache_dirty set but no flush implemented — data may be lost. Investigate.");
+        g_state.cache_dirty = false;
     }
 
     // Update header
@@ -546,19 +730,26 @@ esp_err_t tsdb_close(void) {
 
     ESP_LOGI(TAG, "TSDB closed");
 
+    tsdb_unlock();
     return ESP_OK;
 }
 
 bool tsdb_is_initialized(void) {
+    // Single bool read; atomic on 32-bit MCU. Skip lock to avoid recursive
+    // takes from callers that already hold it (or worse, from tasks that
+    // shouldn't block on it).
     return g_state.is_open;
 }
 
 esp_err_t tsdb_get_stats(tsdb_stats_t *stats) {
+    TSDB_LOCK_OR_RETURN(2000, ESP_ERR_TIMEOUT);
     if (!g_state.is_open) {
+        tsdb_unlock();
         return ESP_ERR_INVALID_STATE;
     }
 
     if (stats == NULL) {
+        tsdb_unlock();
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -583,11 +774,14 @@ esp_err_t tsdb_get_stats(tsdb_stats_t *stats) {
         stats->storage_bytes = 0;
     }
 
+    tsdb_unlock();
     return ESP_OK;
 }
 
 esp_err_t tsdb_clear(void) {
+    TSDB_LOCK_OR_RETURN(5000, ESP_ERR_TIMEOUT);
     if (!g_state.is_open) {
+        tsdb_unlock();
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -621,28 +815,33 @@ esp_err_t tsdb_clear(void) {
 
     ESP_LOGI(TAG, "Database cleared");
 
+    tsdb_unlock();
     return ESP_OK;
 }
 
 esp_err_t tsdb_delete(void) {
+    TSDB_LOCK_OR_RETURN(5000, ESP_ERR_TIMEOUT);
     if (!g_state.is_open) {
+        tsdb_unlock();
         return ESP_ERR_INVALID_STATE;
     }
 
     char filepath_copy[128];
     strncpy(filepath_copy, g_state.filepath, sizeof(filepath_copy));
 
-    // Close first
+    // Close first (recursive lock — we already hold it)
     tsdb_close();
 
     // Delete file
     if (unlink(filepath_copy) != 0) {
         ESP_LOGE(TAG, "Failed to delete file: %s", filepath_copy);
+        tsdb_unlock();
         return ESP_FAIL;
     }
 
     ESP_LOGI(TAG, "Database deleted: %s", filepath_copy);
 
+    tsdb_unlock();
     return ESP_OK;
 }
 
@@ -651,14 +850,18 @@ esp_err_t tsdb_delete(void) {
 // ============================================================================
 
 esp_err_t tsdb_add_extra_params(const char **param_names, uint8_t count) {
+    TSDB_LOCK_OR_RETURN(5000, ESP_ERR_TIMEOUT);
     if (!g_state.is_open) {
+        tsdb_unlock();
         return ESP_ERR_INVALID_STATE;
     }
     if (count == 0 || count > TSDB_MAX_EXTRA_PARAMS || param_names == NULL) {
+        tsdb_unlock();
         return ESP_ERR_INVALID_ARG;
     }
     if (g_state.extra_param_count > 0) {
         ESP_LOGW(TAG, "Overflow already active with %d params", g_state.extra_param_count);
+        tsdb_unlock();
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -684,6 +887,7 @@ esp_err_t tsdb_add_extra_params(const char **param_names, uint8_t count) {
     fseek(g_state.file, overflow_offset, SEEK_SET);
     if (fwrite(&ovf_header, sizeof(ovf_header), 1, g_state.file) != 1) {
         ESP_LOGE(TAG, "Failed to write overflow header");
+        tsdb_unlock();
         return ESP_FAIL;
     }
     fflush(g_state.file);
@@ -697,6 +901,7 @@ esp_err_t tsdb_add_extra_params(const char **param_names, uint8_t count) {
 
     if (tsdb_write_header(g_state.file, &g_state.header) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to update header with overflow info");
+        tsdb_unlock();
         return ESP_FAIL;
     }
 
@@ -709,26 +914,31 @@ esp_err_t tsdb_add_extra_params(const char **param_names, uint8_t count) {
     ESP_LOGI(TAG, "Overflow region created: offset=%lu, %d params, record_size=%d",
              (unsigned long)overflow_offset, count, g_state.overflow_record_size);
 
+    tsdb_unlock();
     return ESP_OK;
 }
 
 esp_err_t tsdb_migrate_overflow(const char **new_names, uint8_t new_count) {
-    if (!g_state.is_open) return ESP_ERR_INVALID_STATE;
-    if (new_count > TSDB_MAX_EXTRA_PARAMS) return ESP_ERR_INVALID_ARG;
-    if (new_count > 0 && new_names == NULL) return ESP_ERR_INVALID_ARG;
+    TSDB_LOCK_OR_RETURN(30000, ESP_ERR_TIMEOUT);  // can take a while for large migrations
+    if (!g_state.is_open) { tsdb_unlock(); return ESP_ERR_INVALID_STATE; }
+    if (new_count > TSDB_MAX_EXTRA_PARAMS) { tsdb_unlock(); return ESP_ERR_INVALID_ARG; }
+    if (new_count > 0 && new_names == NULL) { tsdb_unlock(); return ESP_ERR_INVALID_ARG; }
 
     uint8_t old_count = g_state.extra_param_count;
 
     // Case: nothing to nothing
     if (old_count == 0 && new_count == 0) {
         ESP_LOGI(TAG, "No overflow to migrate");
+        tsdb_unlock();
         return ESP_OK;
     }
 
-    // Case: no existing overflow, just add
+    // Case: no existing overflow, just add (recursive lock take inside)
     if (old_count == 0 && new_count > 0) {
         ESP_LOGI(TAG, "No existing overflow, creating new with %d params", new_count);
-        return tsdb_add_extra_params(new_names, new_count);
+        esp_err_t ret = tsdb_add_extra_params(new_names, new_count);
+        tsdb_unlock();
+        return ret;
     }
 
     // Case: remove overflow entirely
@@ -744,6 +954,7 @@ esp_err_t tsdb_migrate_overflow(const char **new_names, uint8_t new_count) {
         g_state.first_overflow_record_idx = 0;
         tsdb_write_header(g_state.file, &g_state.header);
         ESP_LOGI(TAG, "Overflow removed");
+        tsdb_unlock();
         return ESP_OK;
     }
 
@@ -755,10 +966,12 @@ esp_err_t tsdb_migrate_overflow(const char **new_names, uint8_t new_count) {
     fseek(g_state.file, g_state.header.overflow_offset, SEEK_SET);
     if (fread(&old_ovf, sizeof(old_ovf), 1, g_state.file) != 1) {
         ESP_LOGE(TAG, "Failed to read old overflow header");
+        tsdb_unlock();
         return ESP_FAIL;
     }
     if (old_ovf.magic != TSDB_OVERFLOW_MAGIC) {
         ESP_LOGE(TAG, "Old overflow header corrupted (magic=0x%08lX)", (unsigned long)old_ovf.magic);
+        tsdb_unlock();
         return ESP_FAIL;
     }
 
@@ -773,6 +986,7 @@ esp_err_t tsdb_migrate_overflow(const char **new_names, uint8_t new_count) {
         }
         if (match) {
             ESP_LOGI(TAG, "Overflow already matches requested layout, skipping migration");
+            tsdb_unlock();
             return ESP_OK;
         }
     }
@@ -811,6 +1025,7 @@ esp_err_t tsdb_migrate_overflow(const char **new_names, uint8_t new_count) {
     fseek(g_state.file, new_overflow_offset, SEEK_SET);
     if (fwrite(&new_ovf, sizeof(new_ovf), 1, g_state.file) != 1) {
         ESP_LOGE(TAG, "Failed to write new overflow header");
+        tsdb_unlock();
         return ESP_FAIL;
     }
     fflush(g_state.file);
@@ -880,6 +1095,7 @@ esp_err_t tsdb_migrate_overflow(const char **new_names, uint8_t new_count) {
     ESP_LOGI(TAG, "Migration complete: %d params, %lu records migrated",
              new_count, (unsigned long)overflow_records);
 
+    tsdb_unlock();
     return ESP_OK;
 }
 

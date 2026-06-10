@@ -19,13 +19,21 @@ esp_err_t tsdb_query_init(tsdb_query_t *query,
                           uint32_t end_time,
                           const uint8_t *param_indices,
                           uint8_t num_params_to_fetch) {
+    // Take the global lock for the entire query lifecycle. Released by
+    // tsdb_query_close(). CRITICAL: callers MUST call tsdb_query_close()
+    // even on early-exit / error paths or the lock leaks. The mutex is
+    // recursive so the same task can also do writes.
+    TSDB_LOCK_OR_RETURN(5000, ESP_ERR_TIMEOUT);
+
     if (!g_state.is_open || query == NULL) {
         ESP_LOGE(TAG, "Invalid state or NULL query");
+        tsdb_unlock();
         return ESP_ERR_INVALID_STATE;
     }
 
     if (start_time > end_time) {
         ESP_LOGE(TAG, "Invalid time range: start > end");
+        tsdb_unlock();
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -51,6 +59,7 @@ esp_err_t tsdb_query_init(tsdb_query_t *query,
         query->num_params_to_fetch = num_params_to_fetch;
         if (num_params_to_fetch > TSDB_MAX_PARAMS) {
             ESP_LOGE(TAG, "Too many parameters requested: %d", num_params_to_fetch);
+            tsdb_unlock();
             return ESP_ERR_INVALID_ARG;
         }
         memcpy(query->param_indices, param_indices, num_params_to_fetch);
@@ -66,6 +75,7 @@ esp_err_t tsdb_query_init(tsdb_query_t *query,
         query->block_buffer = heap_caps_malloc(sizeof(tsdb_block_t), MALLOC_CAP_8BIT);
         if (query->block_buffer == NULL) {
             ESP_LOGE(TAG, "Failed to allocate query block buffer");
+            tsdb_unlock();
             return ESP_ERR_NO_MEM;
         }
         query->owns_buffer = true;
@@ -247,6 +257,11 @@ void tsdb_query_close(tsdb_query_t *query) {
     }
 
     memset(query, 0, sizeof(tsdb_query_t));
+
+    // Release the global lock taken by tsdb_query_init(). Safe to call even
+    // if init failed before locking (recursive give of unlocked mutex is
+    // logged but not fatal).
+    tsdb_unlock();
 }
 
 esp_err_t tsdb_query_count(uint32_t start_time,

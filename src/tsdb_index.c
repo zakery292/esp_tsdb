@@ -31,6 +31,14 @@ esp_err_t tsdb_find_block_for_timestamp(FILE *file,
         return ESP_OK;
     }
 
+    // Defensive: tsdb_init now sanity-checks the header so this should never
+    // trigger, but a div-by-zero here is a hard panic — guard anyway.
+    if (header->records_per_block == 0) {
+        ESP_LOGE(TAG, "records_per_block is 0 — header corrupt");
+        *block_num = 0;
+        return ESP_FAIL;
+    }
+
     // Check bounds
     if (timestamp < header->oldest_timestamp) {
         ESP_LOGD(TAG, "Timestamp %lu before oldest %lu",
