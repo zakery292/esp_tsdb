@@ -31,6 +31,22 @@ extern "C" {
 #define TSDB_OVERFLOW_HEADER_SIZE 1024
 
 // ============================================================================
+// OPAQUE DATABASE HANDLE
+// ============================================================================
+
+/**
+ * @brief Opaque database handle. Created by tsdb_open(), released by
+ *        tsdb_close_h(). Multiple handles may be open simultaneously, each
+ *        backed by its own file, buffer pool, and per-instance mutex.
+ *
+ * The legacy global API (tsdb_init / tsdb_write / tsdb_query_init / ...) is
+ * preserved for backward compatibility and operates on a single internal
+ * default handle. New multi-instance code should use the _h-suffixed
+ * variants below.
+ */
+typedef struct tsdb_s tsdb_t;
+
+// ============================================================================
 // CONFIGURATION
 // ============================================================================
 
@@ -234,6 +250,7 @@ typedef struct {
  * Note: Callers should allocate this on the stack
  */
 struct tsdb_query_s {
+    tsdb_t *db;                     // Database handle this query iterates over
     FILE *file;
     tsdb_header_t header;
 
@@ -513,6 +530,115 @@ typedef struct {
  */
 esp_err_t tsdb_run_benchmark(uint32_t num_records, uint8_t num_params,
                               tsdb_benchmark_results_t *results);
+
+// ============================================================================
+// HANDLE-BASED API (multi-instance, v2.1+)
+// ============================================================================
+//
+// Every legacy global function has an _h-suffixed counterpart that takes a
+// tsdb_t handle as its first argument. Use these when you need more than
+// one database open simultaneously (e.g., one for system metrics, one for
+// per-panel telemetry). All functions are safe to call from multiple tasks
+// against the same handle — each handle owns a FreeRTOS mutex internally.
+
+/**
+ * @brief Open a new database handle.
+ *
+ * Creates or opens the file at config->filepath, allocates the buffer pool,
+ * and initialises the per-instance mutex. The returned handle is independent
+ * of any other handle (including the default one used by the legacy API).
+ *
+ * @param config Configuration (same fields as tsdb_init).
+ * @return Handle on success, NULL on failure (check the log for details).
+ */
+tsdb_t *tsdb_open(const tsdb_config_t *config);
+
+/**
+ * @brief Close a handle, flush buffers, free resources.
+ *
+ * Safe to call with NULL (no-op).
+ *
+ * @param db Handle returned from tsdb_open(). Must not be reused after.
+ * @return ESP_OK on success.
+ */
+esp_err_t tsdb_close_h(tsdb_t *db);
+
+/**
+ * @brief Force a directory-entry commit by close+reopen of the underlying FILE*.
+ *
+ * On esp_littlefs (joltwallet/littlefs), files held open with fopen("r+b")
+ * across many writes never trigger a directory commit even with fflush+fsync
+ * after each write — only fclose actually publishes the dir entry to disk.
+ * Without this, every reboot finds the file "missing" and tsdb_open recreates
+ * it from scratch, losing all history.
+ *
+ * tsdb_sync_h takes the per-handle mutex, fcloses db->file, reopens it with
+ * "r+b", and re-validates the on-disk header against the in-memory copy. The
+ * handle and all internal state survive — callers may continue using db after
+ * this returns successfully. Cost is one filesystem round-trip (~30-50 ms on
+ * LittleFS); cheap enough to call after every tsdb_write_h on snapshot
+ * cadences (5-min) or every N writes on faster cadences.
+ *
+ * Returns ESP_ERR_INVALID_STATE if db is null or not open, ESP_FAIL if the
+ * close+reopen cycle leaves the file in an inconsistent state (rare; in that
+ * case the handle's is_open is set false and callers should treat the DB as
+ * closed).
+ */
+esp_err_t tsdb_sync_h(tsdb_t *db);
+
+bool tsdb_is_initialized_h(const tsdb_t *db);
+
+esp_err_t tsdb_write_h(tsdb_t *db, uint32_t timestamp, const int16_t *values);
+
+esp_err_t tsdb_write_batch_h(tsdb_t *db,
+                             const uint32_t *timestamps,
+                             const int16_t **values,
+                             uint32_t count);
+
+esp_err_t tsdb_query_init_h(tsdb_t *db,
+                            tsdb_query_t *query,
+                            uint32_t start_time,
+                            uint32_t end_time,
+                            const uint8_t *param_indices,
+                            uint8_t num_params_to_fetch);
+
+// tsdb_query_next() and tsdb_query_close() use the handle stored inside the
+// tsdb_query_t itself — no _h variant needed.
+
+esp_err_t tsdb_query_count_h(tsdb_t *db,
+                             uint32_t start_time,
+                             uint32_t end_time,
+                             uint32_t *count);
+
+esp_err_t tsdb_aggregate_h(tsdb_t *db,
+                           uint32_t start_time,
+                           uint32_t end_time,
+                           uint8_t param_index,
+                           tsdb_agg_type_t agg_type,
+                           int32_t *result);
+
+esp_err_t tsdb_aggregate_multi_h(tsdb_t *db,
+                                 uint32_t start_time,
+                                 uint32_t end_time,
+                                 tsdb_agg_request_t *requests,
+                                 uint8_t num_requests,
+                                 uint32_t *record_count);
+
+esp_err_t tsdb_get_stats_h(tsdb_t *db, tsdb_stats_t *stats);
+
+esp_err_t tsdb_clear_h(tsdb_t *db);
+
+esp_err_t tsdb_delete_h(tsdb_t *db);
+
+esp_err_t tsdb_add_extra_params_h(tsdb_t *db, const char **param_names, uint8_t count);
+
+esp_err_t tsdb_migrate_overflow_h(tsdb_t *db, const char **new_names, uint8_t new_count);
+
+uint8_t tsdb_get_total_params_h(const tsdb_t *db);
+
+const char *tsdb_get_param_name_h(const tsdb_t *db, uint8_t index);
+
+bool tsdb_has_overflow_h(const tsdb_t *db);
 
 #ifdef __cplusplus
 }

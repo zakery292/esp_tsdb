@@ -54,13 +54,20 @@ void tsdb_buffer_read(tsdb_buffer_pool_t *pool, size_t offset, void *dest, size_
 void tsdb_buffer_write(tsdb_buffer_pool_t *pool, size_t offset, const void *src, size_t size);
 
 // ============================================================================
-// GLOBAL STATE
+// PER-INSTANCE STATE
 // ============================================================================
 
 /**
- * @brief Internal state
+ * @brief Database handle internals.
+ *
+ * Forward-declared as `tsdb_t` (opaque) in esp_tsdb.h so multiple instances
+ * can be opened simultaneously. Each handle carries its own file descriptor,
+ * header cache, buffer pool, overflow state, and FreeRTOS mutex.
+ *
+ * v2 single-DB callers see a static `g_default_handle` of this type wrapped
+ * by the legacy global API (tsdb_init/tsdb_write/etc).
  */
-typedef struct {
+struct tsdb_s {
     FILE *file;
     tsdb_header_t header;
     char filepath[128];
@@ -86,32 +93,38 @@ typedef struct {
     uint32_t first_overflow_record_idx;
     uint16_t overflow_record_size;
 
-    // Global mutex serialising every public mutating + reading API. The HTTP
-    // handler that calls tsdb_clear()/tsdb_close() races the inverter poller
-    // mid-tsdb_write() — without this lock, close() invalidates g_state.file
-    // while a writer is still using it (crash / corruption). Recursive so the
-    // close→delete→init chain from migration paths doesn't self-deadlock.
-    SemaphoreHandle_t lock;
-} tsdb_state_t;
+    // Per-handle serialization. Acquired by every public _h-suffixed call (and
+    // the legacy global API via g_default_handle) so concurrent writers/queriers
+    // on the same handle are safe; different handles are fully independent.
+    //
+    // RECURSIVE: the HTTP handler calling tsdb_clear()/tsdb_close() races the
+    // inverter poller mid-tsdb_write() — without serialization, close()
+    // invalidates db->file while a writer is still using it (crash/corruption).
+    // The close→delete→init chain from migration paths re-enters the lock on the
+    // same task, so a non-recursive mutex would self-deadlock.
+    SemaphoreHandle_t mutex;
+};
 
-// Global state (defined in tsdb_core.c)
-extern tsdb_state_t g_state;
+// Legacy single-DB handle backing the v2 global API. Allocated lazily on the
+// first tsdb_init() call; freed by tsdb_close().
+extern tsdb_t *g_default_handle;
 
-// Lock helpers (defined in tsdb_core.c). Recursive mutex — same task may
-// re-enter via close→delete→init or write→header chains without deadlock.
-static inline bool tsdb_lock(uint32_t timeout_ms) {
-    if (g_state.lock == NULL) return true;  // pre-init paths
-    return xSemaphoreTakeRecursive(g_state.lock, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
+// Per-handle lock helpers. Recursive mutex — same task may re-enter via
+// close→delete→init or write→header chains without deadlock. NULL-tolerant so
+// pre-init / pre-allocation paths (and tsdb_close_h(NULL)) are no-ops.
+static inline bool tsdb_lock(tsdb_t *db, uint32_t timeout_ms) {
+    if (db == NULL || db->mutex == NULL) return true;  // pre-init paths
+    return xSemaphoreTakeRecursive(db->mutex, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
 }
 
-static inline void tsdb_unlock(void) {
-    if (g_state.lock != NULL) {
-        xSemaphoreGiveRecursive(g_state.lock);
+static inline void tsdb_unlock(tsdb_t *db) {
+    if (db != NULL && db->mutex != NULL) {
+        xSemaphoreGiveRecursive(db->mutex);
     }
 }
 
-#define TSDB_LOCK_OR_RETURN(timeout_ms, errval) \
-    do { if (!tsdb_lock(timeout_ms)) { \
+#define TSDB_LOCK_OR_RETURN(db, timeout_ms, errval) \
+    do { if (!tsdb_lock((db), timeout_ms)) { \
         ESP_LOGE(TAG, "%s: lock timeout", __func__); \
         return (errval); \
     } } while (0)
@@ -126,8 +139,8 @@ esp_err_t tsdb_read_header(FILE *file, tsdb_header_t *header);
 esp_err_t tsdb_write_header(FILE *file, const tsdb_header_t *header);
 
 // Block operations (tsdb_write.c, tsdb_query.c)
-esp_err_t tsdb_read_block(FILE *file, uint32_t block_num, tsdb_block_t *block);
-esp_err_t tsdb_write_block(FILE *file, uint32_t block_num, const tsdb_block_t *block);
+esp_err_t tsdb_read_block(tsdb_t *db, uint32_t block_num, tsdb_block_t *block);
+esp_err_t tsdb_write_block(tsdb_t *db, uint32_t block_num, const tsdb_block_t *block);
 uint32_t tsdb_calc_block_offset(const tsdb_header_t *header, uint32_t block_num);
 
 // Index operations (tsdb_index.c)
