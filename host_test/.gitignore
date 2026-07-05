@@ -2,3 +2,4 @@ test_wrap
 test_more
 *.o
 *.tsdb
+test_multi
