@@ -13,7 +13,9 @@ Lightweight, data-agnostic time-series database component for ESP32 with configu
 - **Sparse Time Index**: Fast timestamp-based lookups using binary search
 - **Streaming Queries**: Zero-copy queries where possible, no result set accumulation
 - **Aggregations**: Built-in SUM, AVG, MIN, MAX, COUNT, FIRST, LAST operations
-- **Backward Compatible**: V1 files open seamlessly under the V2 engine
+- **Multi-Instance (v2.1+)**: Handle-based API — open several independent databases simultaneously
+- **Thread-Safe (v2.1+)**: Every handle owns a FreeRTOS mutex; all operations are safe to call from multiple tasks
+- **Backward Compatible**: V1 files open seamlessly under the V2 engine; the original global API is unchanged
 
 ## Quick Start
 
@@ -178,6 +180,35 @@ After migration, the old overflow region becomes dead space in the file. Call `t
 | V2, no overflow configured | `extra_param_count=0`, works identically to V1. |
 | V2, with overflow | Extra params read from overflow region. Pre-overflow records return 0. |
 
+## Multiple Databases (Handle-Based API, v2.1+)
+
+Every global function has an `_h`-suffixed counterpart taking a `tsdb_t *` handle as its first argument, so several independent databases can be open at once (e.g. system metrics in one file, per-panel telemetry in another). The legacy global API still works and is now a thin wrapper over an internal default handle.
+
+```c
+tsdb_config_t sys_cfg  = { .filepath = "/littlefs/system.tsdb",  /* ... */ };
+tsdb_config_t panel_cfg = { .filepath = "/littlefs/panels.tsdb", /* ... */ };
+
+tsdb_t *sys_db   = tsdb_open(&sys_cfg);
+tsdb_t *panel_db = tsdb_open(&panel_cfg);
+
+tsdb_write_h(sys_db,   time(NULL), sys_values);
+tsdb_write_h(panel_db, time(NULL), panel_values);
+
+tsdb_query_t query;
+tsdb_query_init_h(panel_db, &query, day_ago, now, NULL, 0);
+while (tsdb_query_next(&query, &ts, values) == ESP_OK) { /* ... */ }
+tsdb_query_close(&query);   // query_next/close use the handle stored in the query
+
+tsdb_close_h(panel_db);
+tsdb_close_h(sys_db);
+```
+
+Each handle owns a FreeRTOS mutex, so all operations — including on the legacy global API — are safe to call concurrently from multiple tasks.
+
+### Durability on LittleFS: `tsdb_sync_h()`
+
+On esp_littlefs, a file held open across many writes never commits its directory entry — only `fclose` publishes it, so an unexpected reboot can lose the whole file. `tsdb_sync_h(db)` forces the commit with a close+reopen cycle (~30-50 ms) while keeping the handle and all state valid. Call it after each write on slow snapshot cadences, or every N writes on fast ones.
+
 ## Streaming to HTTP/WebSocket
 
 ```c
@@ -333,6 +364,13 @@ See `include/esp_tsdb.h` for full API documentation.
 - `tsdb_get_stats()` - Get database statistics (includes `extra_params` count)
 - `tsdb_clear()` - Clear all data (resets overflow index)
 - `tsdb_delete()` - Delete database file
+
+### Handle-Based API (v2.1+)
+
+- `tsdb_open()` / `tsdb_close_h()` - Open/close an independent database instance
+- `tsdb_sync_h()` - Force a LittleFS directory-entry commit (durability across reboots)
+- `_h` variants of every function above: `tsdb_write_h()`, `tsdb_query_init_h()`, `tsdb_aggregate_h()`, `tsdb_get_stats_h()`, `tsdb_add_extra_params_h()`, `tsdb_migrate_overflow_h()`, etc.
+- `tsdb_query_next()` / `tsdb_query_close()` need no `_h` variant — the query carries its handle
 
 ## License
 
