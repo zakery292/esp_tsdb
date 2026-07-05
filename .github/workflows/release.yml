@@ -1,0 +1,71 @@
+name: Release
+
+# Pushing a tag like v2.2.0 creates a GitHub Release with the matching
+# CHANGELOG.md section as notes, the packed component archive attached,
+# and (if the IDF_COMPONENT_API_TOKEN secret is set) uploads the version
+# to the ESP Component Registry under the zakery292 namespace.
+#
+# Release flow: merge to main -> bump idf_component.yml version + add a
+# "## [X.Y.Z]" section to CHANGELOG.md -> git tag vX.Y.Z && git push origin vX.Y.Z
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      IDF_COMPONENT_API_TOKEN: ${{ secrets.IDF_COMPONENT_API_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Derive version from tag
+        id: ver
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Check tag matches idf_component.yml
+        run: |
+          manifest=$(grep -oP '^version:\s*"\K[^"]+' idf_component.yml)
+          if [ "$manifest" != "${{ steps.ver.outputs.version }}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} != manifest version ${manifest}. Bump idf_component.yml before tagging."
+            exit 1
+          fi
+
+      - name: Extract changelog section
+        run: |
+          awk -v ver="${{ steps.ver.outputs.version }}" '
+            $0 ~ "^## \\[" ver "\\]" {f=1; next}
+            /^## \[/ {f=0}
+            f' CHANGELOG.md > release_notes.md
+          if [ ! -s release_notes.md ]; then
+            echo "::warning::No CHANGELOG.md section for ${{ steps.ver.outputs.version }}; using auto-generated notes."
+          fi
+
+      - name: Pack component archive
+        run: |
+          pip install --quiet idf-component-manager
+          compote component pack --name esp_tsdb --version "${{ steps.ver.outputs.version }}"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          args=(--title "${GITHUB_REF_NAME}")
+          if [ -s release_notes.md ]; then
+            args+=(--notes-file release_notes.md)
+          else
+            args+=(--generate-notes)
+          fi
+          gh release create "${GITHUB_REF_NAME}" "${args[@]}" \
+            "dist/esp_tsdb_${{ steps.ver.outputs.version }}.tgz"
+
+      - name: Upload to ESP Component Registry
+        if: env.IDF_COMPONENT_API_TOKEN != ''
+        run: |
+          compote component upload --namespace zakery292 --name esp_tsdb \
+            --version "${{ steps.ver.outputs.version }}"
