@@ -89,6 +89,12 @@ esp_err_t tsdb_write_h(tsdb_t *db, uint32_t timestamp, const int16_t *values) {
         return ESP_ERR_INVALID_ARG;
     }
 
+    // Fail fast during a schema migration instead of stalling on the mutex
+    // for the full lock timeout. Caller may retry on its next write cadence.
+    if (db->migrating) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
     // Take the handle lock for the whole write. The mutex is recursive, so a
     // task already holding it (e.g. during a query) can still write. Taken
     // ONCE here -- the retry_write path below does not re-take it.

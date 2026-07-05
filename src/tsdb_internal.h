@@ -93,6 +93,12 @@ struct tsdb_s {
     // another. Resets naturally when the handle is reopened (e.g. next boot).
     bool capacity_adapted;
 
+    // Set for the duration of tsdb_migrate_schema_h(). Writers/queriers check
+    // this BEFORE taking the mutex so they fail fast with
+    // ESP_ERR_INVALID_STATE instead of stalling their full lock timeout while
+    // the migration (seconds to a minute) holds the handle lock.
+    volatile bool migrating;
+
     // Overflow state
     uint8_t  extra_param_count;
     uint32_t overflow_data_offset;      // overflow_offset + TSDB_OVERFLOW_HEADER_SIZE
@@ -154,5 +160,10 @@ esp_err_t tsdb_find_block_for_timestamp(FILE *file,
                                         const tsdb_header_t *header,
                                         uint32_t timestamp,
                                         uint32_t *block_num);
+
+// Schema-migration crash recovery (tsdb_migrate.c). Called by tsdb_open()
+// before touching the main file: removes a stale `<path>.mig` leftover, or
+// adopts a completed one if a crash hit the unlink->rename swap window.
+void tsdb_migrate_recover(const char *filepath);
 
 #endif // TSDB_INTERNAL_H

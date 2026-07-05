@@ -147,7 +147,39 @@ bool has_ovf = tsdb_has_overflow();            // true if overflow active
 const char *name = tsdb_get_param_name(5);     // "Tbat" (reads from overflow header)
 ```
 
-### Schema Migration
+### Full Schema Migration (v2.2+)
+
+`tsdb_migrate_schema()` changes the **base** column set itself — add, drop,
+reorder, or promote overflow extras to first-class columns — via a streaming
+rewrite into a new file with the new block geometry (constant ~2KB memory,
+crash-safe, atomic swap):
+
+```c
+// Old schema: 3 base [soc, vbat, pload] + 2 overflow extras [tbat, gen].
+// New schema: keep soc, promote both extras, add a fresh zero-filled column.
+const char *new_cols[] = {"soc", "tbat", "gen", "site"};
+
+static void on_progress(uint32_t done, uint32_t total, void *ctx) {
+    // start (0), ~every 1% (configurable), completion (total). Runs on the
+    // migrating task with the lock held: be quick, no tsdb_* calls.
+}
+
+tsdb_migrate_opts_t opts = {
+    .free_space_bytes = fs_free,   // from esp_littlefs_info(); 0 = "on SD, just go"
+    .allow_trim = true,            // drop oldest records if the copy won't fit
+    .progress = on_progress,       // optional: drive a UI progress bar
+};
+tsdb_migrate_schema(new_cols, 4, &opts);
+// Overflow region is folded away; vbat/pload dropped; "site" reads 0 for
+// existing records. Writes/queries during the migration fail fast with
+// ESP_ERR_INVALID_STATE — retry on the next cycle.
+```
+
+On littlefs the calling task performs flash-bus operations and must have an
+internal-RAM stack (ESP32-S3 PSRAM-stack rule); SD-card databases can be
+migrated from any task.
+
+### Overflow Schema Migration
 
 Extra parameters can be changed at any time using `tsdb_migrate_overflow()`:
 

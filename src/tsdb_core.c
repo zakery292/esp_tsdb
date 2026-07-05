@@ -55,8 +55,10 @@ static void tsdb_flush_and_sync(FILE *file) {
 static bool tsdb_header_is_sane(const tsdb_header_t *h) {
     if (h == NULL) return false;
 
-    // num_params must be in the supported range
-    if (h->num_params == 0 || h->num_params > 16) return false;
+    // num_params must be in the supported range; >16 requires the V4 wide
+    // layout (extended names region + index at 2048)
+    if (h->num_params == 0 || h->num_params > TSDB_MAX_PARAMS) return false;
+    if (h->num_params > 16 && h->version < TSDB_VERSION_WIDE) return false;
     if (h->base_params != 0 && h->base_params > h->num_params) return false;
 
     // param_size must be exactly 2 (int16_t)
@@ -164,7 +166,7 @@ static esp_err_t tsdb_reconstruct_header(FILE *file, tsdb_header_t *header,
     // Rebuild basic header structure from config
     memset(header, 0, sizeof(tsdb_header_t));
     header->magic = TSDB_MAGIC;
-    header->version = TSDB_VERSION;
+    header->version = config->num_params > 16 ? TSDB_VERSION_WIDE : TSDB_VERSION;
     header->num_params = config->num_params;
     header->param_size = sizeof(int16_t);
     header->record_size = 4 + (config->num_params * 2);
@@ -176,7 +178,7 @@ static esp_err_t tsdb_reconstruct_header(FILE *file, tsdb_header_t *header,
 
     header->max_records = config->max_records;
     header->index_stride = config->index_stride > 0 ? config->index_stride : 380;
-    header->index_offset = 512;
+    header->index_offset = 512;    // legacy base; the probe below may switch to 1024
 
     // index_entries: try the value derived from config first, but verify it
     // points at a real data region. If the file was created with a different
@@ -198,17 +200,25 @@ static esp_err_t tsdb_reconstruct_header(FILE *file, tsdb_header_t *header,
         512, 1024, 2048,
     };
     uint32_t probed_entries = 0;
-    for (size_t i = 0; i < sizeof(candidate_entries) / sizeof(candidate_entries[0]); i++) {
-        uint32_t entries = candidate_entries[i];
-        uint32_t probe_offset = 512 + (entries * (uint32_t)sizeof(tsdb_index_entry_t));
-        if (probe_offset + TSDB_BLOCK_SIZE > (uint32_t)file_size) continue;
-        fseek(file, probe_offset, SEEK_SET);
-        uint32_t magic = 0;
-        if (fread(&magic, sizeof(magic), 1, file) == 1 && magic == 0x424C4B54) {
-            probed_entries = entries;
-            ESP_LOGI(TAG, "Reconstruct: probed index_entries=%lu (data starts at offset %lu, magic OK)",
-                     (unsigned long)entries, (unsigned long)probe_offset);
-            break;
+    // Two index bases exist in the wild: 512 (legacy) and 1024 (files created
+    // since the header-size fix). Probe both for each candidate entry count.
+    const uint32_t index_bases[] = {512, 1024, TSDB_V4_INDEX_OFFSET};
+    for (size_t b = 0; b < 3 && probed_entries == 0; b++) {
+        for (size_t i = 0; i < sizeof(candidate_entries) / sizeof(candidate_entries[0]); i++) {
+            uint32_t entries = candidate_entries[i];
+            uint32_t probe_offset = index_bases[b] +
+                                    (entries * (uint32_t)sizeof(tsdb_index_entry_t));
+            if (probe_offset + TSDB_BLOCK_SIZE > (uint32_t)file_size) continue;
+            fseek(file, probe_offset, SEEK_SET);
+            uint32_t magic = 0;
+            if (fread(&magic, sizeof(magic), 1, file) == 1 && magic == 0x424C4B54) {
+                probed_entries = entries;
+                header->index_offset = index_bases[b];
+                ESP_LOGI(TAG, "Reconstruct: probed index_entries=%lu (base=%lu, data at %lu, magic OK)",
+                         (unsigned long)entries, (unsigned long)index_bases[b],
+                         (unsigned long)probe_offset);
+                break;
+            }
         }
     }
     header->index_entries = probed_entries > 0 ? probed_entries : cfg_entries;
@@ -325,8 +335,9 @@ tsdb_t *tsdb_open(const tsdb_config_t *config) {
         return NULL;
     }
 
-    if (config->num_params == 0 || config->num_params > 16) {
-        ESP_LOGE(TAG, "Invalid num_params: %d (must be 1-16)", config->num_params);
+    if (config->num_params == 0 || config->num_params > TSDB_MAX_PARAMS) {
+        ESP_LOGE(TAG, "Invalid num_params: %d (must be 1-%d)",
+                 config->num_params, TSDB_MAX_PARAMS);
         return NULL;
     }
 
@@ -388,6 +399,10 @@ tsdb_t *tsdb_open(const tsdb_config_t *config) {
              db->query_buffer_offset,
              db->stream_buffer_offset,
              db->stream_buffer_size);
+
+    // Clean up (or adopt) any leftover from an interrupted schema migration
+    // before deciding whether the main file exists.
+    tsdb_migrate_recover(config->filepath);
 
     // Check if file exists by trying to open it for read+write. stat() is
     // unreliable on esp_littlefs (joltwallet) — empirical test on 1.21.1
@@ -637,10 +652,12 @@ migration_done: ;
             return NULL;
         }
 
-        // Initialize header
+        // Initialize header. >16 params = V4 wide layout (extended names
+        // region between the fixed header and an index at 2048).
+        bool wide = (config->num_params > 16);
         memset(&db->header, 0, sizeof(tsdb_header_t));
         db->header.magic = TSDB_MAGIC;
-        db->header.version = TSDB_VERSION;
+        db->header.version = wide ? TSDB_VERSION_WIDE : TSDB_VERSION;
         db->header.num_params = config->num_params;
         db->header.base_params = config->num_params;
         db->header.param_size = sizeof(int16_t);
@@ -658,8 +675,13 @@ migration_done: ;
         db->header.max_records = config->max_records;
         db->header.index_stride = config->index_stride > 0 ? config->index_stride : 380;
 
-        // Calculate index offset (right after 512-byte header)
-        db->header.index_offset = 512;
+        // Index offset. Historically 512, but sizeof(tsdb_header_t) is
+        // actually 584 — so header writes clobbered index entries 0–8 (and,
+        // with a small enough index, the first data block). New files start
+        // the index at 1024 (V3) or 2048 (V4, after the extended-names
+        // region). The offset is stored in the file header and honored
+        // everywhere, so existing 512-offset files keep working unchanged.
+        db->header.index_offset = wide ? TSDB_V4_INDEX_OFFSET : 1024;
         db->header.index_entries = config->max_records > 0 ?
             (config->max_records / db->header.index_stride) + 1 : 256;  // 256 default for unlimited
 
@@ -667,7 +689,8 @@ migration_done: ;
                  (unsigned long)db->header.index_entries,
                  (unsigned long)db->header.index_stride);
 
-        // Copy parameter names if provided
+        // Copy parameter names if provided (first 16 in the fixed header;
+        // 17..64 go to the V4 extension region written below)
         if (config->param_names) {
             for (int i = 0; i < config->num_params && i < 16; i++) {
                 strncpy(db->header.param_names[i], config->param_names[i], 31);
@@ -683,6 +706,20 @@ migration_done: ;
             vSemaphoreDelete(db->mutex);
             free(db);
             return NULL;
+        }
+
+        // V4: extended names region (params 16..63, 20 bytes each). Written
+        // once at creation; header rewrites never touch this region.
+        if (wide) {
+            char ext_name[TSDB_V4_EXT_NAME_LEN];
+            fseek(db->file, TSDB_V4_EXT_NAMES_OFFSET, SEEK_SET);
+            for (int i = 16; i < config->num_params; i++) {
+                memset(ext_name, 0, sizeof(ext_name));
+                if (config->param_names && config->param_names[i]) {
+                    strncpy(ext_name, config->param_names[i], TSDB_V4_EXT_NAME_LEN - 1);
+                }
+                fwrite(ext_name, TSDB_V4_EXT_NAME_LEN, 1, db->file);
+            }
         }
 
         // Pre-allocate index space (write zeros)
@@ -900,6 +937,11 @@ esp_err_t tsdb_add_extra_params_h(tsdb_t *db, const char **param_names, uint8_t 
         return ESP_ERR_INVALID_STATE;
     }
     if (count == 0 || count > TSDB_MAX_EXTRA_PARAMS || param_names == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if ((uint16_t)db->header.num_params + count > TSDB_MAX_PARAMS) {
+        ESP_LOGE(TAG, "base %u + extras %u exceeds %d total params",
+                 db->header.num_params, count, TSDB_MAX_PARAMS);
         return ESP_ERR_INVALID_ARG;
     }
     if (db->extra_param_count > 0) {
@@ -1150,7 +1192,20 @@ const char* tsdb_get_param_name_h(const tsdb_t *db, uint8_t index) {
     if (db == NULL || !db->is_open) return NULL;
 
     if (index < db->header.num_params) {
-        return db->header.param_names[index];
+        if (index < 16) {
+            return db->header.param_names[index];
+        }
+        // V4 wide schema: names 16..63 live in the extension region on disk.
+        // Same static-buffer caveat as the overflow names below.
+        static char ext_name_buf[TSDB_V4_EXT_NAME_LEN];
+        uint32_t ext_offset = TSDB_V4_EXT_NAMES_OFFSET +
+                              (uint32_t)(index - 16) * TSDB_V4_EXT_NAME_LEN;
+        fseek(db->file, ext_offset, SEEK_SET);
+        if (fread(ext_name_buf, TSDB_V4_EXT_NAME_LEN, 1, db->file) != 1) {
+            return NULL;
+        }
+        ext_name_buf[TSDB_V4_EXT_NAME_LEN - 1] = '\0';
+        return ext_name_buf;
     }
 
     // Extra param -- read from overflow header in file

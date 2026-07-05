@@ -3,3 +3,4 @@ test_more
 *.o
 *.tsdb
 test_multi
+test_schema

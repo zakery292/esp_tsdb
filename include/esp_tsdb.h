@@ -24,8 +24,17 @@ extern "C" {
 
 #define TSDB_MAX_PARAMS 64          // Maximum parameters supported
 #define TSDB_MAGIC 0x45545344       // "ETSD" (ESP Time-Series DB)
-#define TSDB_VERSION 3              // File format version
+#define TSDB_VERSION 3              // File format version (<=16 base params)
+#define TSDB_VERSION_WIDE 4         // V4: 17-64 base params (extended names region)
 #define TSDB_BLOCK_SIZE 1024        // Block size in bytes
+
+// V4 wide-schema layout: base param names 16..63 live in an extension region
+// between the fixed 584-byte header and the index (which starts at 2048).
+// Only files with num_params > 16 use V4; smaller files stay V3 for
+// backward compatibility. Block geometry is runtime-computed either way.
+#define TSDB_V4_EXT_NAMES_OFFSET 584   // sizeof(tsdb_header_t)
+#define TSDB_V4_EXT_NAME_LEN     20    // names 16..63, 20 bytes each (like overflow)
+#define TSDB_V4_INDEX_OFFSET     2048  // 584 + 48*20 = 1544, rounded up
 #define TSDB_OVERFLOW_MAGIC 0x4F564652  // "OVFR"
 #define TSDB_MAX_EXTRA_PARAMS 48
 #define TSDB_OVERFLOW_HEADER_SIZE 1024
@@ -451,6 +460,87 @@ esp_err_t tsdb_add_extra_params(const char **param_names, uint8_t count);
  */
 esp_err_t tsdb_migrate_overflow(const char **new_names, uint8_t new_count);
 
+// ============================================================================
+// SCHEMA MIGRATION (full base-column rewrite, v2.2+)
+// ============================================================================
+
+/**
+ * @brief Migration progress callback.
+ *
+ * Invoked from the migrating task at the start (done=0), roughly every 1% of
+ * records (configurable via progress_every), and once at completion
+ * (done == total). Total is the record count actually being copied (after any
+ * trim). Keep it fast (it runs inside the migration, handle lock held) and do
+ * NOT call any tsdb_* function from it.
+ */
+typedef void (*tsdb_migrate_progress_cb)(uint32_t done, uint32_t total, void *ctx);
+
+/**
+ * @brief Options for tsdb_migrate_schema().
+ */
+typedef struct {
+    /**
+     * Filesystem free space in bytes, as known by the caller (e.g. from
+     * esp_littlefs_info()). The migration writes a full new copy of the
+     * database before deleting the old one, so this budget decides whether
+     * it fits (a ~5% reserve is subtracted internally for FS metadata).
+     *
+     * 0 = don't check ("I'm on an SD card / space is plentiful, just go").
+     */
+    uint32_t free_space_bytes;
+
+    /**
+     * If the new file doesn't fit in free_space_bytes, permit dropping the
+     * OLDEST records so the newest ones fit (the ring capacity is capped to
+     * what was proven to fit). If false, the migration refuses with
+     * ESP_ERR_NO_MEM instead.
+     */
+    bool allow_trim;
+
+    /** Optional progress reporting (NULL = none). */
+    tsdb_migrate_progress_cb progress;
+    void *progress_ctx;
+
+    /**
+     * Records between progress callbacks. 0 = auto (~1% of the total,
+     * minimum 1). The start (0) and completion (total) calls always fire.
+     */
+    uint32_t progress_every;
+} tsdb_migrate_opts_t;
+
+/**
+ * @brief Change the base column set — MySQL-style ALTER TABLE.
+ *
+ * Rewrites the database into the new block geometry as a streaming copy
+ * (constant ~2KB memory regardless of size), matching columns BY NAME against
+ * the old base columns AND any overflow extras. Old overflow extras named in
+ * new_names become first-class base columns (the overflow region is folded
+ * away — the migrated file never has one). Columns absent from new_names are
+ * dropped; brand-new names are backfilled with 0 for all existing records.
+ *
+ * Runs under the handle lock with a `migrating` flag set: concurrent
+ * tsdb_write()/tsdb_query_init() calls fail fast with ESP_ERR_INVALID_STATE
+ * for the duration (seconds to ~a minute) instead of stalling. Callers on a
+ * periodic write cadence can simply retry next cycle.
+ *
+ * Crash-safe: the copy goes to `<filepath>.mig` and the original is never
+ * modified; the swap is recovered automatically on the next tsdb_open() if
+ * interrupted.
+ *
+ * ESP32 task placement: on littlefs/SPI-flash the CALLING task performs
+ * flash-bus ops and must have an internal-RAM stack; SD-card databases can be
+ * migrated from PSRAM-stacked tasks.
+ *
+ * @param new_names New base column names, in order (1-16)
+ * @param new_count Number of new base columns
+ * @param opts Space budget / trim policy; NULL = no space check, no trim
+ * @return ESP_OK on success (also when the schema already matches);
+ *         ESP_ERR_NO_MEM if it doesn't fit the space budget (or allocation
+ *         failed); ESP_ERR_TIMEOUT if the handle lock couldn't be taken.
+ */
+esp_err_t tsdb_migrate_schema(const char **new_names, uint8_t new_count,
+                              const tsdb_migrate_opts_t *opts);
+
 /**
  * @brief Get total parameter count (base + extra)
  */
@@ -633,6 +723,10 @@ esp_err_t tsdb_delete_h(tsdb_t *db);
 esp_err_t tsdb_add_extra_params_h(tsdb_t *db, const char **param_names, uint8_t count);
 
 esp_err_t tsdb_migrate_overflow_h(tsdb_t *db, const char **new_names, uint8_t new_count);
+
+esp_err_t tsdb_migrate_schema_h(tsdb_t *db, const char **new_names,
+                                uint8_t new_count,
+                                const tsdb_migrate_opts_t *opts);
 
 uint8_t tsdb_get_total_params_h(const tsdb_t *db);
 

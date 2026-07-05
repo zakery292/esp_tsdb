@@ -14,6 +14,49 @@ static const char *TAG = "TSDB_QUERY";
 // QUERY OPERATIONS
 // ============================================================================
 
+/**
+ * @brief Binary-search the ring for the first retained record with
+ *        ts >= query->start_time, in logical (time-ascending) order.
+ *
+ * The ring walk from oldest_record_idx is time-ascending by construction, so
+ * logical positions are binary-searchable even after the ring wraps (unlike
+ * the sparse index, whose entries are slot-ordered post-wrap). This replaces
+ * an O(n) scan-to-window with O(log n) block reads — on a year-full database
+ * a "last 24h" chart query drops from ~3400 block reads to ~17.
+ *
+ * Relies on the same timestamp monotonicity the iterator's early-exit
+ * (ts > end_time) already assumes.
+ *
+ * @return Logical position k in [0, available] of the first record in range;
+ *         0 (= start from the oldest, plain full walk) on any probe anomaly.
+ */
+static uint32_t tsdb_seek_start(tsdb_query_t *query, uint32_t available,
+                                uint32_t first_slot, bool unlimited) {
+    uint16_t rpb = query->header.records_per_block;
+    uint32_t lo = 0, hi = available;   // invariant: ts(lo-1) < start_time <= ts(hi)
+
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        uint32_t slot = unlimited ? mid :
+                        ((first_slot + mid) % query->header.max_records);
+
+        if (tsdb_read_block(query->db, slot / rpb, query->block_buffer) != ESP_OK) {
+            return 0;   // truncation/corruption — fall back to the full walk
+        }
+        uint32_t ts = TSDB_BLOCK_TS((uint8_t *)query->block_buffer, slot % rpb);
+        if (ts == 0) {
+            return 0;   // unexpected hole — fall back to the full walk
+        }
+
+        if (ts < query->start_time) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
 esp_err_t tsdb_query_init_h(tsdb_t *db,
                             tsdb_query_t *query,
                             uint32_t start_time,
@@ -22,6 +65,11 @@ esp_err_t tsdb_query_init_h(tsdb_t *db,
                             uint8_t num_params_to_fetch) {
     if (db == NULL || !db->is_open || query == NULL) {
         ESP_LOGE(TAG, "Invalid state or NULL query");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    // Fail fast during a schema migration instead of stalling on the mutex.
+    if (db->migrating) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -98,9 +146,10 @@ esp_err_t tsdb_query_init_h(tsdb_t *db,
     // We do NOT use the sparse index to seek to start_time: once the ring has
     // wrapped, index entries are ordered by physical slot (the slot they were
     // last written at), not by timestamp, so a binary search on them is
-    // invalid and lands in the wrong place. A full logical scan with an
-    // early-exit once ts > end_time is correct for every range and is bounded
-    // by `available` record reads (one pass over the ring).
+    // invalid and lands in the wrong place. A logical walk with an early-exit
+    // once ts > end_time is correct for every range and is bounded by
+    // `available` record reads; the binary seek below then jumps the walk's
+    // starting point to the window in O(log n) block reads.
     bool unlimited = (query->header.max_records == 0);
     uint32_t available_records = unlimited ? query->header.total_records :
                                  ((query->header.total_records < query->header.max_records) ?
@@ -115,6 +164,23 @@ esp_err_t tsdb_query_init_h(tsdb_t *db,
     query->current_block_num = rpb ? (first_slot / rpb) : 0;
     query->offset_in_block = rpb ? (first_slot % rpb) : 0;
     query->block_loaded = false;
+
+    // O(log n) start seek: jump the cursor to the first record with
+    // ts >= start_time instead of linearly scanning from the oldest.
+    // (records_scanned advances by the skipped count so query_next's
+    // absolute-record-index math for overflow lookups stays correct.)
+    if (available_records > 0 && rpb > 0 &&
+        start_time > query->header.oldest_timestamp) {
+        uint32_t k = tsdb_seek_start(query, available_records, first_slot, unlimited);
+        if (k > 0) {
+            uint32_t slot = unlimited ? k :
+                            ((first_slot + k) % query->header.max_records);
+            query->records_scanned = k;
+            query->current_record_idx = slot;
+            query->current_block_num = slot / rpb;
+            query->offset_in_block = slot % rpb;
+        }
+    }
 
     ESP_LOGD(TAG, "Query init: time=[%lu, %lu], params=%d, scan %lu records from slot %lu",
              (unsigned long)start_time, (unsigned long)end_time,

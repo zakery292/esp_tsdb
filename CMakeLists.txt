@@ -5,6 +5,7 @@ idf_component_register(
         "src/tsdb_write.c"
         "src/tsdb_query.c"
         "src/tsdb_index.c"
+        "src/tsdb_migrate.c"
         "src/tsdb_benchmark.c"
     INCLUDE_DIRS
         "include"
