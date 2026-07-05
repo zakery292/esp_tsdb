@@ -87,6 +87,12 @@ struct tsdb_s {
     uint32_t cached_block_num;
     bool cache_dirty;
 
+    // Adaptive capacity: once THIS database has shrunk max_records in response
+    // to ENOSPC, don't keep shrinking on every subsequent write. Per-handle —
+    // one instance filling the filesystem must not suppress adaptation on
+    // another. Resets naturally when the handle is reopened (e.g. next boot).
+    bool capacity_adapted;
+
     // Overflow state
     uint8_t  extra_param_count;
     uint32_t overflow_data_offset;      // overflow_offset + TSDB_OVERFLOW_HEADER_SIZE

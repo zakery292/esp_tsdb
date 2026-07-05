@@ -11,10 +11,6 @@
 
 static const char *TAG = "TSDB_WRITE";
 
-// Adaptive capacity: once we've shrunk max_records in response to ENOSPC,
-// don't keep shrinking on every subsequent write. Reset per boot.
-static bool g_capacity_adapted = false;
-
 // ============================================================================
 // BLOCK I/O
 // ============================================================================
@@ -163,7 +159,7 @@ retry_write:
 
     // Write block back to file
     ret = tsdb_write_block(db, block_num, block);
-    if (ret == ESP_ERR_NO_MEM && !is_eviction && !g_capacity_adapted &&
+    if (ret == ESP_ERR_NO_MEM && !is_eviction && !db->capacity_adapted &&
         db->header.total_records > 0) {
         // Filesystem full while still growing. Cap max_records to what we've
         // already written so future writes reuse existing blocks via LRU
@@ -171,7 +167,7 @@ retry_write:
         // so it doesn't need new space.
         uint32_t old_max = db->header.max_records;
         db->header.max_records = db->header.total_records;
-        g_capacity_adapted = true;
+        db->capacity_adapted = true;
         ESP_LOGW(TAG, "Adaptive capacity: %lu -> %lu records (LRU from now on)",
                  (unsigned long)old_max,
                  (unsigned long)db->header.max_records);

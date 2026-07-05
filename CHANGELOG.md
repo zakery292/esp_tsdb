@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+### Fixed
+- Mixed recursive/plain FreeRTOS mutex calls: the handle mutex is created with `xSemaphoreCreateRecursiveMutex()`, but `tsdb_get_stats_h`, `tsdb_clear_h`, `tsdb_sync_h`, `tsdb_add_extra_params_h` and `tsdb_migrate_overflow_h` locked it with plain `xSemaphoreTake`/`xSemaphoreGive` — undefined per the FreeRTOS API and corrupts the recursion count when the calling task already holds the lock (e.g. clearing during a query). All paths now go through the recursive lock helpers.
+- Adaptive-capacity latch (`ENOSPC` shrink guard) was a file-scope static shared across all handles; with the v2.1 multi-instance API, the first database to adapt suppressed adaptation on every other open database. Now per-handle.
+- Opening a file whose `num_params` differs from the config's was allowed with only a warning, but writes iterate the file's parameter count over the caller's values array — reading past the end of it when the file has more columns than the config, and silently dropping/mislabeling columns when it has fewer. `tsdb_open` now refuses to open on a mismatch; migrate or delete/recreate the file.
+
 ## [2.1.0] - 2026-07-05
 ### Added
 - Handle-based multi-instance API (`tsdb_open_h()` returning a `tsdb_t *`, plus `_h` variants of every operation: write, query, aggregate, stats, migrate, clear, delete). Multiple independent databases can be open simultaneously. Fully backward-compatible — the original global-singleton API is preserved as wrappers over an internal default handle.

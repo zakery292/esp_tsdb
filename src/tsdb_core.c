@@ -489,9 +489,19 @@ tsdb_t *tsdb_open(const tsdb_config_t *config) {
             }
 
             if (db->header.num_params != config->num_params) {
-                ESP_LOGW(TAG, "Parameter count mismatch: file has %d, config has %d",
+                // Refuse to open. Writes iterate the FILE's num_params over the
+                // CALLER's values[] (sized to config): file > config reads past
+                // the end of the caller's array; file < config silently drops
+                // columns and mislabels every query result. There is no safe
+                // interpretation — the caller must migrate the file to the new
+                // schema or delete and recreate it.
+                ESP_LOGE(TAG, "Parameter count mismatch: file has %d, config has %d — refusing to open (migrate or delete the file)",
                          db->header.num_params, config->num_params);
-                // Allow opening but warn
+                fclose(db->file);
+                tsdb_free_buffer_pool(&db->pool);
+                vSemaphoreDelete(db->mutex);
+                free(db);
+                return NULL;
             }
 
             // V2->V3 block layout migration: fix databases where records_per_block > 38
@@ -750,16 +760,17 @@ esp_err_t tsdb_sync_h(tsdb_t *db) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (db->mutex && xSemaphoreTake(db->mutex, portMAX_DELAY) != pdTRUE) {
-        return ESP_FAIL;
-    }
+    // Recursive take — the mutex is created with xSemaphoreCreateRecursiveMutex,
+    // so plain xSemaphoreTake/Give here would corrupt the recursion count when
+    // the caller already holds the lock (e.g. sync after write on one task).
+    TSDB_LOCK_OR_RETURN(db, 30000, ESP_ERR_TIMEOUT);
 
     fflush(db->file);
     fsync(fileno(db->file));
     if (fclose(db->file) != 0) {
         db->file = NULL;
         db->is_open = false;
-        if (db->mutex) xSemaphoreGive(db->mutex);
+        tsdb_unlock(db);
         ESP_LOGE(TAG, "tsdb_sync_h: fclose failed for %s", db->filepath);
         return ESP_FAIL;
     }
@@ -768,12 +779,12 @@ esp_err_t tsdb_sync_h(tsdb_t *db) {
     db->file = fopen(db->filepath, "r+b");
     if (db->file == NULL) {
         db->is_open = false;
-        if (db->mutex) xSemaphoreGive(db->mutex);
+        tsdb_unlock(db);
         ESP_LOGE(TAG, "tsdb_sync_h: reopen failed for %s", db->filepath);
         return ESP_FAIL;
     }
 
-    if (db->mutex) xSemaphoreGive(db->mutex);
+    tsdb_unlock(db);
     return ESP_OK;
 }
 
@@ -790,7 +801,7 @@ esp_err_t tsdb_get_stats_h(tsdb_t *db, tsdb_stats_t *stats) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    xSemaphoreTake(db->mutex, portMAX_DELAY);
+    TSDB_LOCK_OR_RETURN(db, 5000, ESP_ERR_TIMEOUT);
 
     stats->total_records = (db->header.max_records == 0 ||
                             db->header.total_records < db->header.max_records) ?
@@ -813,7 +824,7 @@ esp_err_t tsdb_get_stats_h(tsdb_t *db, tsdb_stats_t *stats) {
         stats->storage_bytes = 0;
     }
 
-    xSemaphoreGive(db->mutex);
+    tsdb_unlock(db);
     return ESP_OK;
 }
 
@@ -822,7 +833,7 @@ esp_err_t tsdb_clear_h(tsdb_t *db) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    xSemaphoreTake(db->mutex, portMAX_DELAY);
+    TSDB_LOCK_OR_RETURN(db, 5000, ESP_ERR_TIMEOUT);
 
     ESP_LOGW(TAG, "Clearing all data");
 
@@ -854,7 +865,7 @@ esp_err_t tsdb_clear_h(tsdb_t *db) {
 
     ESP_LOGI(TAG, "Database cleared");
 
-    xSemaphoreGive(db->mutex);
+    tsdb_unlock(db);
     return ESP_OK;
 }
 
@@ -896,7 +907,7 @@ esp_err_t tsdb_add_extra_params_h(tsdb_t *db, const char **param_names, uint8_t 
         return ESP_ERR_INVALID_STATE;
     }
 
-    xSemaphoreTake(db->mutex, portMAX_DELAY);
+    TSDB_LOCK_OR_RETURN(db, 5000, ESP_ERR_TIMEOUT);
 
     ESP_LOGI(TAG, "Adding %d extra parameters (overflow region)", count);
 
@@ -920,7 +931,7 @@ esp_err_t tsdb_add_extra_params_h(tsdb_t *db, const char **param_names, uint8_t 
     fseek(db->file, overflow_offset, SEEK_SET);
     if (fwrite(&ovf_header, sizeof(ovf_header), 1, db->file) != 1) {
         ESP_LOGE(TAG, "Failed to write overflow header");
-        xSemaphoreGive(db->mutex);
+        tsdb_unlock(db);
         return ESP_FAIL;
     }
     fflush(db->file);
@@ -934,7 +945,7 @@ esp_err_t tsdb_add_extra_params_h(tsdb_t *db, const char **param_names, uint8_t 
 
     if (tsdb_write_header(db->file, &db->header) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to update header with overflow info");
-        xSemaphoreGive(db->mutex);
+        tsdb_unlock(db);
         return ESP_FAIL;
     }
 
@@ -947,7 +958,7 @@ esp_err_t tsdb_add_extra_params_h(tsdb_t *db, const char **param_names, uint8_t 
     ESP_LOGI(TAG, "Overflow region created: offset=%lu, %d params, record_size=%d",
              (unsigned long)overflow_offset, count, db->overflow_record_size);
 
-    xSemaphoreGive(db->mutex);
+    tsdb_unlock(db);
     return ESP_OK;
 }
 
@@ -970,7 +981,7 @@ esp_err_t tsdb_migrate_overflow_h(tsdb_t *db, const char **new_names, uint8_t ne
         return tsdb_add_extra_params_h(db, new_names, new_count);
     }
 
-    xSemaphoreTake(db->mutex, portMAX_DELAY);
+    TSDB_LOCK_OR_RETURN(db, 5000, ESP_ERR_TIMEOUT);
 
     // Case: remove overflow entirely
     if (new_count == 0) {
@@ -985,7 +996,7 @@ esp_err_t tsdb_migrate_overflow_h(tsdb_t *db, const char **new_names, uint8_t ne
         db->first_overflow_record_idx = 0;
         tsdb_write_header(db->file, &db->header);
         ESP_LOGI(TAG, "Overflow removed");
-        xSemaphoreGive(db->mutex);
+        tsdb_unlock(db);
         return ESP_OK;
     }
 
@@ -997,12 +1008,12 @@ esp_err_t tsdb_migrate_overflow_h(tsdb_t *db, const char **new_names, uint8_t ne
     fseek(db->file, db->header.overflow_offset, SEEK_SET);
     if (fread(&old_ovf, sizeof(old_ovf), 1, db->file) != 1) {
         ESP_LOGE(TAG, "Failed to read old overflow header");
-        xSemaphoreGive(db->mutex);
+        tsdb_unlock(db);
         return ESP_FAIL;
     }
     if (old_ovf.magic != TSDB_OVERFLOW_MAGIC) {
         ESP_LOGE(TAG, "Old overflow header corrupted (magic=0x%08lX)", (unsigned long)old_ovf.magic);
-        xSemaphoreGive(db->mutex);
+        tsdb_unlock(db);
         return ESP_FAIL;
     }
 
@@ -1017,7 +1028,7 @@ esp_err_t tsdb_migrate_overflow_h(tsdb_t *db, const char **new_names, uint8_t ne
         }
         if (match) {
             ESP_LOGI(TAG, "Overflow already matches requested layout, skipping migration");
-            xSemaphoreGive(db->mutex);
+            tsdb_unlock(db);
             return ESP_OK;
         }
     }
@@ -1056,7 +1067,7 @@ esp_err_t tsdb_migrate_overflow_h(tsdb_t *db, const char **new_names, uint8_t ne
     fseek(db->file, new_overflow_offset, SEEK_SET);
     if (fwrite(&new_ovf, sizeof(new_ovf), 1, db->file) != 1) {
         ESP_LOGE(TAG, "Failed to write new overflow header");
-        xSemaphoreGive(db->mutex);
+        tsdb_unlock(db);
         return ESP_FAIL;
     }
     fflush(db->file);
@@ -1126,7 +1137,7 @@ esp_err_t tsdb_migrate_overflow_h(tsdb_t *db, const char **new_names, uint8_t ne
     ESP_LOGI(TAG, "Migration complete: %d params, %lu records migrated",
              new_count, (unsigned long)overflow_records);
 
-    xSemaphoreGive(db->mutex);
+    tsdb_unlock(db);
     return ESP_OK;
 }
 

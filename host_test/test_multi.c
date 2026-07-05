@@ -81,6 +81,20 @@ int main(void) {
     tsdb_close_h(B);
     tsdb_close_h(NULL); // PR#1 says this is now a safe no-op
 
+    // Schema-mismatch refusal: /tmp/m_b.tsdb was created with 1 param; opening
+    // it with a 2-param config must fail (writes would read past the caller's
+    // values[] / queries would mislabel columns).
+    {
+        tsdb_config_t c = {0};
+        c.filepath = "/tmp/m_b.tsdb"; c.num_params = 2; c.max_records = 0;
+        c.index_stride = 10; c.buffer_pool_size = 16*1024;
+        c.alloc_strategy = TSDB_ALLOC_INTERNAL_RAM;
+        tsdb_t *M = tsdb_open(&c);
+        printf("  [mismatch  ] open(1-param file, 2-param config) -> %s\n",
+               M == NULL ? "refused, PASS" : "OPENED, FAIL");
+        if (M != NULL) { f++; tsdb_close_h(M); }
+    }
+
     printf("\n%s (%d failed)\n", f ? "*** FAIL ***" : "*** PASS ***", f);
     return f ? 1 : 0;
 }
