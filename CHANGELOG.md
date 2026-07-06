@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+### Added
+- **Live ring-capacity resize** (`tsdb_resize()` / `_h`): change `max_records` on an open database. Growing a never-wrapped database is a header-only change (milliseconds); a wrapped ring, a shrink below the retained count (newest records win), or a database with overflow extras (folded into base columns) goes through the same-schema streaming-rewrite engine — inheriting the migration semantics: space budget, `allow_trim`, progress callback, `migrating` fail-fast, crash-safe `.mig` swap. Intended for expandable storage (SD cards): growing only helps when the filesystem actually has room — on a flash partition the database was sized to fill, a bigger capacity just meets ENOSPC later and adaptive capacity re-caps it.
+
+### Fixed
+- Sparse-index writes are now bounds-checked against the preallocated index region. Previously unreachable (nothing could grow `max_records`), but after a `tsdb_resize()` grow, records beyond the creation-time capacity would have had their index entries written past the index region — into the first data blocks.
+
 ## [2.2.0] - 2026-07-06
 ### Added
 - **Full schema migration** (`tsdb_migrate_schema()` / `_h`): change the base column set — the MySQL-ALTER-TABLE operation the block geometry previously made impossible. Streaming rewrite (one record in, one record out, ~2KB memory regardless of database size) into a sibling `.mig` file with the new geometry, then an atomic swap. Columns are matched by name against old base columns AND overflow extras — extras named in the new schema become first-class base columns and the overflow region is folded away entirely; dropped columns are discarded, new columns backfilled with 0. Space budget via `tsdb_migrate_opts_t`: caller passes known filesystem free space (`0` = "on SD, just go"), and `allow_trim` permits dropping the oldest records so the newest fit when space is tight. Runs at runtime under the handle lock with a `migrating` flag — concurrent writes/queries fail fast with `ESP_ERR_INVALID_STATE` instead of stalling, so on a periodic write cadence a migration completing within one interval loses no samples. Progress reporting via an optional callback (`(records_done, records_total)` at start, every ~1% by default, and at completion) for driving UI progress bars. Crash-safe: the original is never modified; an interrupted swap is recovered (stale `.mig` removed, orphaned complete `.mig` adopted) on the next `tsdb_open()`. Host regression suite in `host_test/test_schema.c`.

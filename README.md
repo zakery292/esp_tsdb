@@ -179,6 +179,24 @@ On littlefs the calling task performs flash-bus operations and must have an
 internal-RAM stack (ESP32-S3 PSRAM-stack rule); SD-card databases can be
 migrated from any task.
 
+### Live Capacity Resize (v2.3+)
+
+`tsdb_resize()` changes `max_records` on an open database. Growing a database
+that has never wrapped is a header-only change (milliseconds); a wrapped ring
+or a shrink streams through the same rewrite engine as schema migration (same
+opts, progress callback, crash-safe swap). Shrinking keeps the newest records.
+
+```c
+tsdb_resize(200000, NULL);          // grow; NULL opts = no space check
+tsdb_resize(0, NULL);               // convert to unlimited (no eviction)
+```
+
+**Storage reality check:** a bigger `max_records` only helps if the
+*filesystem* has room for the file to grow into. On SD-card storage, grow
+freely. If your database lives on a small flash partition it was already
+sized to fill, this API cannot conjure space — the grow will simply hit
+ENOSPC later and adaptive capacity will cap it again. Know your storage.
+
 ### Overflow Schema Migration
 
 Extra parameters can be changed at any time using `tsdb_migrate_overflow()`:

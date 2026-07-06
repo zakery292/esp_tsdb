@@ -234,8 +234,12 @@ retry_write:
         db->header.oldest_timestamp = timestamp;
     }
 
-    // Update sparse index if at stride boundary
-    if (record_idx % db->header.index_stride == 0) {
+    // Update sparse index if at stride boundary. Bounds-guarded: after a
+    // tsdb_resize() grow, record_idx can exceed the capacity the index was
+    // sized for at creation — an unguarded write here would land PAST the
+    // preallocated index region, inside the first data blocks.
+    if (record_idx % db->header.index_stride == 0 &&
+        (record_idx / db->header.index_stride) < db->header.index_entries) {
         uint32_t index_entry_num = record_idx / db->header.index_stride;
         tsdb_index_entry_t entry = {
             .timestamp = timestamp,

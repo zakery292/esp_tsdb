@@ -542,6 +542,34 @@ esp_err_t tsdb_migrate_schema(const char **new_names, uint8_t new_count,
                               const tsdb_migrate_opts_t *opts);
 
 /**
+ * @brief Change the ring capacity (max_records) of a live database. v2.3+
+ *
+ * Two paths, chosen automatically:
+ * - FAST (header-only, milliseconds): the database has never wrapped, the new
+ *   capacity covers every existing record, and no overflow region exists.
+ *   Growing an actively-filling database is almost always this path.
+ * - REWRITE: the ring has wrapped, the capacity is shrinking below the
+ *   retained record count (newest records win), or overflow extras exist
+ *   (they get folded into base columns) — a same-schema streaming rewrite
+ *   through the migration engine: same opts semantics (space budget,
+ *   allow_trim, progress callback), same `migrating` fail-fast behaviour,
+ *   same crash-safe .mig swap.
+ *
+ * Storage reality check: growing only helps when the FILESYSTEM has room for
+ * the file to grow into. On SD-card storage that is usually true — grow
+ * freely. If your database is capped by a small flash partition (e.g. it was
+ * already sized to fill it), a bigger max_records cannot conjure space: the
+ * grow will just hit ENOSPC later and adaptive capacity will cap it again.
+ *
+ * @param new_max_records New ring capacity; 0 = unlimited (no eviction).
+ * @param opts Space budget / trim / progress — used by the rewrite path;
+ *             may be NULL. Ignored on the fast path.
+ * @return ESP_OK (also when the capacity already matches); error codes as
+ *         tsdb_migrate_schema for the rewrite path.
+ */
+esp_err_t tsdb_resize(uint32_t new_max_records, const tsdb_migrate_opts_t *opts);
+
+/**
  * @brief Get total parameter count (base + extra)
  */
 uint8_t tsdb_get_total_params(void);
@@ -727,6 +755,9 @@ esp_err_t tsdb_migrate_overflow_h(tsdb_t *db, const char **new_names, uint8_t ne
 esp_err_t tsdb_migrate_schema_h(tsdb_t *db, const char **new_names,
                                 uint8_t new_count,
                                 const tsdb_migrate_opts_t *opts);
+
+esp_err_t tsdb_resize_h(tsdb_t *db, uint32_t new_max_records,
+                        const tsdb_migrate_opts_t *opts);
 
 uint8_t tsdb_get_total_params_h(const tsdb_t *db);
 

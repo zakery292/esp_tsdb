@@ -160,49 +160,71 @@ void tsdb_migrate_recover(const char *filepath) {
 // SCHEMA MIGRATION
 // ============================================================================
 
-esp_err_t tsdb_migrate_schema_h(tsdb_t *db, const char **new_names,
-                                uint8_t new_count,
-                                const tsdb_migrate_opts_t *opts) {
-    if (db == NULL || !db->is_open) return ESP_ERR_INVALID_STATE;
-    if (new_names == NULL || new_count == 0 || new_count > TSDB_MAX_PARAMS) {
-        return ESP_ERR_INVALID_ARG;
-    }
+/**
+ * @brief Resolve the i-th NEW column name: from the caller's list, or (in
+ *        same-schema/resize mode) from the current file's name stores.
+ *        May return tsdb_get_param_name_h's static buffer — copy immediately.
+ */
+static const char *engine_new_name(tsdb_t *db, const char **new_names, uint8_t i) {
+    return new_names != NULL ? new_names[i] : tsdb_get_param_name_h(db, i);
+}
 
+/**
+ * @brief Shared streaming-rewrite engine behind tsdb_migrate_schema_h and
+ *        tsdb_resize_h.
+ *
+ * @param new_names New column names, or NULL for same-schema mode (keep the
+ *        current columns — base + folded extras — identity-mapped).
+ * @param new_count Ignored when new_names == NULL.
+ * @param set_max / new_max_override Ring-capacity override (tsdb_resize);
+ *        when !set_max the current max_records is kept (schema migration).
+ */
+static esp_err_t tsdb_migrate_engine(tsdb_t *db, const char **new_names,
+                                     uint8_t new_count,
+                                     const tsdb_migrate_opts_t *opts,
+                                     bool set_max, uint32_t new_max_override) {
     TSDB_LOCK_OR_RETURN(db, 30000, ESP_ERR_TIMEOUT);
 
     uint8_t old_base = db->header.num_params;
     uint8_t old_total = old_base + db->extra_param_count;
 
-    // ---- 1. Column mapping by name: new[i] <- old row index, or -1 (zeros).
-    //         Old columns are resolved via tsdb_get_param_name_h, which
-    //         covers all three name stores (fixed header <16, V4 extension
-    //         16..63, overflow extras) — so old extras count as matchable
-    //         columns too and the overflow region gets folded into base.
-    //         NOTE: names of columns at index >= 16 are stored 19 chars max;
-    //         keep param names short so cross-slot matches never truncate.
+    // ---- 1. Column mapping: new[i] <- old row index, or -1 (zeros).
+    //         Same-schema mode keeps every current column (base + extras,
+    //         which get folded into base) identity-mapped. Named mode
+    //         resolves old columns via tsdb_get_param_name_h, which covers
+    //         all three name stores (fixed header <16, V4 extension 16..63,
+    //         overflow extras). NOTE: names of columns at index >= 16 are
+    //         stored 19 chars max; keep param names short so cross-slot
+    //         matches never truncate.
     int8_t col_map[TSDB_MAX_PARAMS];
-    bool schemas_identical = (new_count == old_base && db->extra_param_count == 0);
-    for (uint8_t i = 0; i < new_count; i++) {
-        col_map[i] = -1;
-        for (uint8_t j = 0; j < old_total; j++) {
-            // Static-buffer return: compare immediately, don't hold. Names at
-            // index >= 16 are stored truncated to 19 chars, so match on that
-            // bound there; fixed-header names (<16) compare exactly.
-            const char *old_name = tsdb_get_param_name_h(db, j);
-            if (old_name == NULL) continue;
-            bool match = (j < 16) ? (strcmp(new_names[i], old_name) == 0)
-                                  : (strncmp(new_names[i], old_name,
-                                             TSDB_V4_EXT_NAME_LEN - 1) == 0);
-            if (match) {
-                col_map[i] = (int8_t)j;
-                break;
+    bool schemas_identical;
+    if (new_names == NULL) {
+        new_count = old_total;
+        for (uint8_t i = 0; i < new_count; i++) col_map[i] = (int8_t)i;
+        schemas_identical = (db->extra_param_count == 0);
+    } else {
+        schemas_identical = (new_count == old_base && db->extra_param_count == 0);
+        for (uint8_t i = 0; i < new_count; i++) {
+            col_map[i] = -1;
+            for (uint8_t j = 0; j < old_total; j++) {
+                // Static-buffer return: compare immediately, don't hold.
+                const char *old_name = tsdb_get_param_name_h(db, j);
+                if (old_name == NULL) continue;
+                bool match = (j < 16) ? (strcmp(new_names[i], old_name) == 0)
+                                      : (strncmp(new_names[i], old_name,
+                                                 TSDB_V4_EXT_NAME_LEN - 1) == 0);
+                if (match) {
+                    col_map[i] = (int8_t)j;
+                    break;
+                }
             }
+            if (col_map[i] != (int8_t)i) schemas_identical = false;
+            ESP_LOGI(TAG, "  %-20s <- %s", new_names[i],
+                     col_map[i] < 0 ? "(new, zeros)" : "old column");
         }
-        if (col_map[i] != (int8_t)i) schemas_identical = false;
-        ESP_LOGI(TAG, "  %-20s <- %s", new_names[i],
-                 col_map[i] < 0 ? "(new, zeros)" : "old column");
     }
-    if (schemas_identical) {
+    bool max_changes = set_max && (new_max_override != db->header.max_records);
+    if (schemas_identical && !max_changes) {
         ESP_LOGI(TAG, "Schema already matches — nothing to migrate");
         tsdb_unlock(db);
         return ESP_OK;
@@ -218,7 +240,14 @@ esp_err_t tsdb_migrate_schema_h(tsdb_t *db, const char **new_names,
                           db->header.total_records : db->header.max_records);
     uint32_t retain = available;
 
-    uint32_t new_max = db->header.max_records;     // keep capacity intent
+    uint32_t new_max = set_max ? new_max_override :
+                       db->header.max_records;    // keep capacity intent
+    // Shrinking below the retained count: newest records win.
+    if (new_max > 0 && retain > new_max) {
+        ESP_LOGW(TAG, "Resize below retained count: keeping newest %lu of %lu",
+                 (unsigned long)new_max, (unsigned long)retain);
+        retain = new_max;
+    }
     uint32_t index_stride = db->header.index_stride;
     uint32_t new_index_entries = new_max > 0 ?
         (new_max / index_stride) + 1 : 256;
@@ -297,7 +326,8 @@ esp_err_t tsdb_migrate_schema_h(tsdb_t *db, const char **new_names,
     nh.index_offset = new_index_offset;
     nh.index_entries = new_index_entries;
     for (uint8_t i = 0; i < new_count && i < 16; i++) {
-        strncpy(nh.param_names[i], new_names[i], 31);
+        const char *nm = engine_new_name(db, new_names, i);
+        strncpy(nh.param_names[i], nm ? nm : "", 31);
         nh.param_names[i][31] = '\0';
     }
 
@@ -309,8 +339,9 @@ esp_err_t tsdb_migrate_schema_h(tsdb_t *db, const char **new_names,
         char ext_name[TSDB_V4_EXT_NAME_LEN];
         fseek(out, TSDB_V4_EXT_NAMES_OFFSET, SEEK_SET);
         for (uint8_t i = 16; i < new_count && err == ESP_OK; i++) {
+            const char *nm = engine_new_name(db, new_names, i);
             memset(ext_name, 0, sizeof(ext_name));
-            strncpy(ext_name, new_names[i], TSDB_V4_EXT_NAME_LEN - 1);
+            if (nm) strncpy(ext_name, nm, TSDB_V4_EXT_NAME_LEN - 1);
             if (fwrite(ext_name, TSDB_V4_EXT_NAME_LEN, 1, out) != 1) err = ESP_FAIL;
         }
     }
@@ -471,10 +502,75 @@ esp_err_t tsdb_migrate_schema_h(tsdb_t *db, const char **new_names,
 }
 
 // ============================================================================
+// PUBLIC API
+// ============================================================================
+
+esp_err_t tsdb_migrate_schema_h(tsdb_t *db, const char **new_names,
+                                uint8_t new_count,
+                                const tsdb_migrate_opts_t *opts) {
+    if (db == NULL || !db->is_open) return ESP_ERR_INVALID_STATE;
+    if (new_names == NULL || new_count == 0 || new_count > TSDB_MAX_PARAMS) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return tsdb_migrate_engine(db, new_names, new_count, opts, false, 0);
+}
+
+esp_err_t tsdb_resize_h(tsdb_t *db, uint32_t new_max_records,
+                        const tsdb_migrate_opts_t *opts) {
+    if (db == NULL || !db->is_open) return ESP_ERR_INVALID_STATE;
+
+    TSDB_LOCK_OR_RETURN(db, 30000, ESP_ERR_TIMEOUT);
+
+    if (new_max_records == db->header.max_records) {
+        tsdb_unlock(db);
+        return ESP_OK;
+    }
+
+    // Fast path: the layout is still linear (never wrapped) and the new
+    // capacity covers every existing record, so slot == record % new_max
+    // holds for all data — a header-only change, milliseconds. Excluded when
+    // an overflow region exists: growing the base data region would extend
+    // into the overflow appended after it (the slow path folds extras into
+    // base columns instead). Relies on the index-write bounds guard in
+    // tsdb_write.c — index entries past the preallocated region are skipped,
+    // never written into data blocks.
+    bool linear = (db->header.oldest_record_idx == 0) &&
+                  (db->header.max_records == 0 ||
+                   db->header.total_records <= db->header.max_records);
+    bool covers = (new_max_records == 0) ||
+                  (new_max_records >= db->header.total_records);
+    if (linear && covers && db->extra_param_count == 0) {
+        uint32_t old_max = db->header.max_records;
+        db->header.max_records = new_max_records;
+        esp_err_t ret = tsdb_write_header(db->file, &db->header);
+        if (ret != ESP_OK) {
+            db->header.max_records = old_max;   // keep RAM/disk consistent
+        } else {
+            db->capacity_adapted = false;       // capacity changed: re-arm ENOSPC adapt
+            ESP_LOGI(TAG, "Resize (fast): max_records %lu -> %lu",
+                     (unsigned long)old_max, (unsigned long)new_max_records);
+        }
+        tsdb_unlock(db);
+        return ret;
+    }
+
+    // Slow path: wrapped ring, shrink below the retained count, or overflow
+    // present — same-schema streaming rewrite through the migration engine
+    // (recursive lock: the engine takes and releases its own count).
+    esp_err_t ret = tsdb_migrate_engine(db, NULL, 0, opts, true, new_max_records);
+    tsdb_unlock(db);
+    return ret;
+}
+
+// ============================================================================
 // LEGACY GLOBAL API
 // ============================================================================
 
 esp_err_t tsdb_migrate_schema(const char **new_names, uint8_t new_count,
                               const tsdb_migrate_opts_t *opts) {
     return tsdb_migrate_schema_h(g_default_handle, new_names, new_count, opts);
+}
+
+esp_err_t tsdb_resize(uint32_t new_max_records, const tsdb_migrate_opts_t *opts) {
+    return tsdb_resize_h(g_default_handle, new_max_records, opts);
 }

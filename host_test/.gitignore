@@ -4,3 +4,4 @@ test_more
 *.tsdb
 test_multi
 test_schema
+test_resize
