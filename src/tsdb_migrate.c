@@ -183,7 +183,7 @@ static esp_err_t tsdb_migrate_engine(tsdb_t *db, const char **new_names,
                                      uint8_t new_count,
                                      const tsdb_migrate_opts_t *opts,
                                      bool set_max, uint32_t new_max_override) {
-    TSDB_LOCK_OR_RETURN(db, 30000, ESP_ERR_TIMEOUT);
+    TSDB_LOCK_OPEN_OR_RETURN(db, 30000, ESP_ERR_TIMEOUT);
 
     uint8_t old_base = db->header.num_params;
     uint8_t old_total = old_base + db->extra_param_count;
@@ -519,7 +519,7 @@ esp_err_t tsdb_resize_h(tsdb_t *db, uint32_t new_max_records,
                         const tsdb_migrate_opts_t *opts) {
     if (db == NULL || !db->is_open) return ESP_ERR_INVALID_STATE;
 
-    TSDB_LOCK_OR_RETURN(db, 30000, ESP_ERR_TIMEOUT);
+    TSDB_LOCK_OPEN_OR_RETURN(db, 30000, ESP_ERR_TIMEOUT);
 
     if (new_max_records == db->header.max_records) {
         tsdb_unlock(db);

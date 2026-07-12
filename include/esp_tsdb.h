@@ -87,6 +87,19 @@ typedef struct {
     tsdb_alloc_strategy_t alloc_strategy;  // Where to allocate buffers
     bool use_paged_allocation;      // true = use paged buffers (fragmented heap)
     size_t page_size;               // Page size if using paged allocation (default: 2048)
+
+    // Free-space guard (optional, NULL/0 = disabled — fully backward
+    // compatible). When set, each time the data file is about to GROW by a
+    // new block the engine calls free_space_cb(); if the result is below
+    // min_free_bytes it caps max_records at the current record count and
+    // switches to ring/LRU reuse immediately — instead of waiting for a hard
+    // ENOSPC, by which time the filesystem is at zero bytes free and every
+    // OTHER file on the medium is failing its writes too (copy-on-write
+    // filesystems like littlefs need free blocks even for in-place updates).
+    // The callback should return UINT64_MAX when free space cannot be
+    // determined, so a failed probe never triggers a spurious cap.
+    uint64_t (*free_space_cb)(void);
+    uint32_t min_free_bytes;
 } tsdb_config_t;
 
 /**

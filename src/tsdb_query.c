@@ -68,8 +68,9 @@ esp_err_t tsdb_query_init_h(tsdb_t *db,
         return ESP_ERR_INVALID_STATE;
     }
 
-    // Fail fast during a schema migration instead of stalling on the mutex.
-    if (db->migrating) {
+    // Fail fast during a schema migration or close instead of stalling on
+    // the mutex.
+    if (db->migrating || db->closing) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -77,7 +78,7 @@ esp_err_t tsdb_query_init_h(tsdb_t *db,
     // tsdb_query_close(). CRITICAL: callers MUST call tsdb_query_close()
     // even on early-exit / error paths or the lock leaks. The mutex is
     // recursive so the same task can also do writes.
-    TSDB_LOCK_OR_RETURN(db, 5000, ESP_ERR_TIMEOUT);
+    TSDB_LOCK_OPEN_OR_RETURN(db, 5000, ESP_ERR_TIMEOUT);
 
     if (start_time > end_time) {
         ESP_LOGE(TAG, "Invalid time range: start > end");

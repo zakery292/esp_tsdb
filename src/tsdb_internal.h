@@ -99,6 +99,26 @@ struct tsdb_s {
     // the migration (seconds to a minute) holds the handle lock.
     volatile bool migrating;
 
+    // Set for the duration of tsdb_close_h(). Latency-only optimisation:
+    // callers that check it BEFORE taking the mutex are spared blocking
+    // behind a teardown they'd only bail out of. It is NOT the safety
+    // mechanism — already-blocked callers recover via the post-lock
+    // is_open + generation re-check in TSDB_LOCK_OPEN_OR_RETURN.
+    volatile bool closing;
+
+    // Incarnation stamp. Preserved (and incremented) across the recycler's
+    // memset in tsdb_acquire_handle — like the mutex itself — so a straggler
+    // that blocked on the mutex during incarnation N can detect that the
+    // handle it wakes up on has been reopened as incarnation N+1 (is_open is
+    // true again by then, so is_open alone cannot catch this: the straggler
+    // would silently write its stale record into the NEW database).
+    uint32_t generation;
+
+    // Optional free-space guard (copied from tsdb_config_t): consulted before
+    // the data file grows by a new block. See tsdb_write_h.
+    uint64_t (*free_space_cb)(void);
+    uint32_t min_free_bytes;
+
     // Overflow state
     uint8_t  extra_param_count;
     uint32_t overflow_data_offset;      // overflow_offset + TSDB_OVERFLOW_HEADER_SIZE
@@ -140,6 +160,27 @@ static inline void tsdb_unlock(tsdb_t *db) {
         ESP_LOGE(TAG, "%s: lock timeout", __func__); \
         return (errval); \
     } } while (0)
+
+// Take the handle lock AND re-verify the handle once inside. The pre-lock
+// `is_open` test is only a fast-path optimisation: a closer can win the mutex
+// first and tear the handle down while this task is blocked in xSemaphoreTake
+// — so after acquiring, the state must be re-checked before touching
+// db->file / pool. (The mutex itself is never deleted — closed handles are
+// parked for reuse, see tsdb_retire_handle in tsdb_core.c.)
+//
+// The generation check catches the close-AND-reopen interleaving: if the
+// handle was recycled into a new incarnation while this task was blocked,
+// is_open is true again but the generation differs — without this, a stale
+// writer would silently inject its old record into the freshly-opened
+// database (e.g. one bogus pre-clear record after a clear-all).
+#define TSDB_LOCK_OPEN_OR_RETURN(db, timeout_ms, errval) \
+    do { uint32_t _tsdb_gen_ = (db)->generation; \
+        TSDB_LOCK_OR_RETURN((db), (timeout_ms), (errval)); \
+        if (!(db)->is_open || (db)->generation != _tsdb_gen_) { \
+            tsdb_unlock(db); \
+            ESP_LOGW(TAG, "%s: handle closed/reopened while waiting for lock", __func__); \
+            return ESP_ERR_INVALID_STATE; \
+        } } while (0)
 
 // ============================================================================
 // INTERNAL FUNCTIONS

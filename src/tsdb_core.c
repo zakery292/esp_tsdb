@@ -329,6 +329,62 @@ static esp_err_t tsdb_reconstruct_header(FILE *file, tsdb_header_t *header,
 // HANDLE LIFECYCLE
 // ============================================================================
 
+// One-slot handle recycler. A closed handle's MUTEX MUST NEVER BE DELETED:
+// a task that passed its pre-lock is_open check can be blocked inside
+// xSemaphoreTake on that exact mutex for up to its lock timeout, and
+// vSemaphoreDelete under a blocked waiter frees the queue structure the
+// waiter's TCB is linked into — use-after-free, typically a LoadProhibited
+// panic on the waiter task (seen live: inverter-poller write racing the
+// clear-history close). Instead the retired handle is parked here, mutex
+// alive, and reused by the next tsdb_open(); stragglers wake on a valid
+// mutex, re-check is_open (TSDB_LOCK_OPEN_OR_RETURN), and bail cleanly.
+static tsdb_t *s_recycled_handle = NULL;
+
+static void tsdb_retire_handle(tsdb_t *db) {
+    if (db == NULL) return;
+    if (s_recycled_handle == NULL) {
+        s_recycled_handle = db;
+    } else {
+        // Slot occupied (multi-handle user closing >1 handle before the next
+        // open): deliberately leak the struct AND its mutex rather than ever
+        // risk deleting a mutex a straggler could still be blocked on. NOTE
+        // for multi-handle users: this leaks per EXCESS CONCURRENT close, not
+        // once — churning many handles through open/close leaks accordingly.
+        // The single-global-handle pattern (the common case) never hits this.
+        ESP_LOGW(TAG, "handle recycler occupied — leaking retired handle (%u bytes + mutex)",
+                 (unsigned)sizeof(tsdb_t));
+    }
+}
+
+// Get a zeroed handle with a live mutex: reuse the parked one if present
+// (preserving its mutex), else allocate fresh.
+static tsdb_t *tsdb_acquire_handle(void) {
+    tsdb_t *db = s_recycled_handle;
+    if (db != NULL) {
+        s_recycled_handle = NULL;
+        // Preserve the mutex AND the incarnation stamp across the wipe: the
+        // bumped generation is how a straggler blocked on this mutex detects
+        // that the handle it wakes on is a NEW database (see
+        // TSDB_LOCK_OPEN_OR_RETURN).
+        SemaphoreHandle_t m = db->mutex;
+        uint32_t gen = db->generation;
+        memset(db, 0, sizeof(*db));
+        db->mutex = m;
+        db->generation = gen + 1;
+        return db;
+    }
+    db = (tsdb_t *)calloc(1, sizeof(tsdb_t));
+    if (db == NULL) return NULL;
+    // Recursive: the close->delete->init chain (migration / clear-all)
+    // re-enters the lock on the same task, so a plain mutex would self-deadlock.
+    db->mutex = xSemaphoreCreateRecursiveMutex();
+    if (db->mutex == NULL) {
+        free(db);
+        return NULL;
+    }
+    return db;
+}
+
 tsdb_t *tsdb_open(const tsdb_config_t *config) {
     if (config == NULL || config->filepath == NULL) {
         ESP_LOGE(TAG, "Invalid config");
@@ -346,20 +402,15 @@ tsdb_t *tsdb_open(const tsdb_config_t *config) {
         return NULL;
     }
 
-    tsdb_t *db = (tsdb_t *)calloc(1, sizeof(tsdb_t));
+    tsdb_t *db = tsdb_acquire_handle();
     if (db == NULL) {
         ESP_LOGE(TAG, "Failed to allocate handle");
         return NULL;
     }
 
-    // Recursive: the close→delete→init chain (migration / clear-all) re-enters
-    // the lock on the same task, so a plain mutex would self-deadlock.
-    db->mutex = xSemaphoreCreateRecursiveMutex();
-    if (db->mutex == NULL) {
-        ESP_LOGE(TAG, "Failed to create handle mutex");
-        free(db);
-        return NULL;
-    }
+    // Free-space guard (optional) — see esp_tsdb.h.
+    db->free_space_cb  = config->free_space_cb;
+    db->min_free_bytes = config->min_free_bytes;
 
     ESP_LOGI(TAG, "Initializing TSDB: %s", config->filepath);
     ESP_LOGI(TAG, "Parameters: %d, Max records: %lu, Buffer: %d KB",
@@ -374,8 +425,7 @@ tsdb_t *tsdb_open(const tsdb_config_t *config) {
                                            config->alloc_strategy);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to allocate buffer pool");
-        vSemaphoreDelete(db->mutex);
-        free(db);
+        tsdb_retire_handle(db);
         return NULL;
     }
 
@@ -483,8 +533,7 @@ tsdb_t *tsdb_open(const tsdb_config_t *config) {
                         ESP_LOGE(TAG, "Failed to write reconstructed header");
                         fclose(db->file);
                         tsdb_free_buffer_pool(&db->pool);
-                        vSemaphoreDelete(db->mutex);
-                        free(db);
+                        tsdb_retire_handle(db);
                         return NULL;
                     }
 
@@ -514,8 +563,7 @@ tsdb_t *tsdb_open(const tsdb_config_t *config) {
                          db->header.num_params, config->num_params);
                 fclose(db->file);
                 tsdb_free_buffer_pool(&db->pool);
-                vSemaphoreDelete(db->mutex);
-                free(db);
+                tsdb_retire_handle(db);
                 return NULL;
             }
 
@@ -647,8 +695,7 @@ migration_done: ;
         if (db->file == NULL) {
             ESP_LOGE(TAG, "Failed to create new file");
             tsdb_free_buffer_pool(&db->pool);
-            vSemaphoreDelete(db->mutex);
-            free(db);
+            tsdb_retire_handle(db);
             return NULL;
         }
 
@@ -703,8 +750,7 @@ migration_done: ;
             ESP_LOGE(TAG, "Failed to write header");
             fclose(db->file);
             tsdb_free_buffer_pool(&db->pool);
-            vSemaphoreDelete(db->mutex);
-            free(db);
+            tsdb_retire_handle(db);
             return NULL;
         }
 
@@ -735,7 +781,15 @@ migration_done: ;
 
     // Save filepath
     strncpy(db->filepath, config->filepath, sizeof(db->filepath) - 1);
+
+    // Publish is_open under the lock: on a RECYCLED handle a straggler from
+    // the previous incarnation may acquire the mutex mid-init; it must see
+    // either is_open==false (bails) or is_open==true with every field above
+    // fully written. The lock round-trip provides the release barrier.
+    // (Stragglers only hold the mutex for a flag check, so 10s can't hit.)
+    tsdb_lock(db, 10000);
     db->is_open = true;
+    tsdb_unlock(db);
 
     ESP_LOGI(TAG, "TSDB initialized successfully");
 
@@ -747,13 +801,25 @@ esp_err_t tsdb_close_h(tsdb_t *db) {
         return ESP_OK;
     }
 
-    TSDB_LOCK_OR_RETURN(db, 5000, ESP_ERR_TIMEOUT);
+    // Fail-fast signal: writers/queriers check this BEFORE taking the mutex so
+    // they don't queue up behind a close that will invalidate the handle.
+    db->closing = true;
+
+    // 30s: must out-wait the slowest legitimate lock holder (a streaming query
+    // or block write on a full, fragmented filesystem). On timeout the handle
+    // stays fully valid — the caller can retry or give up; nothing is torn.
+    if (!tsdb_lock(db, 30000)) {
+        ESP_LOGE(TAG, "tsdb_close: lock timeout — handle left open");
+        db->closing = false;
+        return ESP_ERR_TIMEOUT;
+    }
 
     if (!db->is_open) {
-        // Nothing to flush, but still free the handle
+        // Nothing to flush; park the handle (mutex stays alive — see
+        // tsdb_retire_handle for why it must never be deleted).
+        db->closing = false;
         tsdb_unlock(db);
-        if (db->mutex) vSemaphoreDelete(db->mutex);
-        free(db);
+        tsdb_retire_handle(db);
         return ESP_OK;
     }
 
@@ -780,14 +846,17 @@ esp_err_t tsdb_close_h(tsdb_t *db) {
     tsdb_free_buffer_pool(&db->pool);
 
     db->is_open = false;
+    db->closing = false;
 
     ESP_LOGI(TAG, "TSDB closed");
 
-    // Release the lock before tearing down the mutex it protects, then free
-    // the handle. (unlock-before-free: never touch db->mutex after it's deleted)
+    // Release the lock, then PARK the handle instead of freeing it. The mutex
+    // must survive: a straggler that passed its pre-lock is_open check may
+    // still be blocked in xSemaphoreTake — it will wake on the (valid) mutex,
+    // re-check is_open via TSDB_LOCK_OPEN_OR_RETURN, and bail. Deleting the
+    // mutex here was a live use-after-free (poller write vs clear-history).
     tsdb_unlock(db);
-    if (db->mutex) vSemaphoreDelete(db->mutex);
-    free(db);
+    tsdb_retire_handle(db);
 
     return ESP_OK;
 }
@@ -800,7 +869,7 @@ esp_err_t tsdb_sync_h(tsdb_t *db) {
     // Recursive take — the mutex is created with xSemaphoreCreateRecursiveMutex,
     // so plain xSemaphoreTake/Give here would corrupt the recursion count when
     // the caller already holds the lock (e.g. sync after write on one task).
-    TSDB_LOCK_OR_RETURN(db, 30000, ESP_ERR_TIMEOUT);
+    TSDB_LOCK_OPEN_OR_RETURN(db, 30000, ESP_ERR_TIMEOUT);
 
     fflush(db->file);
     fsync(fileno(db->file));
@@ -838,7 +907,7 @@ esp_err_t tsdb_get_stats_h(tsdb_t *db, tsdb_stats_t *stats) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    TSDB_LOCK_OR_RETURN(db, 5000, ESP_ERR_TIMEOUT);
+    TSDB_LOCK_OPEN_OR_RETURN(db, 5000, ESP_ERR_TIMEOUT);
 
     stats->total_records = (db->header.max_records == 0 ||
                             db->header.total_records < db->header.max_records) ?
@@ -870,7 +939,7 @@ esp_err_t tsdb_clear_h(tsdb_t *db) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    TSDB_LOCK_OR_RETURN(db, 5000, ESP_ERR_TIMEOUT);
+    TSDB_LOCK_OPEN_OR_RETURN(db, 5000, ESP_ERR_TIMEOUT);
 
     ESP_LOGW(TAG, "Clearing all data");
 
@@ -914,8 +983,13 @@ esp_err_t tsdb_delete_h(tsdb_t *db) {
     char filepath_copy[128];
     strncpy(filepath_copy, db->filepath, sizeof(filepath_copy));
 
-    // Close (frees the handle — including db->mutex; db is dangling after this)
-    tsdb_close_h(db);
+    // Close (parks the handle in the recycler; db must not be used after this).
+    // A failed close means the file is still open — do NOT unlink underneath it.
+    esp_err_t cret = tsdb_close_h(db);
+    if (cret != ESP_OK) {
+        ESP_LOGE(TAG, "tsdb_delete: close failed (%d) — file not deleted", cret);
+        return cret;
+    }
 
     // Delete file
     if (unlink(filepath_copy) != 0) {
@@ -949,7 +1023,7 @@ esp_err_t tsdb_add_extra_params_h(tsdb_t *db, const char **param_names, uint8_t 
         return ESP_ERR_INVALID_STATE;
     }
 
-    TSDB_LOCK_OR_RETURN(db, 5000, ESP_ERR_TIMEOUT);
+    TSDB_LOCK_OPEN_OR_RETURN(db, 5000, ESP_ERR_TIMEOUT);
 
     ESP_LOGI(TAG, "Adding %d extra parameters (overflow region)", count);
 
@@ -1023,7 +1097,7 @@ esp_err_t tsdb_migrate_overflow_h(tsdb_t *db, const char **new_names, uint8_t ne
         return tsdb_add_extra_params_h(db, new_names, new_count);
     }
 
-    TSDB_LOCK_OR_RETURN(db, 5000, ESP_ERR_TIMEOUT);
+    TSDB_LOCK_OPEN_OR_RETURN(db, 5000, ESP_ERR_TIMEOUT);
 
     // Case: remove overflow entirely
     if (new_count == 0) {
@@ -1249,8 +1323,11 @@ esp_err_t tsdb_init(const tsdb_config_t *config) {
         return ESP_OK;
     }
     if (g_default_handle != NULL) {
-        // Stale (closed) handle — free it before opening fresh.
-        free(g_default_handle);
+        // Stale (closed) handle still published. Shouldn't happen with the
+        // close() contract (unpublish-first), but NEVER free() it here: a
+        // closed handle is parked in the recycler and owned by it — freeing
+        // would double-own the memory the next tsdb_open() reuses. Just drop
+        // the reference.
         g_default_handle = NULL;
     }
     g_default_handle = tsdb_open(config);
@@ -1258,9 +1335,19 @@ esp_err_t tsdb_init(const tsdb_config_t *config) {
 }
 
 esp_err_t tsdb_close(void) {
-    if (g_default_handle == NULL) return ESP_OK;
-    esp_err_t ret = tsdb_close_h(g_default_handle);
+    tsdb_t *db = g_default_handle;
+    if (db == NULL) return ESP_OK;
+    // Unpublish FIRST so new global-API callers fail fast with "not
+    // initialized" instead of racing the teardown. In-flight callers that
+    // already loaded the pointer are safe: the handle's mutex is never
+    // deleted (recycler) and they re-check is_open after acquiring it.
     g_default_handle = NULL;
+    esp_err_t ret = tsdb_close_h(db);
+    if (ret != ESP_OK) {
+        // Close failed (lock timeout) — the handle is still fully open.
+        // Re-publish it so the DB keeps working; caller may retry.
+        g_default_handle = db;
+    }
     return ret;
 }
 
@@ -1277,8 +1364,17 @@ esp_err_t tsdb_clear(void) {
 }
 
 esp_err_t tsdb_delete(void) {
-    esp_err_t ret = tsdb_delete_h(g_default_handle);
-    g_default_handle = NULL;
+    tsdb_t *db = g_default_handle;
+    if (db == NULL) return ESP_ERR_INVALID_STATE;
+    g_default_handle = NULL;  // unpublish first — same contract as tsdb_close()
+    esp_err_t ret = tsdb_delete_h(db);
+    if (ret == ESP_ERR_TIMEOUT) {
+        // Close inside delete timed out: handle still open, file NOT deleted.
+        // ONLY republish on TIMEOUT — the other failure (unlink failed) comes
+        // AFTER a successful close, where the handle is already parked in the
+        // recycler; republishing it would publish a closed handle.
+        g_default_handle = db;
+    }
     return ret;
 }
 

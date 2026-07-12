@@ -89,16 +89,53 @@ esp_err_t tsdb_write_h(tsdb_t *db, uint32_t timestamp, const int16_t *values) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    // Fail fast during a schema migration instead of stalling on the mutex
-    // for the full lock timeout. Caller may retry on its next write cadence.
-    if (db->migrating) {
+    // Fail fast during a schema migration or close instead of stalling on the
+    // mutex for the full lock timeout. Caller may retry on its next cadence.
+    if (db->migrating || db->closing) {
         return ESP_ERR_INVALID_STATE;
     }
 
     // Take the handle lock for the whole write. The mutex is recursive, so a
     // task already holding it (e.g. during a query) can still write. Taken
     // ONCE here -- the retry_write path below does not re-take it.
-    TSDB_LOCK_OR_RETURN(db, 5000, ESP_ERR_TIMEOUT);
+    // OPEN variant: a closer may have won the mutex while we were blocked —
+    // the handle is parked (not freed) in that case, so we must re-check.
+    TSDB_LOCK_OPEN_OR_RETURN(db, 5000, ESP_ERR_TIMEOUT);
+
+    // PROACTIVE capacity cap (free-space guard, see esp_tsdb.h): if the file
+    // is still in its growth phase and the NEXT record starts a new block —
+    // the only point the data file grows — check the filesystem reserve and
+    // switch to ring/LRU reuse BEFORE breaching it. Waiting for the hard
+    // ENOSPC below means the filesystem is already at zero free, where
+    // copy-on-write filesystems (littlefs) fail every OTHER file's writes
+    // too (fault ring, settings audit, energy json on the dongle).
+    if (db->free_space_cb && db->min_free_bytes > 0 &&
+        !db->capacity_adapted && db->header.max_records > 0 &&
+        db->header.total_records > 0 &&
+        db->header.total_records < db->header.max_records &&
+        (db->header.total_records % db->header.records_per_block) == 0) {
+        uint64_t free_now = db->free_space_cb();
+        if (free_now < db->min_free_bytes) {
+            uint32_t old_max = db->header.max_records;
+            db->header.max_records = db->header.total_records;
+            db->capacity_adapted = true;
+            ESP_LOGW(TAG, "Free space %llu below reserve %lu: capping %lu -> %lu records (LRU from now on)",
+                     (unsigned long long)free_now,
+                     (unsigned long)db->min_free_bytes,
+                     (unsigned long)old_max,
+                     (unsigned long)db->header.max_records);
+            // Persisting the cap matters across reboots: a stale on-disk max
+            // resumes growth into the reserve on the next open. At the reserve
+            // boundary littlefs COW can fail even this in-place 512B rewrite,
+            // so retry once and shout if it still fails (the in-memory cap
+            // holds for this power cycle regardless).
+            if (tsdb_write_header(db->file, &db->header) != ESP_OK &&
+                tsdb_write_header(db->file, &db->header) != ESP_OK) {
+                ESP_LOGE(TAG, "Capacity-cap header persist FAILED — cap is "
+                              "in-memory only until the next successful header write");
+            }
+        }
+    }
 
 retry_write:
     {}  // label target — allow re-entry after adaptive shrink
@@ -180,7 +217,13 @@ retry_write:
         // Persist the new cap. If this fails we still retry - the in-memory
         // header is authoritative for the retry path. The lock is still held
         // (recursive mutex, taken once above); the retry does not re-take it.
-        tsdb_write_header(db->file, &db->header);
+        // Header persist failure here is likely (we JUST hit ENOSPC) — retry
+        // once and log loudly; a stale on-disk max resumes growth next boot.
+        if (tsdb_write_header(db->file, &db->header) != ESP_OK &&
+            tsdb_write_header(db->file, &db->header) != ESP_OK) {
+            ESP_LOGE(TAG, "ENOSPC-cap header persist FAILED — cap is "
+                          "in-memory only until the next successful header write");
+        }
         goto retry_write;
     }
     if (ret != ESP_OK) {
