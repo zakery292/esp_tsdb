@@ -53,8 +53,23 @@ esp_err_t tsdb_write_block(tsdb_t *db, uint32_t block_num, const tsdb_block_t *b
     errno = 0;
     size_t written = fwrite(block, TSDB_BLOCK_SIZE, 1, db->file);
     int write_errno = errno;
+    // fflush pushes the stdio buffer to the VFS so ENOSPC surfaces below.
+    //
+    // Deliberately NOT fsync'd. The only caller is tsdb_write_h, which fsyncs
+    // the same descriptor a few lines after writing the header — one fsync
+    // covers both writes. On LittleFS an fsync costs a full journal commit
+    // (~2.6 s measured on an ESP32-S3 with a 3 MB partition), and it is a
+    // fixed per-call cost: a 1 MB database and a 192 KB one measured the same.
+    // Syncing here doubled the cost of every write for no durability the
+    // trailing fsync does not already provide.
+    //
+    // What this gives up: the data block is no longer forced durable *before*
+    // the header advertises the record. A power loss between the two can now
+    // leave the header claiming a record whose block never landed — one bad
+    // row, detectable as an out-of-range timestamp on read. That was worth
+    // paying for when it also guarded a frequent crash; it is not worth
+    // halving write throughput indefinitely.
     fflush(db->file);
-    fsync(fileno(db->file));
 
     if (written != 1) {
         if (write_errno == ENOSPC) {
