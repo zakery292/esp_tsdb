@@ -1,5 +1,9 @@
 # Changelog
 
+## [2.4.2] - 2026-08-31
+### Added
+- First release published to the **PlatformIO Registry**, alongside the existing ESP Component Registry upload. PlatformIO consumers previously had to pin the component by git URL, which `pio pkg outdated` cannot see — so a downstream project's dependency scanner never reported a new esp_tsdb release. They can now depend on a version spec and be told about updates. No code change in this version.
+
 ## [2.4.1] - 2026-08-31
 ### Added
 - **PlatformIO manifest (`library.json`).** The component shipped only `idf_component.yml`, which PlatformIO cannot read — so a PlatformIO consumer saw the package as `esp_tsdb@0.0.0+<sha>` and could not express a version constraint at all; the git ref was the only way to pin it. With a manifest, `esp_tsdb@^2.4.1` resolves normally. `srcDir`/`includeDir` match the layout the LDF already inferred and `host_test/` is excluded from the package, so the set of compiled files is unchanged. ESP-IDF consumers are unaffected: `idf_component.yml` and `CMakeLists.txt` still drive that path.

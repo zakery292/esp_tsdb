@@ -1,6 +1,6 @@
 {
   "name": "esp_tsdb",
-  "version": "2.4.1",
+  "version": "2.4.2",
   "description": "Data-agnostic time-series database for ESP32. Columnar storage, sparse indexing, runtime-extensible parameters, schema migration, built-in aggregations, configurable memory allocation (internal RAM or PSRAM), ring-buffer eviction, and streaming queries with on-device benchmarking.",
   "keywords": ["time-series", "tsdb", "database", "esp32", "idf", "littlefs"],
   "license": "MIT",
