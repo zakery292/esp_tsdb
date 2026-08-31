@@ -1,5 +1,16 @@
 # Changelog
 
+## [2.4.0] - 2026-08-31
+### Changed
+- **The database header is written to a sidecar file instead of in place.** The in-file header sits at offset 0, and littlefs stores a file as a CTZ skip-list of block addresses — so rewriting byte 0 rewrites the *whole* file, at a cost linear in its size (~20 ms/KB measured on esp_littlefs; ~5.1 s for a 268 KB database). Since the header is rewritten on every sample, a database that worked for weeks eventually crosses the task-watchdog budget and panics the device mid-write; observed live as a boot loop on an ESP32 logging one record per 5 minutes, once the file reached ~170 KB. The header now goes to one of two alternating slots (`<db>.h0` / `<db>.h1`) holding `{magic, seq, crc32, header}` — a fresh small file each time, so the cost is flat regardless of database size (~56-80 ms).
+
+  Backward compatible in both directions, and no migration step. On open, the in-file header stays authoritative; a sidecar is adopted only when it is valid (magic + CRC), geometrically identical, and strictly ahead of it — i.e. only to recover the records an unclean shutdown would otherwise have lost. `tsdb_close()` refreshes the in-file header and removes the sidecars, so a cleanly-closed database is byte-for-byte an ordinary esp_tsdb file that 2.3.0 reads unchanged.
+
+  Host coverage in `host_test/test_sidecar.c`: clean close, crash-with-sidecar-ahead, and corrupt-sidecar-ignored.
+
+### Added
+- `esp32p4` added to the component manifest's supported targets.
+
 ## [2.3.0] - 2026-07-12
 ### Added
 - **Free-space guard** (`tsdb_config_t.free_space_cb` + `min_free_bytes`, both optional/off by default): before the data file grows by a new block, the engine consults the callback and — if free space is below the reserve — caps `max_records` at the current record count and switches to ring/LRU reuse immediately, persisting the cap. Previously the adaptive cap only fired on a hard `ENOSPC`, i.e. when the filesystem was already at zero bytes free — where copy-on-write filesystems (littlefs) also fail every *other* file's in-place writes. The callback should return `UINT64_MAX` when free space cannot be determined, so a failed probe never latches a spurious cap. CAVEAT: the guard covers the base (ring) data region only — the legacy overflow-extras region (`tsdb_add_extra_params`) grows monotonically per write and is NOT ring-reused or guard-capped; databases using overflow extras can still grow past the reserve. (The modern path — first-class base columns via schema migration — is fully covered.)
