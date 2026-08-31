@@ -1,5 +1,9 @@
 # Changelog
 
+## [2.4.3] - 2026-08-31
+### Fixed
+- The published PlatformIO package no longer carries build byproducts. `release_notes.md` and `dist/` are written by earlier steps of the release workflow and were being swept into the package tarball; `.github/` was shipping too. All three are now excluded, alongside `host_test/`. Harmless (nothing was compiled from them), but they are not part of the library.
+
 ## [2.4.2] - 2026-08-31
 ### Added
 - First release published to the **PlatformIO Registry**, alongside the existing ESP Component Registry upload. PlatformIO consumers previously had to pin the component by git URL, which `pio pkg outdated` cannot see — so a downstream project's dependency scanner never reported a new esp_tsdb release. They can now depend on a version spec and be told about updates. No code change in this version.
