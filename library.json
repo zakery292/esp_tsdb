@@ -1,0 +1,22 @@
+{
+  "name": "esp_tsdb",
+  "version": "2.4.1",
+  "description": "Data-agnostic time-series database for ESP32. Columnar storage, sparse indexing, runtime-extensible parameters, schema migration, built-in aggregations, configurable memory allocation (internal RAM or PSRAM), ring-buffer eviction, and streaming queries with on-device benchmarking.",
+  "keywords": ["time-series", "tsdb", "database", "esp32", "idf", "littlefs"],
+  "license": "MIT",
+  "homepage": "https://github.com/zakery292/esp_tsdb",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zakery292/esp_tsdb.git"
+  },
+  "frameworks": ["espidf", "arduino"],
+  "platforms": ["espressif32"],
+  "headers": "esp_tsdb.h",
+  "export": {
+    "exclude": ["host_test"]
+  },
+  "build": {
+    "srcDir": "src",
+    "includeDir": "include"
+  }
+}

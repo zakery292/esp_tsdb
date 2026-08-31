@@ -1,5 +1,9 @@
 # Changelog
 
+## [2.4.1] - 2026-08-31
+### Added
+- **PlatformIO manifest (`library.json`).** The component shipped only `idf_component.yml`, which PlatformIO cannot read — so a PlatformIO consumer saw the package as `esp_tsdb@0.0.0+<sha>` and could not express a version constraint at all; the git ref was the only way to pin it. With a manifest, `esp_tsdb@^2.4.1` resolves normally. `srcDir`/`includeDir` match the layout the LDF already inferred and `host_test/` is excluded from the package, so the set of compiled files is unchanged. ESP-IDF consumers are unaffected: `idf_component.yml` and `CMakeLists.txt` still drive that path.
+
 ## [2.4.0] - 2026-08-31
 ### Changed
 - **The database header is written to a sidecar file instead of in place.** The in-file header sits at offset 0, and littlefs stores a file as a CTZ skip-list of block addresses — so rewriting byte 0 rewrites the *whole* file, at a cost linear in its size (~20 ms/KB measured on esp_littlefs; ~5.1 s for a 268 KB database). Since the header is rewritten on every sample, a database that worked for weeks eventually crosses the task-watchdog budget and panics the device mid-write; observed live as a boot loop on an ESP32 logging one record per 5 minutes, once the file reached ~170 KB. The header now goes to one of two alternating slots (`<db>.h0` / `<db>.h1`) holding `{magic, seq, crc32, header}` — a fresh small file each time, so the cost is flat regardless of database size (~56-80 ms).
