@@ -21,6 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       IDF_COMPONENT_API_TOKEN: ${{ secrets.IDF_COMPONENT_API_TOKEN }}
+      PLATFORMIO_AUTH_TOKEN: ${{ secrets.PLATFORMIO_AUTH_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
@@ -28,11 +29,20 @@ jobs:
         id: ver
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
-      - name: Check tag matches idf_component.yml
+      - name: Check tag matches both manifests
         run: |
           manifest=$(grep -oP '^version:\s*"\K[^"]+' idf_component.yml)
           if [ "$manifest" != "${{ steps.ver.outputs.version }}" ]; then
-            echo "::error::Tag ${GITHUB_REF_NAME} != manifest version ${manifest}. Bump idf_component.yml before tagging."
+            echo "::error::Tag ${GITHUB_REF_NAME} != idf_component.yml version ${manifest}. Bump it before tagging."
+            exit 1
+          fi
+          # library.json is the PlatformIO manifest and carries its own copy of
+          # the version. The registry refuses to re-publish an existing version,
+          # so a stale value here fails the publish at the end of the job rather
+          # than shipping the wrong number - catch it before anything is created.
+          pio_manifest=$(python3 -c 'import json; print(json.load(open("library.json"))["version"])')
+          if [ "$pio_manifest" != "${{ steps.ver.outputs.version }}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} != library.json version ${pio_manifest}. Bump it before tagging."
             exit 1
           fi
 
@@ -69,3 +79,18 @@ jobs:
         run: |
           compote component upload --namespace zakery292 --name esp_tsdb \
             --version "${{ steps.ver.outputs.version }}"
+
+      # PlatformIO consumers pin this component by git URL, which makes it
+      # invisible to `pio pkg outdated` -- so a downstream project's dependency
+      # scanner never reports a new esp_tsdb release. Publishing to the registry
+      # lets them depend on a version spec and be told about updates instead.
+      #
+      # NB the namespace differs from the ESP Component Registry upload above:
+      # PlatformIO namespaces a package by the publishing account, so this lands
+      # under whoever owns PLATFORMIO_AUTH_TOKEN, not under zakery292. Skipped
+      # entirely when the secret is unset, exactly like the upload above.
+      - name: Publish to the PlatformIO Registry
+        if: env.PLATFORMIO_AUTH_TOKEN != ''
+        run: |
+          pip install --quiet platformio
+          pio pkg publish --type library --no-interactive --no-notify .
