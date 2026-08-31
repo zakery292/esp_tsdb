@@ -135,6 +135,114 @@ esp_err_t tsdb_write_header(FILE *file, const tsdb_header_t *header) {
     return ESP_OK;
 }
 
+
+// ---------------------------------------------------------------------------
+// Sidecar header (see TSDB_SIDECAR_MAGIC in tsdb_internal.h)
+// ---------------------------------------------------------------------------
+
+// Small table-free CRC32 (IEEE). Deliberately not esp_rom_crc32_le: this file
+// is compiled by the host test harness too, which has no ESP ROM.
+static uint32_t tsdb_crc32_(const void *data, size_t len) {
+    const uint8_t *p = (const uint8_t *) data;
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= p[i];
+        for (int bit = 0; bit < 8; bit++) {
+            crc = (crc >> 1) ^ (0xEDB88320u & (uint32_t) (-(int32_t) (crc & 1)));
+        }
+    }
+    return ~crc;
+}
+
+static void tsdb_sidecar_path_(const char *filepath, uint8_t slot, char *out, size_t out_len) {
+    snprintf(out, out_len, "%s.h%u", filepath, (unsigned) (slot & 1));
+}
+
+esp_err_t tsdb_sidecar_write(tsdb_t *db) {
+    if (db == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    tsdb_sidecar_t sidecar;
+    sidecar.magic = TSDB_SIDECAR_MAGIC;
+    sidecar.seq = ++db->sidecar_seq;
+    sidecar.header = db->header;
+    sidecar.header_crc = tsdb_crc32_(&sidecar.header, sizeof(sidecar.header));
+
+    // Alternate slots so the previous one survives a torn write.
+    db->sidecar_slot ^= 1;
+    char path[160];
+    tsdb_sidecar_path_(db->filepath, db->sidecar_slot, path, sizeof(path));
+
+    // "wb" truncates — cheap on littlefs because the file is one block and
+    // nothing follows it. The OTHER slot is the durable copy meanwhile.
+    FILE *f = fopen(path, "wb");
+    if (f == NULL) {
+        ESP_LOGW(TAG, "sidecar open failed: %s", path);
+        return ESP_FAIL;
+    }
+    size_t written = fwrite(&sidecar, sizeof(sidecar), 1, f);
+    tsdb_flush_and_sync(f);
+    fclose(f);
+
+    if (written != 1) {
+        ESP_LOGW(TAG, "sidecar write failed: %s", path);
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+esp_err_t tsdb_sidecar_load(const char *filepath, tsdb_header_t *out, uint32_t *seq_out) {
+    if (filepath == NULL || out == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    bool found = false;
+    uint32_t best_seq = 0;
+
+    for (uint8_t slot = 0; slot < 2; slot++) {
+        char path[160];
+        tsdb_sidecar_path_(filepath, slot, path, sizeof(path));
+        FILE *f = fopen(path, "rb");
+        if (f == NULL) {
+            continue;
+        }
+        tsdb_sidecar_t sidecar;
+        size_t items_read = fread(&sidecar, sizeof(sidecar), 1, f);
+        fclose(f);
+        if (items_read != 1 || sidecar.magic != TSDB_SIDECAR_MAGIC) {
+            continue;
+        }
+        if (tsdb_crc32_(&sidecar.header, sizeof(sidecar.header)) != sidecar.header_crc) {
+            ESP_LOGW(TAG, "sidecar slot %u CRC mismatch — ignoring", (unsigned) slot);
+            continue;
+        }
+        // seq is monotonic, so the larger value is the later write. Wrap is
+        // not handled: at one write per record it would take ~4 billion.
+        if (!found || sidecar.seq > best_seq) {
+            found = true;
+            best_seq = sidecar.seq;
+            *out = sidecar.header;
+        }
+    }
+
+    if (!found) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (seq_out != NULL) {
+        *seq_out = best_seq;
+    }
+    return ESP_OK;
+}
+
+void tsdb_sidecar_remove(const char *filepath) {
+    for (uint8_t slot = 0; slot < 2; slot++) {
+        char path[160];
+        tsdb_sidecar_path_(filepath, slot, path, sizeof(path));
+        unlink(path);
+    }
+}
+
 /**
  * @brief Calculate block file offset
  */
@@ -504,6 +612,40 @@ tsdb_t *tsdb_open(const tsdb_config_t *config) {
             needs_reconstruction = true;
         }
 
+        // The in-file header may lag: the hot write path persists to the
+        // sidecar instead (see TSDB_SIDECAR_MAGIC), and the in-file copy is
+        // only refreshed on close/sync. If a valid sidecar describes MORE
+        // records than the in-file header, it is the later state and wins.
+        //
+        // Guarded on the in-file header being usable first — a sidecar cannot
+        // rescue a file whose real header is unreadable, because the two must
+        // describe the same geometry.
+        if (!needs_reconstruction && !torn_migration) {
+            tsdb_header_t sidecar_header;
+            uint32_t sidecar_seq = 0;
+            if (tsdb_sidecar_load(config->filepath, &sidecar_header, &sidecar_seq) == ESP_OK) {
+                if (sidecar_header.magic == TSDB_MAGIC && tsdb_header_is_sane(&sidecar_header) &&
+                    sidecar_header.num_params == db->header.num_params &&
+                    sidecar_header.records_per_block == db->header.records_per_block &&
+                    sidecar_header.index_offset == db->header.index_offset &&
+                    sidecar_header.total_records >= db->header.total_records) {
+                    ESP_LOGI(TAG, "sidecar is ahead of in-file header (%lu -> %lu records, seq %lu)",
+                             (unsigned long) db->header.total_records,
+                             (unsigned long) sidecar_header.total_records,
+                             (unsigned long) sidecar_seq);
+                    db->header = sidecar_header;
+                    db->sidecar_seq = sidecar_seq;
+                } else if (sidecar_header.total_records < db->header.total_records) {
+                    // In-file is newer (e.g. a clean close after the last
+                    // sidecar write). Keep it, but carry the sequence forward
+                    // so subsequent sidecar writes still increase.
+                    db->sidecar_seq = sidecar_seq;
+                } else {
+                    ESP_LOGW(TAG, "sidecar geometry mismatch — ignoring it");
+                }
+            }
+        }
+
         if (torn_migration) {
             // No salvage path — close, unlink, fall through to fresh-create
             // branch below.
@@ -835,8 +977,12 @@ esp_err_t tsdb_close_h(tsdb_t *db) {
         db->cache_dirty = false;
     }
 
-    // Update header
+    // Refresh the in-file header so a cleanly closed file is self-contained
+    // and readable by an unmodified esp_tsdb. Then drop the sidecar: keeping a
+    // stale one around risks a future open preferring it over this write.
     tsdb_write_header(db->file, &db->header);
+    db->in_file_header_stale = false;
+    tsdb_sidecar_remove(db->filepath);
 
     // Close file
     fclose(db->file);
@@ -870,6 +1016,15 @@ esp_err_t tsdb_sync_h(tsdb_t *db) {
     // so plain xSemaphoreTake/Give here would corrupt the recursion count when
     // the caller already holds the lock (e.g. sync after write on one task).
     TSDB_LOCK_OPEN_OR_RETURN(db, 30000, ESP_ERR_TIMEOUT);
+
+    // Explicit "make it durable" entry point, so fold the sidecar back into
+    // the file. The handle stays open and writes continue afterwards, so the
+    // sidecar is refreshed rather than removed.
+    if (db->in_file_header_stale) {
+        tsdb_write_header(db->file, &db->header);
+        db->in_file_header_stale = false;
+        tsdb_sidecar_write(db);
+    }
 
     fflush(db->file);
     fsync(fileno(db->file));

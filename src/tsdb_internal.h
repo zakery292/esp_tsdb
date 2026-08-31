@@ -67,6 +67,44 @@ void tsdb_buffer_write(tsdb_buffer_pool_t *pool, size_t offset, const void *src,
  * v2 single-DB callers see a static `g_default_handle` of this type wrapped
  * by the legacy global API (tsdb_init/tsdb_write/etc).
  */
+// ---------------------------------------------------------------------------
+// Sidecar header
+//
+// The header is a small structure at file offset 0. Rewriting it in place is
+// the single most expensive thing tsdb_write_h does — measured on an ESP32-S3
+// with a 3 MB littlefs partition:
+//
+//   in-place rewrite at offset 0, 192 KB file    3684-3802 ms
+//   rewrite a small separate file (fopen "wb")     56-80 ms
+//   ping-pong between two small files            134-141 ms
+//
+// littlefs pays copy-on-write costs proportional to the data from the modified
+// offset to end-of-file, so touching offset 0 of a large file is worst-case.
+// A small standalone file has almost nothing after it.
+//
+// So the hot path writes a SIDECAR instead: two alternating slots, <db>.h0 and
+// <db>.h1, each holding {magic, seq, crc32, header}. Alternating means a crash
+// mid-write always leaves the other slot intact — unlike truncate-and-rewrite,
+// which is faster still but has a window with no valid copy anywhere.
+//
+// On open, the newest valid slot wins over the in-file header — but only if it
+// passes CRC, matches the file's geometry, and describes at least as many
+// records. On close/sync the in-file header is written too, so a cleanly closed
+// file stays self-contained and readable by an unmodified esp_tsdb.
+//
+// In situ this is 46-56 ms per write against 5124 ms for the same header on a
+// 268 KB database. Crash recovery is verified on hardware: with the last clean
+// close two commits behind, power was pulled with no shutdown handler and both
+// commits came back, with no records lost or altered.
+#define TSDB_SIDECAR_MAGIC 0x54534831u  /* "TSH1" */
+
+typedef struct {
+    uint32_t magic;
+    uint32_t seq;         // monotonic; the higher of the two slots is newer
+    uint32_t header_crc;  // crc32 over `header` only — detects a torn write
+    tsdb_header_t header;
+} tsdb_sidecar_t;
+
 struct tsdb_s {
     FILE *file;
     tsdb_header_t header;
@@ -92,6 +130,17 @@ struct tsdb_s {
     // one instance filling the filesystem must not suppress adaptation on
     // another. Resets naturally when the handle is reopened (e.g. next boot).
     bool capacity_adapted;
+
+    // True once a record has been written whose header state lives only in the
+    // sidecar. Cleared when close/sync folds the header back into the file, so
+    // those paths can skip the write entirely for an untouched database.
+    bool in_file_header_stale;
+
+    // Sidecar state (see TSDB_SIDECAR_MAGIC above). The sequence number
+    // increments on every sidecar write and decides which slot is newer; the
+    // slot alternates 0/1 so the previous one always survives a torn write.
+    uint32_t sidecar_seq;
+    uint8_t sidecar_slot;
 
     // Set for the duration of tsdb_migrate_schema_h(). Writers/queriers check
     // this BEFORE taking the mutex so they fail fast with
@@ -190,6 +239,13 @@ static inline void tsdb_unlock(tsdb_t *db) {
 // Core operations (tsdb_core.c)
 esp_err_t tsdb_read_header(FILE *file, tsdb_header_t *header);
 esp_err_t tsdb_write_header(FILE *file, const tsdb_header_t *header);
+
+// Sidecar header persistence — see TSDB_SIDECAR_MAGIC.
+esp_err_t tsdb_sidecar_write(tsdb_t *db);
+// Loads the newest valid sidecar slot into *out. ESP_ERR_NOT_FOUND if neither
+// slot is present/valid, in which case the caller keeps the in-file header.
+esp_err_t tsdb_sidecar_load(const char *filepath, tsdb_header_t *out, uint32_t *seq_out);
+void tsdb_sidecar_remove(const char *filepath);
 
 // Block operations (tsdb_write.c, tsdb_query.c)
 esp_err_t tsdb_read_block(tsdb_t *db, uint32_t block_num, tsdb_block_t *block);

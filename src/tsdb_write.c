@@ -176,7 +176,8 @@ retry_write:
     }
 
     // Read existing block
-    esp_err_t ret = tsdb_read_block(db, block_num, block);
+    esp_err_t ret;
+    ret = tsdb_read_block(db, block_num, block);
 
     // Initialize block if new or read failed
     uint8_t *raw_blk = (uint8_t *)block;
@@ -270,7 +271,9 @@ retry_write:
             oldest_block_data = &temp_oldest;
         }
 
-        if (tsdb_read_block(db, oldest_block, oldest_block_data) == ESP_OK) {
+        esp_err_t _evr;
+        _evr = tsdb_read_block(db, oldest_block, oldest_block_data);
+        if (_evr == ESP_OK) {
             db->header.oldest_timestamp = TSDB_BLOCK_TS((uint8_t *)oldest_block_data, oldest_offset);
         }
     } else if (db->header.total_records == 1) {
@@ -301,10 +304,15 @@ retry_write:
                  (unsigned long)block_num);
     }
 
-    // Update header in file
-    tsdb_write_header(db->file, &db->header);
-    fflush(db->file);
-    fsync(fileno(db->file));
+    // Persist the header to the SIDECAR, not to offset 0 of this file.
+    // Rewriting offset 0 costs 3.7-5.1 s because littlefs copy-on-writes
+    // everything from the modified offset to EOF. The sidecar is measured at
+    // 46-56 ms for the same header on a 268 KB database, and stays durable on
+    // every record. close/sync fold the header back in, so a cleanly closed
+    // file remains self-contained. See TSDB_SIDECAR_MAGIC.
+    tsdb_sidecar_write(db);
+    db->in_file_header_stale = true;
+
 
     ESP_LOGD(TAG, "Write complete: total_records=%lu, newest_ts=%lu",
              (unsigned long)db->header.total_records,
