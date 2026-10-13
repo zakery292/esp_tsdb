@@ -1,5 +1,2 @@
 #!/bin/bash
-set -e
-gcc -g -O0 -Wall -Wextra -Wno-unused -I shims -I ../include -I ../src \
-  test_v25.c ../src/tsdb_core.c ../src/tsdb_write.c ../src/tsdb_index.c \
-  ../src/tsdb_query.c ../src/tsdb_migrate.c ../src/tsdb_buffer.c -o test_v25
+exec "$(dirname "$0")/build_common.sh" test_v25

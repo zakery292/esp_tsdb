@@ -4,6 +4,7 @@
 //
 // Build with ./build.sh (gcc, ESP-IDF deps shimmed under shims/).
 #include "esp_tsdb.h"
+#include "testutil.h"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -29,7 +30,7 @@ static int q(uint32_t s, uint32_t e, const char *label, int expect) {
 }
 
 static void mkdb(const char *path, uint32_t maxrec, int nwrite) {
-    remove(path);
+    tsdb_test_wipe(path);
     tsdb_config_t c = {0};
     c.filepath = path; c.num_params = 1; c.max_records = maxrec; c.index_stride = 10;
     c.buffer_pool_size = 16*1024; c.alloc_strategy = TSDB_ALLOC_INTERNAL_RAM;

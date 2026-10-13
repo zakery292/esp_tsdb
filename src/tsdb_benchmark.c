@@ -29,9 +29,8 @@ esp_err_t tsdb_run_benchmark(uint32_t num_records, uint8_t num_params,
         tsdb_close();
     }
 
-    // Delete any existing benchmark file
+    // Fresh benchmark database (3.0: a set of segment files next to this path)
     const char *bench_path = "/littlefs/bench.tsdb";
-    unlink(bench_path);
 
     // Build param names
     const char *param_names[16];
@@ -54,7 +53,9 @@ esp_err_t tsdb_run_benchmark(uint32_t num_records, uint8_t num_params,
         .page_size = 2048
     };
 
+    // Make sure no stale benchmark segments survive from an aborted run.
     esp_err_t ret = tsdb_init(&config);
+    if (ret == ESP_OK) { tsdb_clear(); }
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to init benchmark DB: %d", ret);
         return ret;
@@ -86,8 +87,7 @@ esp_err_t tsdb_run_benchmark(uint32_t num_records, uint8_t num_params,
 
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "Write failed at record %lu", (unsigned long)i);
-            tsdb_close();
-            unlink(bench_path);
+            tsdb_delete();
             return ret;
         }
 
@@ -284,10 +284,10 @@ esp_err_t tsdb_run_benchmark(uint32_t num_records, uint8_t num_params,
         }
     }
 
-    // Get file size
-    struct stat st;
-    if (stat(bench_path, &st) == 0) {
-        results->file_size_bytes = st.st_size;
+    // Storage footprint across all segment files
+    tsdb_stats_t stats;
+    if (tsdb_get_stats(&stats) == ESP_OK) {
+        results->file_size_bytes = stats.storage_bytes;
     }
 
     // ========================================================================
@@ -311,9 +311,8 @@ esp_err_t tsdb_run_benchmark(uint32_t num_records, uint8_t num_params,
         ESP_LOGI(TAG, "Overflow query: %.1f us/record", results->overflow_query_per_record_us);
     }
 
-    // Cleanup — close and delete benchmark DB
-    tsdb_close();
-    unlink(bench_path);
+    // Cleanup — delete benchmark DB (all segment files)
+    tsdb_delete();
 
     ESP_LOGI(TAG, "Benchmark DB cleaned up");
 

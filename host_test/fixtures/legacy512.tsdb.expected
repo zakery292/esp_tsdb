@@ -1,0 +1,7 @@
+columns:soc,vbat
+stats: records=5 max=100 oldest=100000 newest=100040 writes=5 evictions=0 params=2 extras=0
+100000,-15000,-14000
+100010,-14997,-13996
+100020,-14994,-13992
+100030,-14991,-13988
+100040,-14988,-13984

@@ -14,6 +14,7 @@
 //   - tsdb_rename_param / tsdb_find_param.
 // Build with ./build_v25.sh.
 #include "esp_tsdb.h"
+#include "testutil.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,18 +33,8 @@ static int fails = 0;
     if (!_ok) fails++; \
 } while (0)
 
-static void wipe(const char *p) {
-    char b[160];
-    remove(p);
-    snprintf(b, sizeof b, "%s.h0", p); remove(b);
-    snprintf(b, sizeof b, "%s.h1", p); remove(b);
-    snprintf(b, sizeof b, "%s.mig", p); remove(b);
-}
-
-static long fsize(const char *p) {
-    struct stat st;
-    return stat(p, &st) == 0 ? (long)st.st_size : -1;
-}
+static void wipe(const char *p) { tsdb_test_wipe(p); }
+static long fsize(const char *p) { return tsdb_test_bytes(p); }
 
 static int exists(const char *p) {
     FILE *f = fopen(p, "rb");
@@ -237,34 +228,22 @@ int main(void) {
         CHECK(ok && n == 150, "all 150 retained rows identical");
     }
     tsdb_close_h(A); tsdb_close_h(B);
-    CHECK(fsize(PA) == fsize(PB), "file sizes identical");
-    // Batch survives close/reopen (header persisted once at batch end)
+    CHECK(fsize(PA) == fsize(PB), "storage sizes identical");
+    // Batch survives close/reopen.
     B = mk(PB, 3, n3, 150, TSDB_SCHEMA_STRICT);
     { tsdb_stats_t s; tsdb_get_stats_h(B, &s); CHECK(s.total_records == 150 && s.total_writes == 400, "batch state persisted"); }
-    // Unclean "crash" after a batch: sidecar must carry it.
-    tsdb_write_batch_h(B, &tss[0], &ptrs[0], 20);   // 20 more (ts repeat is fine for this check)
-    {
-        // simulate crash: drop handle without close by opening a second file? Not
-        // possible with the recycler; instead copy the file+sidecars aside is
-        // overkill — just verify the sidecar exists and is newer than the file's header.
-        char h0[160], h1[160];
-        snprintf(h0, sizeof h0, "%s.h0", PB); snprintf(h1, sizeof h1, "%s.h1", PB);
-        CHECK(exists(h0) || exists(h1), "sidecar written after batch");
-    }
     tsdb_close_h(B);
 
     // ========================================================================
-    printf("PART 4: clear recreates the file\n");
+    printf("PART 4: clear removes the files\n");
     A = mk(PA, 3, n3, 150, TSDB_SCHEMA_STRICT);
     long before = fsize(PA);
-    tsdb_write_h(A, T0 + 500 * DT, rows[0]);          // leaves a sidecar
+    tsdb_write_h(A, T0 + 500 * DT, rows[0]);
     CHECK(tsdb_clear_h(A) == ESP_OK, "clear OK");
     long after = fsize(PA);
-    CHECK(after > 0 && after < before, "file shrank");
+    CHECK(after < before && after <= 2048, "storage released (only an empty segment left)");
     {
-        char h0[160], h1[160];
-        snprintf(h0, sizeof h0, "%s.h0", PA); snprintf(h1, sizeof h1, "%s.h1", PA);
-        CHECK(!exists(h0) && !exists(h1), "sidecars removed");
+        CHECK(tsdb_test_segments(PA) <= 1, "old segments removed");
         tsdb_stats_t s; tsdb_get_stats_h(A, &s);
         CHECK(s.total_records == 0 && s.max_records == 150 && s.num_params == 3, "empty, geometry kept");
         uint32_t cnt = 99; tsdb_query_count_h(A, 0, UINT32_MAX, &cnt);
@@ -297,7 +276,14 @@ int main(void) {
     tsdb_close_h(A);
 
     const char *n4[] = {"a", "b", "c", "d"};
-    CHECK(mk(PA, 4, n4, 150, TSDB_SCHEMA_STRICT) == NULL, "strict refuses count mismatch");
+    A = mk(PA, 4, n4, 150, TSDB_SCHEMA_STRICT);
+    CHECK(A != NULL, "3.0: count mismatch with names opens (by-name map)");
+    if (A) {
+        tsdb_stats_t s; tsdb_get_stats_h(A, &s);
+        CHECK(s.total_records == 150 && s.num_params == 4, "history visible under the wider schema");
+        tsdb_close_h(A);
+    }
+    // Back to 3 columns for the rest of the part (just a schema, nothing moves).
 
     // MIGRATE with identical names -> no rewrite (total_writes stays 200)
     A = mk(PA, 3, n3, 150, TSDB_SCHEMA_MIGRATE);
@@ -310,7 +296,7 @@ int main(void) {
     CHECK(A != NULL, "migrate policy: reorder/drop/add opens");
     if (A) {
         tsdb_stats_t s; tsdb_get_stats_h(A, &s);
-        CHECK(s.total_records == 150 && s.num_params == 3 && s.total_writes == 150, "rewritten: 150 rows kept");
+        CHECK(s.total_records == 150 && s.num_params == 3 && s.total_writes == 200, "150 rows kept, lifetime count intact");
         tsdb_query_t q; tsdb_query_init_h(A, &q, tss[123], tss[123], NULL, 0);
         uint32_t ts; int16_t v[3]; int got = tsdb_query_next(&q, &ts, v) == ESP_OK;
         tsdb_query_close(&q);
@@ -329,7 +315,7 @@ int main(void) {
     CHECK(A != NULL, "reopen under renamed schema");
     if (A) {
         tsdb_stats_t s; tsdb_get_stats_h(A, &s);
-        CHECK(s.total_writes == 151, "rename needed no rewrite");
+        CHECK(s.total_writes == 201, "rename needed no rewrite");
         tsdb_query_t q; tsdb_query_init_h(A, &q, tss[300], tss[300], NULL, 0);
         uint32_t ts; int16_t v[3]; int got = tsdb_query_next(&q, &ts, v) == ESP_OK;
         tsdb_query_close(&q);
@@ -397,14 +383,14 @@ int main(void) {
         CHECK(ok && n == 700, "extras intact after 6 blocks of growth");
     }
     tsdb_close_h(O);
-    // unlimited DB refuses extras
+    // 3.0: extras are ordinary columns, so an unlimited DB takes them too
     wipe(PB);
     B = mk(PB, 2, n2, 0, TSDB_SCHEMA_STRICT);
-    { const char *x[] = {"c"}; CHECK(tsdb_add_extra_params_h(B, x, 1) == ESP_ERR_NOT_SUPPORTED, "unlimited DB refuses extras"); }
+    { const char *x[] = {"c"}; CHECK(tsdb_add_extra_params_h(B, x, 1) == ESP_OK, "unlimited DB accepts extras"); }
     tsdb_close_h(B);
 
-    // 6c. Clearing a legacy file (index at 512, which the 584-byte header
-    //     overlaps) must recreate it with the index at 1024.
+    // 6c. A legacy file with the index at 512 (pre-2.2 layout) is adopted,
+    //     written past, and gone after a clear.
     wipe(PB);
     {
         tsdb_header_t h; memset(&h, 0, sizeof h);
@@ -426,8 +412,7 @@ int main(void) {
         CHECK(tsdb_clear_h(B) == ESP_OK, "legacy clear OK");
         tsdb_write_h(B, T0 + DT, v);
         tsdb_close_h(B);
-        tsdb_header_t h; FILE *f = fopen(PB, "rb"); fread(&h, sizeof h, 1, f); fclose(f);
-        CHECK(h.index_offset == 1024 && h.total_records == 1, "recreated with index at 1024");
+        CHECK(!tsdb_test_exists(PB), "legacy file gone after clear");
         B = mk(PB, 2, n2, 100, TSDB_SCHEMA_STRICT);
         uint32_t cnt = 0; tsdb_query_count_h(B, 0, UINT32_MAX, &cnt);
         CHECK(cnt == 1, "record readable after legacy clear + reopen");

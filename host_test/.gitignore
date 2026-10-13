@@ -7,3 +7,9 @@ test_schema
 test_resize
 test_freecap
 test_v25
+test_legacy
+test_segments
+build_common.sh.swp
+!fixtures/*.tsdb
+!fixtures/*.h0
+!fixtures/*.h1

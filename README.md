@@ -1,30 +1,23 @@
 # ESP Time-Series Database (esp_tsdb)
 
-Lightweight, data-agnostic time-series database component for ESP32 with configurable memory allocation, columnar storage, sparse indexing, streaming queries, and runtime-extensible parameters.
+Lightweight, data-agnostic time-series database component for ESP32: append-only segment files, columnar blocks, by-name schema evolution, streaming queries and built-in aggregations, with configurable memory allocation.
 
 ## Features
 
 - **Data-Agnostic Engine**: No domain knowledge — just N columns of `int16_t` + timestamps
-- **Runtime Extra Parameters**: Add overflow columns at runtime without recreating the database
-- **Configurable Memory Allocation**: Choose buffer size and allocation strategy (internal RAM vs PSRAM)
-- **Paged Buffer Support**: Allocate from fragmented heap on legacy units with limited contiguous memory
-- **Ring Buffer with LRU Eviction**: Automatically overwrites oldest data when capacity is reached
-- **Columnar Storage**: Efficient selective parameter reading
-- **Sparse Time Index**: Fast timestamp-based lookups using binary search
-- **Streaming Queries**: Zero-copy queries where possible, no result set accumulation
-- **Aggregations**: Built-in SUM, AVG, MIN, MAX, COUNT, FIRST, LAST operations
-- **Schema Evolution (v2.5+)**: Open with a changed column list and let the engine reconcile by name; rename columns in place
-- **Chart-Friendly Queries (v2.5+)**: Stride sampling, O(log n) counts and FIRST/LAST, block-level aggregation
-- **Real Batch Writes (v2.5+)**: One block write per block touched, one header persist per batch
-- **Multi-Instance (v2.1+)**: Handle-based API — open several independent databases simultaneously
-- **Thread-Safe (v2.1+)**: Every handle owns a FreeRTOS mutex; all operations are safe to call from multiple tasks
-- **Backward Compatible**: V1 files open seamlessly under the V2 engine; the original global API is unchanged
+- **Append-Only Segments (v3.0+)**: Writes only ever append to the newest small file; old data is evicted by deleting whole files. No in-place rewrites, so LittleFS write cost stays flat for the life of the device
+- **Exact Capacity**: `max_records` is honoured to the record; eviction is logical at the head and physical per segment
+- **Schema Evolution Without Rewrites (v3.0+)**: Change, add, drop, reorder or rename columns at any time; every segment carries its own column list and readers map by name
+- **Zero-Copy Upgrade**: A 1.x/2.x single-file database is adopted in place as the oldest segment
+- **Crash-Safe by Construction**: No header to keep in sync — a segment's record count is derived from its content on open
+- **Chart-Friendly Queries**: O(log n) seeks, counts and FIRST/LAST; stride sampling; block-level aggregation
+- **Real Batch Writes**: One block write per block touched
+- **Configurable Memory Allocation**: Buffer pool in internal RAM or PSRAM, contiguous or paged
+- **Multi-Instance, Thread-Safe**: Handle-based API; every handle owns a FreeRTOS mutex
 
 ## Quick Start
 
 ### 1. Include in Your Project
-
-Add to your component's `CMakeLists.txt`:
 
 ```cmake
 idf_component_register(
@@ -43,9 +36,8 @@ const char *param_names[] = {"SOC", "Vbat", "PpvTotal", "Pload", "Pcharge"};
 tsdb_config_t config = {
     .filepath = "/littlefs/solar.tsdb",
     .num_params = 5,
-    .param_names = param_names,
-    .max_records = TSDB_CALC_MAX_RECORDS(2000000, 5),  // ~2MB file
-    .index_stride = 380,
+    .param_names = param_names,                        // the schema — match by name
+    .max_records = TSDB_CALC_MAX_RECORDS(2000000, 5),  // ~2MB of records
     .buffer_pool_size = 10 * 1024,                     // 10KB buffer
     .alloc_strategy = TSDB_ALLOC_INTERNAL_RAM,
     .use_paged_allocation = true,
@@ -95,12 +87,11 @@ printf("Total energy this week: %ld Wh\n", total_kwh);
 seeks bound the window and no records are scanned. `SUM/AVG/MIN/MAX` scan the
 window block by block.
 
-### 6. Charts: stride sampling (v2.5+)
+### 6. Charts: stride sampling
 
 A plot wants a few hundred points, not every sample. `tsdb_query_set_stride()`
 returns every N-th in-range record, and once N is at or above
-`records_per_block` the iterator reads roughly one block per returned point
-instead of every block in the window:
+`records_per_block` the iterator reads roughly one block per returned point:
 
 ```c
 uint32_t span = 365 * 86400;                 // a year at 5-min = ~105k records
@@ -113,201 +104,69 @@ tsdb_query_close(&query);
 
 ### 7. Backfill: batch writes
 
-`tsdb_write_batch()` takes the lock once, keeps the current block in RAM until
-the batch moves on to the next block, and persists the header once at the end
-— two block writes per block touched (one to allocate it while the file is
-growing, one when the batch leaves it; just one once the ring has wrapped)
+`tsdb_write_batch()` takes the lock once and keeps the current block in RAM
+until the batch moves on to the next block: one block write per block touched
 instead of one per record. Use it for imports and for draining a RAM buffer
 you fill while flash is busy.
 
-## Runtime Extra Parameters (Overflow Region)
+## Changing Columns
 
-The database supports adding extra columns at runtime without recreating existing data. Base parameters define the block geometry; extra parameters are stored in an overflow region appended to the end of the file.
+The config's `param_names` **is** the schema. Every segment file records the
+column list it was written with, and readers map each segment's columns onto
+the current schema **by name**. So changing the schema never touches data:
 
-### How It Works
+- Ship a firmware with a different `param_names` list → open just works.
+  Columns present in both keep their history, missing names read 0 for old
+  records, dropped names are no longer visible, reorders are honoured.
+- `tsdb_migrate_schema(names, n, NULL)` does the same at runtime, instantly.
+- `tsdb_add_extra_params(names, n)` appends columns at runtime; they persist in
+  the segment headers, so the config does not need to know about them.
+- `tsdb_resize(n, NULL)` changes the capacity instantly (shrink keeps the
+  newest records).
 
-```
-┌─────────────────────────────┐
-│ Header (512 bytes)          │  ← base_params drives block geometry
-│   overflow_offset ──────────│──┐
-├─────────────────────────────┤  │
-│ Sparse Time Index           │  │
-├─────────────────────────────┤  │
-│ Data Blocks (base params)   │  │  Ring buffer, columnar storage
-│   ...                       │  │
-├─────────────────────────────┤  │
-│ Overflow Header (1024 bytes)│←─┘  Magic 0x4F564652, param names
-├─────────────────────────────┤
-│ Overflow Data (sequential)  │     int16_t[extra_count] per record
-│   ...                       │     Indexed by (record_idx - first_overflow_record_idx)
-└─────────────────────────────┘
-```
-
-### Adding Extra Parameters
-
-```c
-// Initialize with 5 base parameters
-ESP_ERROR_CHECK(tsdb_init(&config));
-
-// Later, add 3 extra parameters (creates overflow region at end of file)
-const char *extras[] = {"Tbat", "Tinner", "GenPower"};
-ESP_ERROR_CHECK(tsdb_add_extra_params(extras, 3));
-
-// Now writes expect 8 values (5 base + 3 extra)
-int16_t values[8] = {85, 4850, 2500, 1200, 800, 25, 40, 0};
-tsdb_write(time(NULL), values);
-```
-
-### Querying Extra Parameters
-
-```c
-// Query all params (base + extra) — NULL fetches everything
-tsdb_query_init(&query, start, end, NULL, 0);
-
-// Or query specific extra params by index
-uint8_t params[] = {0, 5, 6};  // SOC, Tbat, Tinner
-tsdb_query_init(&query, start, end, params, 3);
-
-// Records that predate the overflow return 0 for extra params
-```
-
-### Introspection
-
-```c
-uint8_t total = tsdb_get_total_params();      // base + extra
-bool has_ovf = tsdb_has_overflow();            // true if overflow active
-const char *name = tsdb_get_param_name(5);     // "Tbat" (reads from overflow header)
-```
-
-### Changing Columns Between Firmware Versions (v2.5+)
-
-The usual way a schema changes is that the next firmware ships a different
-`param_names` list. Set `schema_policy` and `tsdb_open()`/`tsdb_init()` take
-care of the file:
-
-```c
-const char *names[] = {"soc", "vbat", "pload", "tbat"};   // was {soc, vbat, pload, pcharge}
-
-tsdb_migrate_opts_t mopts = { .free_space_bytes = fs_free, .allow_trim = true };
-tsdb_config_t config = {
-    .filepath = "/littlefs/solar.tsdb",
-    .num_params = 4, .param_names = names,
-    .schema_policy = TSDB_SCHEMA_MIGRATE,     // default TSDB_SCHEMA_STRICT = refuse on mismatch
-    .migrate_opts = &mopts,                   // optional space budget / trim / progress
-    /* ... */
-};
-ESP_ERROR_CHECK(tsdb_init(&config));
-// soc/vbat/pload keep their history, pcharge is dropped, tbat reads 0 for old records.
-```
-
-Columns are matched **by name**: reorders are honoured, missing names are
-dropped, new names are backfilled with 0, and legacy overflow extras are folded
-into base columns. When the names already match, open is just a comparison. The
-rewrite is the same streaming engine as `tsdb_migrate_schema()` below (crash-safe,
-constant memory); if it fails — out of space with `allow_trim` off, say — the
-original file is untouched and open fails.
-
-A **rename** cannot be told apart from drop+add by name matching, so rename in
-place first (header-only, no data touched), then change the config:
+A **rename** cannot be told apart from drop + add by name matching, so rename in
+place first; the old name is kept as an alias so earlier segments still map:
 
 ```c
 tsdb_rename_param(3, "tbat");           // "pcharge" -> "tbat", history kept
 int idx = tsdb_find_param("tbat");      // 3
 ```
 
-### Full Schema Migration (v2.2+)
+Each of these starts a new segment immediately, so the change is on disk even
+if the device reboots before the next write.
 
-`tsdb_migrate_schema()` changes the **base** column set itself — add, drop,
-reorder, or promote overflow extras to first-class columns — via a streaming
-rewrite into a new file with the new block geometry (constant ~2KB memory,
-crash-safe, atomic swap):
+The only refusal left at open is a column-count mismatch with `param_names`
+set to NULL — positional mapping is then ambiguous. Keep names in the config.
 
-```c
-// Old schema: 3 base [soc, vbat, pload] + 2 overflow extras [tbat, gen].
-// New schema: keep soc, promote both extras, add a fresh zero-filled column.
-const char *new_cols[] = {"soc", "tbat", "gen", "site"};
+## Upgrading From 1.x / 2.x
 
-static void on_progress(uint32_t done, uint32_t total, void *ctx) {
-    // start (0), ~every 1% (configurable), completion (total). Runs on the
-    // migrating task with the lock held: be quick, no tsdb_* calls.
-}
+Nothing to do. A single-file database at the configured path is adopted as the
+oldest segment without copying: all of 2.5's recovery logic (sidecar adoption,
+header reconstruction, V2→V3 block layout, orphaned `.mig`) runs on the first
+open, after which the file is read-only. New records go to segment files next
+to it; when the capacity window has moved past its last record, the old file
+and its sidecars are deleted. Legacy overflow extras are read from the old
+file's overflow region and carried into the schema as runtime extras.
 
-tsdb_migrate_opts_t opts = {
-    .free_space_bytes = fs_free,   // from esp_littlefs_info(); 0 = "on SD, just go"
-    .allow_trim = true,            // drop oldest records if the copy won't fit
-    .progress = on_progress,       // optional: drive a UI progress bar
-};
-tsdb_migrate_schema(new_cols, 4, &opts);
-// Overflow region is folded away; vbat/pload dropped; "site" reads 0 for
-// existing records. Writes/queries during the migration fail fast with
-// ESP_ERR_INVALID_STATE — retry on the next cycle.
-```
+Firmware older than 3.0 does not know about segment files. A rollback after an
+upgrade sees (and keeps using) the original single file if it has not been
+evicted yet, but none of the records written since the upgrade.
 
-On littlefs the calling task performs flash-bus operations and must have an
-internal-RAM stack (ESP32-S3 PSRAM-stack rule); SD-card databases can be
-migrated from any task.
-
-### Live Capacity Resize (v2.3+)
-
-`tsdb_resize()` changes `max_records` on an open database. Growing a database
-that has never wrapped is a header-only change (milliseconds); a wrapped ring
-or a shrink streams through the same rewrite engine as schema migration (same
-opts, progress callback, crash-safe swap). Shrinking keeps the newest records.
-
-```c
-tsdb_resize(200000, NULL);          // grow; NULL opts = no space check
-tsdb_resize(0, NULL);               // convert to unlimited (no eviction)
-```
-
-**Storage reality check:** a bigger `max_records` only helps if the
-*filesystem* has room for the file to grow into. On SD-card storage, grow
-freely. If your database lives on a small flash partition it was already
-sized to fill, this API cannot conjure space — the grow will simply hit
-ENOSPC later and adaptive capacity will cap it again. Know your storage.
-
-### Overflow Schema Migration
-
-Extra parameters can be changed at any time using `tsdb_migrate_overflow()`:
-
-```c
-// Change from [Tbat, Tinner] to [Tbat, MaxCellVolt, GenPower]
-const char *new_extras[] = {"Tbat", "MaxCellVolt", "GenPower"};
-tsdb_migrate_overflow(new_extras, 3);
-// Tbat data is preserved, MaxCellVolt/GenPower backfilled with zeros, Tinner dropped
-
-// Remove all extras
-tsdb_migrate_overflow(NULL, 0);
-```
-
-Migration is crash-safe: new data is written first, header updated last. If interrupted, the old layout remains intact and migration can be retried.
-
-After migration, the old overflow region becomes dead space in the file. Call `tsdb_clear()` or `tsdb_delete()` to reclaim it if needed.
-
-### Constraints
-
-- Maximum 48 extra parameters (up to 64 total).
-- Overflow data is sequential (not ring-buffered) — it grows as new records are written.
-- Not available on unlimited databases (`max_records = 0`): the region must sit past the fully grown data region, which an unlimited ring does not have. Use `tsdb_migrate_schema()` instead.
-- Creating the region on a ring that has not yet filled leaves a zero-filled gap up to the ring's full size (one-time cost, proportional to the unallocated part of the ring).
-- Extra param names are stored in the overflow header (20 chars max each).
-- Each migration leaves dead space from the previous overflow (~2 bytes x extras x records). Acceptable for occasional schema changes.
-
-### Backward Compatibility
-
-| File Version | Behavior |
-|---|---|
-| V1 (no overflow) | Opens normally. `base_params=0` treated as `base_params=num_params`. |
-| V2, no overflow configured | `extra_param_count=0`, works identically to V1. |
-| V2, with overflow | Extra params read from overflow region. Pre-overflow records return 0. |
+**One upgrade caveat — devices already short of space.** If the free-space
+guard (`free_space_cb` / `min_free_bytes`) is configured and the filesystem is
+*already* below the reserve when 3.0 first writes (typical for a device whose
+2.x ring had been capped by that guard), the first segment cannot be created
+without breaching the reserve, so the engine makes room the only way it can:
+it deletes the adopted 2.x file — the whole history — and logs an ERROR with
+the record count. The same happens on a hard ENOSPC. If that history matters,
+free space (or raise the reserve only after the upgrade) before deploying 3.0.
+`host_test/test_legacy.c` pins this behaviour.
 
 ## Multiple Databases (Handle-Based API, v2.1+)
 
-Every global function has an `_h`-suffixed counterpart taking a `tsdb_t *` handle as its first argument, so several independent databases can be open at once (e.g. system metrics in one file, per-panel telemetry in another). The legacy global API still works and is now a thin wrapper over an internal default handle.
+Every global function has an `_h`-suffixed counterpart taking a `tsdb_t *` handle as its first argument, so several independent databases can be open at once. The legacy global API is a thin wrapper over an internal default handle.
 
 ```c
-tsdb_config_t sys_cfg  = { .filepath = "/littlefs/system.tsdb",  /* ... */ };
-tsdb_config_t panel_cfg = { .filepath = "/littlefs/panels.tsdb", /* ... */ };
-
 tsdb_t *sys_db   = tsdb_open(&sys_cfg);
 tsdb_t *panel_db = tsdb_open(&panel_cfg);
 
@@ -325,9 +184,15 @@ tsdb_close_h(sys_db);
 
 Each handle owns a FreeRTOS mutex, so all operations — including on the legacy global API — are safe to call concurrently from multiple tasks.
 
-### Durability on LittleFS: `tsdb_sync_h()`
+## Durability
 
-On esp_littlefs, a file held open across many writes never commits its directory entry — only `fclose` publishes it, so an unexpected reboot can lose the whole file. `tsdb_sync_h(db)` forces the commit with a close+reopen cycle (~30-50 ms) while keeping the handle and all state valid. Call it after each write on slow snapshot cadences, or every N writes on fast ones.
+Every write ends with an `fsync` of the active segment, and on open a
+segment's record count comes from its content (full blocks from the file size,
+the tail block validated by magic, count and ascending timestamps), not from a
+counter that has to be kept in sync. A power cut therefore loses at most the
+records of the block being written at that moment and never leaves the
+database inconsistent. `tsdb_sync_h()` (close + reopen of the active segment)
+remains available for belt-and-braces before a planned reboot.
 
 ## Streaming to HTTP/WebSocket
 
@@ -363,105 +228,99 @@ esp_err_t history_handler(httpd_req_t *req) {
 
 ## Performance
 
-Benchmarked on ESP32-C6 (single-core RISC-V, 160MHz) with 4MB NOR flash, LittleFS filesystem, 14 parameters, 10KB paged buffer pool. Measured **under full production load** (WiFi, 2x MQTT, WebSocket, inverter Modbus polling, TCP socket — all running concurrently).
+### Why segments: LittleFS and in-place writes
 
-| Operation | Latency | Throughput | Notes |
-|---|---|---|---|
-| **Write** | 290ms avg (99ms min, 750ms max) | ~3.5 writes/sec | Flash-bound: includes fflush + fsync for crash safety. Contends with other flash I/O under load. |
-| **Full query (14 params)** | 64 us/record | ~15,600 records/sec | Columnar block read into RAM, then iterate. |
-| **Single param query** | 60 us/record | ~16,600 records/sec | Same block I/O, fewer columns extracted. |
-| **Aggregation (single)** | 30ms / 469 records | ~15,600 records/sec | Single-pass AVG over full dataset. |
-| **Multi-agg (8 aggs)** | 30ms / 469 records | ~15,600 records/sec | 8 aggregations in one pass, same speed. |
+LittleFS stores a file as a backward-linked skip-list of blocks. Modifying a
+block in the **middle** of a file rewrites that block *and every block after
+it* — ~20 ms per KB that follows, measured in 2.4.0 (which moved the header
+out of the file for exactly this reason). The 2.x ring buffer wrote block 0,
+1, 2… in place once it wrapped, so a full 2 MB database would have cost tens of
+seconds per write — past the task watchdog.
 
-**What this means in practice:**
-- 1 week of 5-min data (2,016 records): **~130ms** to query
-- 1 month (8,640 records): **~550ms**
-- 1 year (105,120 records): **~6.7 seconds**
+In 3.0 the only in-place write is the tail block of the newest segment (a
+small file with nothing after that block), and eviction is `unlink`. Write cost
+is flat for the life of the device, on LittleFS and FAT alike.
 
-Write latency is dominated by LittleFS flash operations (sector erase/program). The 750ms max is a LittleFS block compaction. Under lighter load (fewer concurrent flash operations), writes drop to ~50-100ms. Read performance is largely RAM-bound and minimally affected by system load.
+### What a write costs now
 
-These figures predate v2.5; the v2.5 changes reduce the per-write I/O count (one block read fewer in steady state, two once the ring has wrapped) and make counts, FIRST/LAST and strided chart queries O(log n) or O(points) instead of O(window). Re-run the built-in benchmark on your hardware for current numbers.
+| | 2.5 (ring + sidecar) | 3.0 (segments) |
+|---|---|---|
+| Single write | block read-back, block write, fsync, sidecar create + write + fsync + close | block write, fsync |
+| Host trace, 500 single writes | 1001 fsync, 506 opens | 501 fsync, 39 opens |
+| Host trace, 500-record batch | 503 fsync | 34 fsync |
 
-### LittleFS and the wrapped ring — read this before sizing a flash-resident database
+Pre-3.0 on-device figures (ESP32-C6, LittleFS, 14 columns, full production
+load) were ~290 ms per write, dominated by the sidecar and the flash program.
+Re-run the built-in benchmark (`tsdb_run_benchmark()`) on your hardware for
+current numbers.
 
-LittleFS stores a file as a backward-linked skip-list of blocks. Modifying a block in the **middle** of a file rewrites that block *and every block after it* (their pointers change). 2.4.0 measured this at ~20 ms per KB of file following the written offset, which is why the header moved to a sidecar file.
+### Reads
 
-Data blocks have the same shape. While the ring is filling, each new block is appended at the tail — cheap. **Once the ring wraps, writes go to block 0, 1, 2, … near the head of the file**, and each one costs a rewrite of everything after it:
-
-| Ring file size | Cost of a post-wrap write near the head (≈20 ms/KB) |
-|---|---|
-| 256 KB | ~5 s |
-| 1 MB | ~20 s |
-| 2 MB | ~40 s |
-
-That is well past the task watchdog. **On a flash partition with LittleFS, size the ring so it does not wrap within the device's service life, or move the database to an SD card (FAT writes in place at constant cost).** The free-space guard and ENOSPC cap switch a database to ring reuse automatically — on LittleFS that is exactly the moment the cost appears, so treat a logged capacity cap as a signal to act (`tsdb_clear()` is cheap in v2.5 and resets the ring to the appending phase).
-
-The structural fix is a segment-file format (append-only segment files, eviction by deleting the oldest segment, each segment carrying its own column list so schema changes cost nothing). It is a format change with a one-time migration and is planned, not shipped.
-
-A built-in benchmark endpoint (`GET /api/history/benchmark?records=500&params=14`) runs on-device and returns JSON timing data.
+- Query start, count, FIRST/LAST: O(log n) — a binary search over the in-RAM
+  segment table, then over one segment's blocks.
+- Full scan: one 1 KB block read per `records_per_block` records, plus one
+  file open per segment crossed.
+- Boot: one open and two small reads per segment file (default ~32 segments).
 
 ## Memory Usage
 
-### ESP32-C6 (4MB flash, no PSRAM)
-- **Buffer pool**: 10KB (paged allocation from fragmented heap)
-- **Stack usage**: ~500 bytes per query
-- **Heap overhead**: ~50 bytes
-
-### ESP32-S3 (16MB flash, 16MB PSRAM)
-- **Buffer pool**: 256KB (contiguous PSRAM allocation)
-- **Stack usage**: ~500 bytes per query
-- **Heap overhead**: ~50 bytes
+- **Buffer pool**: three 1 KB block buffers (read, write cache, query) — 3 KB
+  minimum; the rest of `buffer_pool_size` is currently unused
+- **Handle**: ~3 KB (schema names + aliases for up to 64 columns) + 40 bytes
+  per segment
+- **Stack**: ~1.3 KB per query (`tsdb_query_t` + a block when the pool buffer
+  spans pages)
 
 ## Storage Calculations
 
 ```c
-// Records per block depends on num_params (base only — extras don't affect blocks)
-// Block size = 1024 bytes
-// Overhead = 8 bytes (magic + count + flags)
+// Records per block depends on the number of columns
+// Block size = 1024 bytes, overhead = 8 bytes
 // Per record = 4 bytes (timestamp) + (num_params * 2 bytes)
 
-// Example: 10 base parameters
+// Example: 10 columns
 // Per record = 4 + (10 * 2) = 24 bytes
 // Records per block = (1024 - 8) / 24 = 42 records/block
 
-// Overflow adds: extra_count * 2 bytes per record (sequential, after all blocks)
-// Example: 10 base + 5 extra, 75000 records, 50000 post-overflow
-// Base data  = 75000 * 24 = 1.8 MB
-// Overflow   = 50000 * 10 = 0.5 MB  (5 extras * 2 bytes * 50K records)
-// Index      = (75000 / 380) * 8 = 1.5 KB
-// Total      = ~2.3 MB
+// Each segment adds a 1 KB header (2 KB above 24 columns).
+// Default segment size = capacity / 32, clamped to [1 KB, 256 KB] of blocks;
+// override with tsdb_config_t.segment_bytes.
 ```
-
-Use the helper macro for base storage:
 
 ```c
-uint32_t max_records = TSDB_CALC_MAX_RECORDS(2000000, 10);  // 2MB storage, 10 params
+uint32_t max_records = TSDB_CALC_MAX_RECORDS(2000000, 10);  // 2MB budget, 10 params
 ```
 
-## File Format
+Leave a few percent of headroom: at capacity the on-disk footprint is the
+records plus one header per segment plus up to one partially filled block.
+
+## File Format (v3)
 
 ```
+<path>.s0000000001         segment 1 (oldest)
+<path>.s0000000002         segment 2
+...
+<path>.s00000000NN         newest segment (held open for appends)
+<path>                     optional: an adopted 1.x/2.x single-file database
+                           (read-only, oldest of all; deleted once evicted)
+
+Segment file:
 ┌─────────────────────────────────────────────────┐
-│ Header (512 bytes)                              │
-│   - Magic (0x45545344), version (2)             │
-│   - Base params, ring buffer state, time bounds │
-│   - Overflow metadata (offset, extra count)     │
-│   - Parameter names (base, up to 16)            │
+│ Header (64 bytes, write-once)                   │
+│   magic "TSEG", version, sequence               │
+│   num_params, records_per_block, blocks_cap     │
+│   data_offset, schema generation                │
+│   lifetime_base (records written before it)     │
+│   created_ts                                    │
 ├─────────────────────────────────────────────────┤
-│ Sparse Time Index (variable size)              │
-│   - Binary searchable timestamp->block mapping  │
-│   - ~8 bytes per entry                          │
+│ Column names   [num_params][20]                 │
+│ Column aliases [num_params][20]  (rename)       │
+│ (zero padding to data_offset: 1 KB, or 2 KB     │
+│  above 24 columns)                              │
 ├─────────────────────────────────────────────────┤
-│ Data Blocks (1024 bytes each)                  │
-│   - Columnar storage for base params            │
-│   - Ring buffer with LRU eviction              │
-├─────────────────────────────────────────────────┤
-│ Overflow Header (1024 bytes) [optional]        │
-│   - Magic (0x4F564652), extra param names       │
-│   - first_record_idx anchor                     │
-├─────────────────────────────────────────────────┤
-│ Overflow Data (sequential) [optional]          │
-│   - int16_t[extra_count] per new record        │
+│ Data blocks (1024 bytes each, time-ordered)     │
+│   magic "BLKT", record_count, timestamps[],     │
+│   then one int16 column array per parameter     │
 └─────────────────────────────────────────────────┘
 ```
 
@@ -471,46 +330,51 @@ See `include/esp_tsdb.h` for full API documentation.
 
 ### Core Functions
 
-- `tsdb_init()` - Initialize or open existing database
-- `tsdb_close()` - Close and flush
+- `tsdb_init()` / `tsdb_open()` - Initialize or open a database (adopts a 1.x/2.x file)
+- `tsdb_close()` / `tsdb_close_h()` - Close
 - `tsdb_write()` - Write single record (base + extra values)
-- `tsdb_write_batch()` - Write multiple records
+- `tsdb_write_batch()` - Write multiple records (one block write per block touched)
 
-### Overflow Functions
+### Schema Functions
 
-- `tsdb_add_extra_params()` - Add extra parameters (creates overflow region)
-- `tsdb_get_total_params()` - Get total parameter count (base + extra)
-- `tsdb_get_param_name()` - Get parameter name by index
-- `tsdb_has_overflow()` - Check if overflow region is active
+- `tsdb_migrate_schema()` - Replace the column list (instant, by-name mapping)
+- `tsdb_add_extra_params()` / `tsdb_migrate_overflow()` - Append / replace runtime extra columns
+- `tsdb_rename_param()` / `tsdb_find_param()` - Rename in place (history kept) / look up by name
+- `tsdb_get_total_params()` / `tsdb_get_param_name()` / `tsdb_has_overflow()` - Introspection
+- `tsdb_resize()` - Change capacity (instant)
 
 ### Query Functions
 
-- `tsdb_query_init()` - Initialize query iterator (fetches base + extra automatically)
-- `tsdb_query_set_stride()` - Return every N-th in-range record (v2.5+)
-- `tsdb_query_next()` - Get next record (returns 0 for extras on pre-overflow records)
-- `tsdb_query_close()` - Close query
+- `tsdb_query_init()` - Initialize query iterator
+- `tsdb_query_set_stride()` - Return every N-th in-range record
+- `tsdb_query_next()` - Get next record
+- `tsdb_query_close()` - Close query (releases the handle lock — always call it)
 - `tsdb_query_count()` - Count records in range, O(log n)
 
 ### Aggregation Functions
 
-- `tsdb_aggregate()` - Compute aggregation over time range (works on base + extra indices)
-- `tsdb_aggregate_multi()` - Multiple aggregations in a single pass
-  - `TSDB_AGG_SUM`, `TSDB_AGG_AVG`, `TSDB_AGG_MIN`, `TSDB_AGG_MAX`
-  - `TSDB_AGG_COUNT`, `TSDB_AGG_FIRST`, `TSDB_AGG_LAST`
+- `tsdb_aggregate()` - `SUM`, `AVG`, `MIN`, `MAX`, `COUNT`, `FIRST`, `LAST`
+- `tsdb_aggregate_multi()` - Several aggregations in one pass
 
 ### Utility Functions
 
-- `tsdb_get_stats()` - Get database statistics (includes `extra_params` count)
-- `tsdb_clear()` - Clear all data (recreates the file; flat cost, space returned)
-- `tsdb_delete()` - Delete database file
-- `tsdb_rename_param()` / `tsdb_find_param()` - Rename a column in place / look one up by name (v2.5+)
+- `tsdb_get_stats()` - Statistics (retained records, capacity, time bounds, lifetime writes/evictions, storage bytes, segment count)
+- `tsdb_clear()` - Delete all data (keeps schema and capacity)
+- `tsdb_delete()` - Delete the database files and close
+- `tsdb_sync_h()` - Close + reopen the active segment
 
-### Handle-Based API (v2.1+)
+Every function above has an `_h` variant taking a `tsdb_t *` handle.
 
-- `tsdb_open()` / `tsdb_close_h()` - Open/close an independent database instance
-- `tsdb_sync_h()` - Force a LittleFS directory-entry commit (durability across reboots)
-- `_h` variants of every function above: `tsdb_write_h()`, `tsdb_query_init_h()`, `tsdb_aggregate_h()`, `tsdb_get_stats_h()`, `tsdb_add_extra_params_h()`, `tsdb_migrate_overflow_h()`, `tsdb_rename_param_h()`, etc.
-- `tsdb_query_next()` / `tsdb_query_close()` need no `_h` variant — the query carries its handle
+## Host Tests
+
+`host_test/` builds the engine with gcc against FreeRTOS/ESP shims:
+
+```sh
+cd host_test
+for s in build.sh build_*.sh; do bash $s; done
+for t in test_wrap test_multi test_schema test_sidecar test_resize test_freecap test_v25 test_legacy test_segments; do ./$t | tail -1; done
+./make_fixtures.sh   # regenerate the 2.5.0 legacy fixtures (needs git history)
+```
 
 ## License
 

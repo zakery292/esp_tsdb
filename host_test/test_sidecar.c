@@ -1,14 +1,14 @@
-// Host regression for sidecar header persistence.
+// Host regression for crash durability (was: sidecar header persistence).
 //
-// The hot write path persists the header to <db>.h0/.h1 instead of offset 0 of
-// the database, because an in-place rewrite at offset 0 costs ~3.7 s on
-// littlefs. The in-file header is only refreshed on close/sync, so it can lag.
-// This checks the three cases that matters for:
+// Since 3.0 there is no header to persist: every write fsyncs the active
+// segment and the record count is derived from the file on open. The three
+// scenarios from the 2.4 sidecar suite still hold, with stronger outcomes:
 //
-//   1. clean close  -> in-file header current, sidecar removed, data intact
-//   2. simulated crash (no close) -> sidecar is ahead, reopen must adopt it
-//   3. corrupt sidecar -> ignored, in-file header used, no crash
+//   1. clean close -> data intact
+//   2. simulated crash (no close) -> every fsynced record is back
+//   3. garbage sidecar files next to the database -> ignored, nothing lost
 #include "esp_tsdb.h"
+#include "testutil.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,9 +30,7 @@ static tsdb_t *open_db(void) {
 }
 
 static void cleanup(void) {
-    unlink(PATH);
-    unlink(PATH ".h0");
-    unlink(PATH ".h1");
+    tsdb_test_wipe(PATH);
 }
 
 static int count_records(tsdb_t *db) {
@@ -67,23 +65,20 @@ int main(void) {
     if (n != 80) fails++;
     tsdb_close_h(db);
 
-    // --- 3. corrupt sidecar must be ignored, not fatal --------------------
+    // --- 3. garbage sidecar files must be ignored, not fatal ----------------
     db = open_db();
     for (int i = 0; i < 10; i++) tsdb_write_h(db, 3000 + i, v);
-    // Corrupt both slots; a clean close already removed any older pair.
     for (int slot = 0; slot < 2; slot++) {
         char p[256];
         snprintf(p, sizeof(p), "%s.h%d", PATH, slot);
-        FILE *f = fopen(p, "r+b");
-        if (f != NULL) { fseek(f, 8, SEEK_SET); fputc(0xFF, f); fputc(0xFF, f); fclose(f); }
+        FILE *f = fopen(p, "wb");
+        if (f != NULL) { fputs("garbage sidecar", f); fclose(f); }
     }
     db = open_db();
     n = count_records(db);
-    // In-file header is from the last clean close (80). A corrupt sidecar must
-    // not be adopted and must not crash the open.
-    printf("3. corrupt sidecar    : %d records (expect 80, ignored) %s\n",
-           n, n == 80 ? "PASS" : "FAIL");
-    if (n != 80) fails++;
+    printf("3. garbage sidecars   : %d records (expect 90, ignored) %s\n",
+           n, n == 90 ? "PASS" : "FAIL");
+    if (n != 90) fails++;
     tsdb_close_h(db);
 
     cleanup();

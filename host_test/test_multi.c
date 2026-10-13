@@ -3,6 +3,7 @@
 // Also re-checks the wrapped-ring fix runs through the _h path (not just the
 // legacy global wrapper). Build with ./build_multi.sh.
 #include "esp_tsdb.h"
+#include "testutil.h"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -10,7 +11,7 @@
 #define DT 10u
 
 static tsdb_t *mkdb(const char *path, uint32_t maxrec, int nwrite, int16_t base) {
-    remove(path);
+    tsdb_test_wipe(path);
     tsdb_config_t c = {0};
     c.filepath = path; c.num_params = 1; c.max_records = maxrec; c.index_stride = 10;
     c.buffer_pool_size = 16*1024; c.alloc_strategy = TSDB_ALLOC_INTERNAL_RAM;
