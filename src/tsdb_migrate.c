@@ -289,6 +289,7 @@ static esp_err_t tsdb_migrate_engine(tsdb_t *db, const char **new_names,
 
     // ---- 3. Migration begins: block concurrent writers/queriers fast.
     db->migrating = true;
+    tsdb_write_cache_flush(db);             // never dirty here; belt and braces
     ESP_LOGI(TAG, "Schema migration: %u base + %u extra -> %u base, %lu records",
              old_base, db->extra_param_count, new_count, (unsigned long)retain);
 
@@ -486,6 +487,9 @@ static esp_err_t tsdb_migrate_engine(tsdb_t *db, const char **new_names,
     }
 
     // ---- 8. Adopt the new schema in the live handle. No overflow anymore.
+    tsdb_write_cache_invalidate(db);
+    tsdb_sidecar_remove(db->filepath);      // described the OLD geometry
+    db->in_file_header_stale = false;
     memcpy(&db->header, &nh, sizeof(nh));
     db->extra_param_count = 0;
     db->overflow_record_size = 0;
@@ -515,6 +519,12 @@ esp_err_t tsdb_migrate_schema_h(tsdb_t *db, const char **new_names,
     return tsdb_migrate_engine(db, new_names, new_count, opts, false, 0);
 }
 
+esp_err_t tsdb_migrate_schema_internal(tsdb_t *db, const char **new_names,
+                                       uint8_t new_count,
+                                       const tsdb_migrate_opts_t *opts) {
+    return tsdb_migrate_schema_h(db, new_names, new_count, opts);
+}
+
 esp_err_t tsdb_resize_h(tsdb_t *db, uint32_t new_max_records,
                         const tsdb_migrate_opts_t *opts) {
     if (db == NULL || !db->is_open) return ESP_ERR_INVALID_STATE;
@@ -542,11 +552,16 @@ esp_err_t tsdb_resize_h(tsdb_t *db, uint32_t new_max_records,
     if (linear && covers && db->extra_param_count == 0) {
         uint32_t old_max = db->header.max_records;
         db->header.max_records = new_max_records;
-        esp_err_t ret = tsdb_write_header(db->file, &db->header);
+        // Persist through the sidecar (geometry unchanged, so it is adopted
+        // on open) rather than an in-place header rewrite, which on littlefs
+        // costs seconds on a large file.
+        esp_err_t ret = tsdb_sidecar_write(db);
         if (ret != ESP_OK) {
             db->header.max_records = old_max;   // keep RAM/disk consistent
         } else {
+            db->in_file_header_stale = true;
             db->capacity_adapted = false;       // capacity changed: re-arm ENOSPC adapt
+            tsdb_write_cache_invalidate(db);
             ESP_LOGI(TAG, "Resize (fast): max_records %lu -> %lu",
                      (unsigned long)old_max, (unsigned long)new_max_records);
         }

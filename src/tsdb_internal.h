@@ -121,8 +121,13 @@ struct tsdb_s {
     size_t stream_buffer_offset;    // Offset for streaming/temp data
     size_t stream_buffer_size;      // Size of stream buffer
 
-    // Write cache state
-    uint32_t cached_block_num;
+    // Write cache: the block most recently written through tsdb_write_h
+    // stays in the pool's write-cache region so the next record landing in
+    // the same block skips the read-back. cache_dirty is only ever true
+    // inside tsdb_write_batch_h (deferred flush); every other path flushes
+    // synchronously. Invalidate (tsdb_write_cache_invalidate) whenever the
+    // file content changes behind it: clear, migrate, resize, reopen.
+    uint32_t cached_block_num;      // UINT32_MAX = nothing cached
     bool cache_dirty;
 
     // Adaptive capacity: once THIS database has shrunk max_records in response
@@ -251,6 +256,7 @@ void tsdb_sidecar_remove(const char *filepath);
 esp_err_t tsdb_read_block(tsdb_t *db, uint32_t block_num, tsdb_block_t *block);
 esp_err_t tsdb_write_block(tsdb_t *db, uint32_t block_num, const tsdb_block_t *block);
 uint32_t tsdb_calc_block_offset(const tsdb_header_t *header, uint32_t block_num);
+uint32_t tsdb_overflow_min_offset(const tsdb_header_t *header);
 
 // Index operations (tsdb_index.c)
 esp_err_t tsdb_find_block_for_timestamp(FILE *file,
@@ -262,5 +268,24 @@ esp_err_t tsdb_find_block_for_timestamp(FILE *file,
 // before touching the main file: removes a stale `<path>.mig` leftover, or
 // adopts a completed one if a crash hit the unlink->rename swap window.
 void tsdb_migrate_recover(const char *filepath);
+
+// Streaming-rewrite entry used by tsdb_open() for TSDB_SCHEMA_MIGRATE. Same
+// engine as tsdb_migrate_schema_h; the handle must already have is_open set
+// (the engine resolves old column names through the open-only accessors).
+esp_err_t tsdb_migrate_schema_internal(tsdb_t *db, const char **new_names,
+                                       uint8_t new_count,
+                                       const tsdb_migrate_opts_t *opts);
+
+// Write-cache control (tsdb_write.c).
+static inline void tsdb_write_cache_invalidate(tsdb_t *db) {
+    db->cached_block_num = UINT32_MAX;
+    db->cache_dirty = false;
+}
+// Flush a dirty cached block (batch mode). No-op when clean.
+esp_err_t tsdb_write_cache_flush(tsdb_t *db);
+
+// V4 extended-names region helpers (tsdb_core.c): names of columns 16..63.
+esp_err_t tsdb_ext_name_read(FILE *file, uint8_t index, char *out /* [TSDB_V4_EXT_NAME_LEN] */);
+esp_err_t tsdb_ext_name_write(FILE *file, uint8_t index, const char *name);
 
 #endif // TSDB_INTERNAL_H

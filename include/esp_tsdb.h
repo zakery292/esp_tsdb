@@ -69,6 +69,35 @@ typedef enum {
 } tsdb_alloc_strategy_t;
 
 /**
+ * @brief What tsdb_open() does when the file's column set differs from the
+ *        config's (v2.5+).
+ */
+typedef enum {
+    /**
+     * Refuse to open on a parameter-COUNT mismatch (the v2.2–2.4 behaviour).
+     * Names are not compared. The caller must migrate or recreate the file.
+     */
+    TSDB_SCHEMA_STRICT = 0,
+
+    /**
+     * Reconcile the file to the config's column list BY NAME, then open.
+     * Requires `param_names`. Columns present in both keep their data,
+     * names missing from the config are dropped, new names are backfilled
+     * with 0, and reorders are honoured. Legacy overflow extras are folded
+     * into base columns. This is a streaming rewrite through the same engine
+     * as tsdb_migrate_schema() (see `migrate_opts` for the space budget);
+     * when nothing differs it is a no-op and open costs the same as STRICT.
+     *
+     * Caveat: a RENAMED column cannot be told apart from drop+add — its
+     * history reads as 0 under the new name. Rename with
+     * tsdb_rename_param() before changing the config instead.
+     */
+    TSDB_SCHEMA_MIGRATE = 1,
+} tsdb_schema_policy_t;
+
+struct tsdb_migrate_opts_s;
+
+/**
  * @brief Database configuration
  */
 typedef struct {
@@ -100,6 +129,13 @@ typedef struct {
     // determined, so a failed probe never triggers a spurious cap.
     uint64_t (*free_space_cb)(void);
     uint32_t min_free_bytes;
+
+    // Schema reconciliation at open (v2.5+, see tsdb_schema_policy_t).
+    // Zero-initialised configs keep the strict behaviour.
+    tsdb_schema_policy_t schema_policy;
+    // Space budget / trim / progress for the TSDB_SCHEMA_MIGRATE rewrite;
+    // NULL = no space check, no trim, no progress callback.
+    const struct tsdb_migrate_opts_s *migrate_opts;
 } tsdb_config_t;
 
 /**
@@ -158,10 +194,22 @@ esp_err_t tsdb_write(uint32_t timestamp, const int16_t *values);
 /**
  * @brief Write multiple records in batch (more efficient)
  *
+ * Takes the handle lock once, keeps the current block in RAM so consecutive
+ * records that land in the same block cost ONE block write instead of one
+ * per record, and persists the header once at the end. For a backfill of
+ * N records at R records per block this is ~N/R block writes + 1 header
+ * write instead of N of each. Crash mid-batch: the header still describes
+ * the last fully persisted state, so records already in the file but not yet
+ * counted are simply overwritten by the next writes (no corruption).
+ *
+ * Timestamps must be ascending (same rule as tsdb_write). Stack: adds a
+ * header snapshot (~600 bytes) to the write path's usual footprint.
+ *
  * @param timestamps Array of timestamps
  * @param values 2D array [count][num_params]
  * @param count Number of records
- * @return ESP_OK on success
+ * @return ESP_OK on success; on error, records before the failing one are
+ *         persisted.
  */
 esp_err_t tsdb_write_batch(const uint32_t *timestamps,
                             const int16_t **values,
@@ -293,6 +341,11 @@ struct tsdb_query_s {
     tsdb_block_t *block_buffer;
     bool block_loaded;
     bool owns_buffer;               // true if allocated separately
+
+    // v2.5+: every stride-th in-range record is returned (1 = all)
+    uint32_t stride;
+    // v2.5+: true when any requested column lives in the overflow region
+    bool needs_extras;
 };
 
 typedef struct tsdb_query_s tsdb_query_t;
@@ -327,7 +380,26 @@ esp_err_t tsdb_query_next(tsdb_query_t *query,
                           int16_t *values);
 
 /**
+ * @brief Return only every stride-th in-range record from the query (v2.5+).
+ *
+ * For charts: a year of 5-minute samples is ~105k records, but a plot only
+ * needs a few hundred points. With stride = 200 the iterator reads only the
+ * blocks that hold the sampled records — roughly one block read per point
+ * once stride >= records_per_block — instead of every block in the window.
+ * The first returned record is the first in-range one; subsequent records
+ * are stride positions apart. Call after tsdb_query_init(); 0 or 1 = all.
+ *
+ * @param query Initialised query
+ * @param stride Record step (1 = every record)
+ * @return ESP_OK, ESP_ERR_INVALID_ARG if query is not initialised
+ */
+esp_err_t tsdb_query_set_stride(tsdb_query_t *query, uint32_t stride);
+
+/**
  * @brief Get count of records in time range without iterating
+ *
+ * O(log n): two binary seeks bound the window, no records are read.
+ * (Falls back to a scan only if a probe hits a zero-timestamp hole.)
  *
  * @param start_time Start timestamp
  * @param end_time End timestamp
@@ -364,6 +436,9 @@ typedef enum {
 
 /**
  * @brief Perform aggregation over time range
+ *
+ * COUNT, FIRST and LAST are O(log n) (binary seeks, at most one record
+ * read). SUM/AVG/MIN/MAX scan the window block by block.
  *
  * @param start_time Start timestamp
  * @param end_time End timestamp
@@ -435,6 +510,11 @@ esp_err_t tsdb_get_stats(tsdb_stats_t *stats);
 /**
  * @brief Clear all data (keeps structure, resets to empty)
  *
+ * The file is recreated (header + empty index) rather than rewritten in
+ * place, so the cost is flat regardless of how large the database had grown
+ * and the space is returned to the filesystem. Databases with legacy overflow
+ * extras keep the in-place behaviour (the overflow region is preserved).
+ *
  * @return ESP_OK on success
  */
 esp_err_t tsdb_clear(void);
@@ -491,7 +571,7 @@ typedef void (*tsdb_migrate_progress_cb)(uint32_t done, uint32_t total, void *ct
 /**
  * @brief Options for tsdb_migrate_schema().
  */
-typedef struct {
+typedef struct tsdb_migrate_opts_s {
     /**
      * Filesystem free space in bytes, as known by the caller (e.g. from
      * esp_littlefs_info()). The migration writes a full new copy of the
@@ -596,6 +676,25 @@ const char* tsdb_get_param_name(uint8_t index);
  * @brief Check if overflow region is active
  */
 bool tsdb_has_overflow(void);
+
+/**
+ * @brief Rename a base column in place (v2.5+). Header-only: no data is
+ *        touched. Use this BEFORE changing the name in your config when the
+ *        open policy is TSDB_SCHEMA_MIGRATE, so the column's history is kept.
+ *
+ * @param index Base column index (0 .. num_params-1; overflow extras are not
+ *              renameable)
+ * @param new_name New name (31 chars for index < 16, 19 chars for 16..63)
+ * @return ESP_OK, ESP_ERR_INVALID_ARG on bad index/name
+ */
+esp_err_t tsdb_rename_param(uint8_t index, const char *new_name);
+
+/**
+ * @brief Find a column by name (base, then overflow extras). v2.5+
+ *
+ * @return Column index, or -1 if not found.
+ */
+int tsdb_find_param(const char *name);
 
 // ============================================================================
 // BENCHMARK
@@ -777,6 +876,10 @@ uint8_t tsdb_get_total_params_h(const tsdb_t *db);
 const char *tsdb_get_param_name_h(const tsdb_t *db, uint8_t index);
 
 bool tsdb_has_overflow_h(const tsdb_t *db);
+
+esp_err_t tsdb_rename_param_h(tsdb_t *db, uint8_t index, const char *new_name);
+
+int tsdb_find_param_h(tsdb_t *db, const char *name);
 
 #ifdef __cplusplus
 }

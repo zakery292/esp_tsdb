@@ -6,3 +6,4 @@ test_multi
 test_schema
 test_resize
 test_freecap
+test_v25
