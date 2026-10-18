@@ -287,6 +287,39 @@ int main(void) {
     CHECK(tsdb_delete_h(db) == ESP_OK, "delete");
     CHECK(tsdb_test_segments(P) == 0 && !tsdb_test_exists(P), "no files left");
 
+    // ======================================================================
+    printf("PART 6: path-level remove / disk usage, delete refusal keeps the handle\n");
+    tsdb_test_wipe(P);
+    { char junk[300]; snprintf(junk, sizeof junk, "%s.bak", P);
+      FILE *jf = fopen(junk, "wb"); fputs("not a segment", jf); fclose(jf); }
+    db = mk(3, n3, 0, 1024, 0);
+    for (int i = 0; i < 250; i++) { int16_t v[3]; row(i, 3, v); tsdb_write_h(db, T0 + i * DT, v); }
+    tsdb_close_h(db);
+    { uint64_t bytes = 0;
+      CHECK(tsdb_disk_usage(P, &bytes) == ESP_OK && bytes == (uint64_t) tsdb_test_bytes(P) && bytes > 0,
+            "disk_usage == sum of segment files");
+      CHECK(tsdb_test_segments(P) == 3, "three segments on disk");
+      CHECK(tsdb_remove(P) == ESP_OK && tsdb_test_segments(P) == 0 && !tsdb_test_exists(P), "remove: no files left");
+      CHECK(tsdb_disk_usage(P, &bytes) == ESP_OK && bytes == 0, "disk_usage after remove == 0");
+      char junk[300]; snprintf(junk, sizeof junk, "%s.bak", P);
+      CHECK(tsdb_test_exists(junk), "unrelated sibling file untouched");
+      remove(junk);
+      CHECK(tsdb_remove(P) == ESP_OK, "remove on nothing is fine");
+      CHECK(tsdb_remove(NULL) == ESP_ERR_INVALID_ARG && tsdb_disk_usage(P, NULL) == ESP_ERR_INVALID_ARG, "NULL args"); }
+    // Global API: a refused delete (query open) must leave the default handle usable.
+    { tsdb_config_t c = {0};
+      c.filepath = P; c.num_params = 3; c.param_names = n3; c.max_records = 1000;
+      c.buffer_pool_size = 16 * 1024; c.alloc_strategy = TSDB_ALLOC_INTERNAL_RAM;
+      CHECK(tsdb_init(&c) == ESP_OK, "global init");
+      int16_t v[3] = {1, 2, 3};
+      tsdb_write(T0, v); tsdb_write(T0 + DT, v);
+      tsdb_query_t q;
+      CHECK(tsdb_query_init(&q, 0, UINT32_MAX, NULL, 0) == ESP_OK, "global query open");
+      CHECK(tsdb_delete() == ESP_ERR_INVALID_STATE, "delete refused while query open");
+      tsdb_query_close(&q);
+      CHECK(tsdb_get_stats(&st) == ESP_OK && st.total_records == 2, "default handle still usable");
+      CHECK(tsdb_delete() == ESP_OK && tsdb_test_segments(P) == 0, "delete after query closed"); }
+
     printf("\n%s (%d failed)\n", fails ? "*** FAIL ***" : "*** PASS ***", fails);
     return fails ? 1 : 0;
 }

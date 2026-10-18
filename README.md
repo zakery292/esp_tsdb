@@ -361,6 +361,8 @@ See `include/esp_tsdb.h` for full API documentation.
 - `tsdb_get_stats()` - Statistics (retained records, capacity, time bounds, lifetime writes/evictions, storage bytes, segment count)
 - `tsdb_clear()` - Delete all data (keeps schema and capacity)
 - `tsdb_delete()` - Delete the database files and close
+- `tsdb_remove(path)` - Delete every file of a database that is not open (no handle needed)
+- `tsdb_disk_usage(path, &bytes)` - On-disk size of a database without opening it
 - `tsdb_sync_h()` - Close + reopen the active segment
 
 Every function above has an `_h` variant taking a `tsdb_t *` handle.

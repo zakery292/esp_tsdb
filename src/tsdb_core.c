@@ -697,7 +697,9 @@ esp_err_t tsdb_delete(void) {
     if (db == NULL) return ESP_ERR_INVALID_STATE;
     g_default_handle = NULL;
     esp_err_t ret = tsdb_delete_h(db);
-    if (ret == ESP_ERR_TIMEOUT) g_default_handle = db;
+    // Refused (lock timeout, open query, not open): the handle is still
+    // alive and still the default handle.
+    if (ret != ESP_OK) g_default_handle = db;
     return ret;
 }
 

@@ -1,5 +1,13 @@
 # Changelog
 
+## [3.0.0-beta.2] - 2026-10-18
+### Added
+- `tsdb_remove(path)` — unlink every file of a database that is not open: the legacy 2.x file, its sidecars, an orphaned `.mig` and every segment. For callers that discard a database before the first open (schema family changed, rebuild with the handle closed); a bare `unlink(path)` only ever removed the 2.x file.
+- `tsdb_disk_usage(path, &bytes)` — on-disk size of a database without opening it. 3.0 applies the configured `max_records` at every open, so a caller that sizes the capacity from free space must add the database's own bytes back in; `stat(path)` only ever saw the 2.x file.
+
+### Fixed
+- `tsdb_delete()` (global-handle API) dropped the default handle when the delete was refused for an open query; only a lock timeout restored it. Any refusal now leaves the handle in place.
+
 ## [3.0.0-beta.1] - 2026-10-18
 ### Changed — new on-disk format: append-only segments
 - **The ring buffer is gone; a database is now a set of append-only segment files** (`<path>.s0000000001`, `.s0000000002`, …). Each segment is a write-once header (its own column list, geometry and lifetime counters) followed by 1 KB columnar blocks in time order. Records are only ever appended to the newest segment; when it reaches its block budget (`segment_bytes`, default: capacity split into ~32 segments) or the schema changes, the next write starts a new one. Eviction is logical at the head (the oldest `total_on_disk − max_records` records are invisible) and physical per segment (the oldest file is unlinked once every record in it has left the window), so capacity is exact and nothing has to be persisted to track it.

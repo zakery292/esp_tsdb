@@ -507,3 +507,70 @@ void tsdb_remove_all_files(tsdb_t *db) {
     db->total_physical = 0;
     db->head_skip = 0;
 }
+
+// ---------------------------------------------------------------------------
+// Path-level operations (no handle)
+// ---------------------------------------------------------------------------
+
+// First segment file for `base` in `dir`, or false. Callers that unlink the
+// result and rescan avoid mutating a directory while iterating it (littlefs
+// does not promise a stable readdir across unlink).
+static bool find_one_segment(const char *dir, const char *base, char *out, size_t out_len) {
+    DIR *d = opendir(dir);
+    if (d == NULL) return false;
+    bool found = false;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        uint32_t seq;
+        if (parse_seq(e->d_name, base, &seq)) {
+            int n = snprintf(out, out_len, "%s/%s", dir, e->d_name);
+            if (n < 0 || (size_t) n >= out_len) continue;   // name does not fit: skip it
+            found = true;
+            break;
+        }
+    }
+    closedir(d);
+    return found;
+}
+
+esp_err_t tsdb_remove(const char *filepath) {
+    if (filepath == NULL) return ESP_ERR_INVALID_ARG;
+    char dir[128], base[128], p[300];
+    split_path(filepath, dir, sizeof(dir), base, sizeof(base));
+    tsdb_legacy_remove(filepath);
+    // Bounded: every iteration removes one file or stops.
+    for (int guard = 0; guard < 4096 && find_one_segment(dir, base, p, sizeof(p)); guard++) {
+        if (unlink(p) != 0) {
+            ESP_LOGW(TAG, "unlink(%s) failed (errno=%d)", p, errno);
+            break;
+        }
+    }
+    return ESP_OK;
+}
+
+esp_err_t tsdb_disk_usage(const char *filepath, uint64_t *bytes) {
+    if (filepath == NULL || bytes == NULL) return ESP_ERR_INVALID_ARG;
+    char dir[128], base[128], p[300];
+    split_path(filepath, dir, sizeof(dir), base, sizeof(base));
+    uint64_t total = 0;
+    struct stat st;
+    static const char *const legacy_suffix[] = { "", ".h0", ".h1", ".mig" };
+    for (size_t i = 0; i < sizeof(legacy_suffix) / sizeof(legacy_suffix[0]); i++) {
+        snprintf(p, sizeof(p), "%s%s", filepath, legacy_suffix[i]);
+        if (stat(p, &st) == 0) total += (uint64_t) st.st_size;
+    }
+    DIR *d = opendir(dir);
+    if (d != NULL) {
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL) {
+            uint32_t seq;
+            if (!parse_seq(e->d_name, base, &seq)) continue;
+            int n = snprintf(p, sizeof(p), "%s/%s", dir, e->d_name);
+            if (n < 0 || (size_t) n >= sizeof(p)) continue;
+            if (stat(p, &st) == 0) total += (uint64_t) st.st_size;
+        }
+        closedir(d);
+    }
+    *bytes = total;
+    return ESP_OK;
+}

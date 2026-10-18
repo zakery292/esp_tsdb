@@ -534,6 +534,33 @@ esp_err_t tsdb_clear(void);
  */
 esp_err_t tsdb_delete(void);
 
+/**
+ * @brief Remove every file of a database that is NOT open (path-level)
+ *
+ * Unlinks the legacy 2.x file and its sidecars, an orphaned .mig, and every
+ * segment file belonging to @p filepath. Use this where no handle exists yet
+ * (e.g. discarding a database for a different schema before the first open).
+ * Removing a database that is open elsewhere is undefined.
+ *
+ * @param filepath Database path as given in tsdb_config_t.filepath
+ * @return ESP_OK (also when nothing existed), ESP_ERR_INVALID_ARG on NULL
+ */
+esp_err_t tsdb_remove(const char *filepath);
+
+/**
+ * @brief On-disk size of a database without opening it (path-level)
+ *
+ * Sums the legacy file, its sidecars and every segment file at @p filepath.
+ * Lets a caller that sizes the capacity from free space add the database's
+ * own bytes back in before tsdb_open(); 3.0 applies the configured
+ * max_records at every open.
+ *
+ * @param filepath Database path
+ * @param bytes    Out: total bytes (0 when no files exist)
+ * @return ESP_OK, ESP_ERR_INVALID_ARG on NULL
+ */
+esp_err_t tsdb_disk_usage(const char *filepath, uint64_t *bytes);
+
 // ============================================================================
 // OVERFLOW PARAMETER API
 // ============================================================================
