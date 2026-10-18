@@ -1,6 +1,6 @@
 # Changelog
 
-## [3.0.0] - 2026-10-14
+## [3.0.0-beta.1] - 2026-10-18
 ### Changed — new on-disk format: append-only segments
 - **The ring buffer is gone; a database is now a set of append-only segment files** (`<path>.s0000000001`, `.s0000000002`, …). Each segment is a write-once header (its own column list, geometry and lifetime counters) followed by 1 KB columnar blocks in time order. Records are only ever appended to the newest segment; when it reaches its block budget (`segment_bytes`, default: capacity split into ~32 segments) or the schema changes, the next write starts a new one. Eviction is logical at the head (the oldest `total_on_disk − max_records` records are invisible) and physical per segment (the oldest file is unlinked once every record in it has left the window), so capacity is exact and nothing has to be persisted to track it.
 
