@@ -97,7 +97,11 @@ static uint32_t crc32_(const void *data, size_t len) {
     return ~crc;
 }
 
+// Heap, not stack, for the ~600-byte sidecar: open runs on whatever task
+// the caller has (a 4.6 KB main task on the dongle firmware).
 static esp_err_t sidecar_load(const char *filepath, tsdb_header_t *out) {
+    tsdb_sidecar_t *sc = malloc(sizeof(*sc));
+    if (sc == NULL) return ESP_ERR_NO_MEM;
     bool found = false;
     uint32_t best_seq = 0;
     for (uint8_t slot = 0; slot < 2; slot++) {
@@ -105,20 +109,20 @@ static esp_err_t sidecar_load(const char *filepath, tsdb_header_t *out) {
         snprintf(path, sizeof(path), "%s.h%u", filepath, (unsigned) slot);
         FILE *f = fopen(path, "rb");
         if (f == NULL) continue;
-        tsdb_sidecar_t sc;
-        size_t n = fread(&sc, sizeof(sc), 1, f);
+        size_t n = fread(sc, sizeof(*sc), 1, f);
         fclose(f);
-        if (n != 1 || sc.magic != TSDB_SIDECAR_MAGIC) continue;
-        if (crc32_(&sc.header, sizeof(sc.header)) != sc.header_crc) {
+        if (n != 1 || sc->magic != TSDB_SIDECAR_MAGIC) continue;
+        if (crc32_(&sc->header, sizeof(sc->header)) != sc->header_crc) {
             ESP_LOGW(TAG, "sidecar slot %u CRC mismatch — ignoring", (unsigned) slot);
             continue;
         }
-        if (!found || sc.seq > best_seq) {
+        if (!found || sc->seq > best_seq) {
             found = true;
-            best_seq = sc.seq;
-            *out = sc.header;
+            best_seq = sc->seq;
+            *out = sc->header;
         }
     }
+    free(sc);
     return found ? ESP_OK : ESP_ERR_NOT_FOUND;
 }
 
@@ -148,8 +152,9 @@ static void migrate_recover(const char *filepath) {
         ESP_LOGW(TAG, "Removed stale migration file %s", mig_path);
         return;
     }
-    tsdb_header_t hdr;
-    bool valid = (fread(&hdr, sizeof(hdr), 1, mig) == 1) && (hdr.magic == TSDB_MAGIC);
+    tsdb_header_t *hdr = malloc(sizeof(*hdr));
+    bool valid = hdr != NULL && (fread(hdr, sizeof(*hdr), 1, mig) == 1) && (hdr->magic == TSDB_MAGIC);
+    free(hdr);
     fclose(mig);
     if (valid) {
         if (rename(mig_path, filepath) == 0) {
@@ -375,18 +380,19 @@ esp_err_t tsdb_legacy_open(const char *path, const tsdb_config_t *config, tsdb_l
     if (!needs_reconstruction) {
         // A sidecar that is valid, geometrically identical and ahead of the
         // in-file header holds the records an unclean shutdown would lose.
-        tsdb_header_t sc;
-        if (sidecar_load(path, &sc) == ESP_OK) {
-            if (sc.magic == TSDB_MAGIC && header_is_sane(&sc) &&
-                sc.num_params == l->header.num_params &&
-                sc.records_per_block == l->header.records_per_block &&
-                sc.index_offset == l->header.index_offset &&
-                sc.total_records >= l->header.total_records) {
+        tsdb_header_t *sc = malloc(sizeof(*sc));
+        if (sc != NULL && sidecar_load(path, sc) == ESP_OK) {
+            if (sc->magic == TSDB_MAGIC && header_is_sane(sc) &&
+                sc->num_params == l->header.num_params &&
+                sc->records_per_block == l->header.records_per_block &&
+                sc->index_offset == l->header.index_offset &&
+                sc->total_records >= l->header.total_records) {
                 ESP_LOGI(TAG, "Legacy sidecar ahead of in-file header (%lu -> %lu records)",
-                         (unsigned long) l->header.total_records, (unsigned long) sc.total_records);
-                l->header = sc;
+                         (unsigned long) l->header.total_records, (unsigned long) sc->total_records);
+                l->header = *sc;
             }
         }
+        free(sc);
     } else {
         fseek(f, 0, SEEK_END);
         long size = ftell(f);

@@ -503,11 +503,13 @@ esp_err_t tsdb_aggregate_multi_h(tsdb_t *db, uint32_t start_time, uint32_t end_t
         req_to[i] = j;
     }
 
+    agg_acc_t *acc = malloc(sizeof(agg_acc_t) * nu);   // up to 64 × ~24 B: heap, not stack
+    if (acc == NULL) return ESP_ERR_NO_MEM;
+
     tsdb_query_t q;
     esp_err_t ret = tsdb_query_init_h(db, &q, start_time, end_time, unique, nu);
-    if (ret != ESP_OK) return ret;
+    if (ret != ESP_OK) { free(acc); return ret; }
 
-    agg_acc_t acc[TSDB_MAX_PARAMS];
     for (uint8_t i = 0; i < nu; i++) acc_init(&acc[i]);
     uint32_t count = agg_scan(&q, nu, acc);
     tsdb_query_close(&q);
@@ -515,6 +517,7 @@ esp_err_t tsdb_aggregate_multi_h(tsdb_t *db, uint32_t start_time, uint32_t end_t
     for (uint8_t i = 0; i < num_requests; i++) {
         requests[i].result = count == 0 ? 0 : acc_result(&acc[req_to[i]], requests[i].agg_type, count);
     }
+    free(acc);
     if (record_count) *record_count = count;
     return ESP_OK;
 }

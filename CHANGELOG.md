@@ -1,5 +1,10 @@
 # Changelog
 
+## [3.0.0-beta.3] - 2026-10-18
+### Fixed
+- **Stack use on small tasks.** Measured with `-fstack-usage` on riscv32: `tsdb_legacy_open` kept two 584-byte 2.x headers on the stack (1440-byte frame), `tsdb_seg_create` and `tsdb_oldest_retained_ts` (called by `tsdb_get_stats`) each kept a 1 KB block buffer as a fallback (1392 / 1232), `tsdb_migrate_schema_h` kept a ~2.6 KB candidate schema (2640) and `tsdb_aggregate_multi_h` a 64-entry accumulator array (1920). All of these now live on the heap for the duration of the call; the largest frame on the open / stats / schema paths is now `tsdb_seg_scan` at 592 bytes. Matters for a caller that opens the database from a 4–5 KB boot task. (`tsdb_write_locked` still carries a 1 KB fallback block for a pool without a write cache: 1440 bytes on the writer's task.)
+- `tsdb_remove()` / `tsdb_disk_usage()` (beta.2) used ~600 bytes of path scratch on the stack; now heap.
+
 ## [3.0.0-beta.2] - 2026-10-18
 ### Added
 - `tsdb_remove(path)` — unlink every file of a database that is not open: the legacy 2.x file, its sidecars, an orphaned `.mig` and every segment. For callers that discard a database before the first open (schema family changed, rebuild with the handle closed); a bare `unlink(path)` only ever removed the 2.x file.

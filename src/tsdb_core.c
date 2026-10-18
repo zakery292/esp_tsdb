@@ -98,16 +98,25 @@ uint32_t tsdb_oldest_retained_ts(tsdb_t *db) {
     tsdb_seg_t *o = &db->segs[0];
     if (db->head_skip == 0) return o->first_ts;
 
+    // Pool read buffer when it is contiguous, else a heap block — never a
+    // 1 KB stack buffer (stats are read from small tasks, including the
+    // dongle's 4.6 KB main task at boot).
+    uint8_t *heapbuf = NULL;
     uint8_t *buf = tsdb_get_buffer_ptr(&db->pool, db->read_buffer_offset, TSDB_BLOCK_SIZE);
-    uint8_t stackbuf[TSDB_BLOCK_SIZE];
-    if (buf == NULL) buf = stackbuf;
+    if (buf == NULL) {
+        heapbuf = malloc(TSDB_BLOCK_SIZE);
+        if (heapbuf == NULL) return o->first_ts;
+        buf = heapbuf;
+    }
 
+    uint32_t ts = o->first_ts;
     uint32_t block; uint16_t off;
     if (o->seq == 0 && db->legacy) {
         tsdb_legacy_locate(db->legacy, db->head_skip, &block, &off);
         fseek(db->legacy->file, tsdb_legacy_block_offset(db->legacy, block), SEEK_SET);
-        if (fread(buf, TSDB_BLOCK_SIZE, 1, db->legacy->file) != 1) return o->first_ts;
-        return TSDB_BLOCK_TS(buf, off);
+        if (fread(buf, TSDB_BLOCK_SIZE, 1, db->legacy->file) == 1) ts = TSDB_BLOCK_TS(buf, off);
+        free(heapbuf);
+        return ts;
     }
     block = db->head_skip / o->rpb;
     off = (uint16_t)(db->head_skip % o->rpb);
@@ -117,14 +126,14 @@ uint32_t tsdb_oldest_retained_ts(tsdb_t *db) {
         char path[160];
         tsdb_seg_path(db, o->seq, path, sizeof(path));
         f = fopen(path, "rb");
-        if (f == NULL) return o->first_ts;
+        if (f == NULL) { free(heapbuf); return ts; }
         own = true;
     }
-    uint32_t ts = o->first_ts;
     if (tsdb_seg_read_block(f, o->data_offset, block, buf) == ESP_OK) {
         ts = TSDB_BLOCK_TS(buf, off);
     }
     if (own) fclose(f);
+    free(heapbuf);
     return ts;
 }
 
@@ -576,26 +585,29 @@ esp_err_t tsdb_migrate_schema_h(tsdb_t *db, const char **new_names, uint8_t new_
     }
     tsdb_schema_t *s = &db->schema;
 
-    tsdb_schema_t ns;
-    memset(&ns, 0, sizeof(ns));
-    ns.count = ns.base_count = new_count;
+    // Heap: tsdb_schema_t is ~2.6 KB (64 names + 64 aliases).
+    tsdb_schema_t *ns = calloc(1, sizeof(*ns));
+    if (ns == NULL) { tsdb_unlock(db); return ESP_ERR_NO_MEM; }
+    ns->count = ns->base_count = new_count;
     for (uint8_t i = 0; i < new_count; i++) {
-        schema_set_name(ns.names[i], new_names[i]);
+        schema_set_name(ns->names[i], new_names[i]);
         // keep the alias of a column that keeps its name
         for (uint8_t j = 0; j < s->count; j++) {
-            if (strncmp(s->names[j], ns.names[i], TSDB_NAME_LEN - 1) == 0) {
-                memcpy(ns.aliases[i], s->aliases[j], TSDB_NAME_LEN);
+            if (strncmp(s->names[j], ns->names[i], TSDB_NAME_LEN - 1) == 0) {
+                memcpy(ns->aliases[i], s->aliases[j], TSDB_NAME_LEN);
                 break;
             }
         }
     }
-    if (schema_equal(s, ns.count, ns.base_count, ns.names, ns.aliases)) {
+    if (schema_equal(s, ns->count, ns->base_count, ns->names, ns->aliases)) {
         ESP_LOGI(TAG, "Schema already matches — nothing to do");
+        free(ns);
         tsdb_unlock(db);
         return ESP_OK;
     }
-    ns.gen = s->gen;
-    *s = ns;
+    ns->gen = s->gen;
+    *s = *ns;
+    free(ns);
     schema_bump(db);
     ESP_LOGI(TAG, "Schema changed to %u columns (gen %lu); takes effect at the next write",
              new_count, (unsigned long) s->gen);

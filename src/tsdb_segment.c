@@ -377,9 +377,13 @@ esp_err_t tsdb_seg_create(tsdb_t *db, uint32_t first_ts) {
 
     // Header + names + aliases + zero padding up to data_offset, one block
     // of I/O. Reuse the pool's read buffer as scratch when it is contiguous.
+    uint8_t *heapbuf = NULL;
     uint8_t *buf = tsdb_get_buffer_ptr(&db->pool, db->read_buffer_offset, TSDB_BLOCK_SIZE);
-    uint8_t stackbuf[TSDB_BLOCK_SIZE];
-    if (buf == NULL) buf = stackbuf;
+    if (buf == NULL) {
+        heapbuf = malloc(TSDB_BLOCK_SIZE);   // never a 1 KB stack buffer
+        if (heapbuf == NULL) { fclose(f); unlink(path); return ESP_ERR_NO_MEM; }
+        buf = heapbuf;
+    }
 
     bool ok = true;
     uint32_t written = 0;
@@ -405,6 +409,7 @@ esp_err_t tsdb_seg_create(tsdb_t *db, uint32_t first_ts) {
         written += chunk;
     }
     int werr = errno;
+    free(heapbuf);
     fflush(f);
     fsync(fileno(f));
     if (!ok) {
@@ -533,44 +538,52 @@ static bool find_one_segment(const char *dir, const char *base, char *out, size_
     return found;
 }
 
+// Scratch for the path-level helpers: on the heap, because they are called
+// before any handle exists, typically from a small boot task.
+typedef struct { char dir[128]; char base[128]; char p[300]; } path_scratch_t;
+
 esp_err_t tsdb_remove(const char *filepath) {
     if (filepath == NULL) return ESP_ERR_INVALID_ARG;
-    char dir[128], base[128], p[300];
-    split_path(filepath, dir, sizeof(dir), base, sizeof(base));
+    path_scratch_t *s = malloc(sizeof(*s));
+    if (s == NULL) return ESP_ERR_NO_MEM;
+    split_path(filepath, s->dir, sizeof(s->dir), s->base, sizeof(s->base));
     tsdb_legacy_remove(filepath);
     // Bounded: every iteration removes one file or stops.
-    for (int guard = 0; guard < 4096 && find_one_segment(dir, base, p, sizeof(p)); guard++) {
-        if (unlink(p) != 0) {
-            ESP_LOGW(TAG, "unlink(%s) failed (errno=%d)", p, errno);
+    for (int guard = 0; guard < 4096 && find_one_segment(s->dir, s->base, s->p, sizeof(s->p)); guard++) {
+        if (unlink(s->p) != 0) {
+            ESP_LOGW(TAG, "unlink(%s) failed (errno=%d)", s->p, errno);
             break;
         }
     }
+    free(s);
     return ESP_OK;
 }
 
 esp_err_t tsdb_disk_usage(const char *filepath, uint64_t *bytes) {
     if (filepath == NULL || bytes == NULL) return ESP_ERR_INVALID_ARG;
-    char dir[128], base[128], p[300];
-    split_path(filepath, dir, sizeof(dir), base, sizeof(base));
+    path_scratch_t *s = malloc(sizeof(*s));
+    if (s == NULL) return ESP_ERR_NO_MEM;
+    split_path(filepath, s->dir, sizeof(s->dir), s->base, sizeof(s->base));
     uint64_t total = 0;
     struct stat st;
     static const char *const legacy_suffix[] = { "", ".h0", ".h1", ".mig" };
     for (size_t i = 0; i < sizeof(legacy_suffix) / sizeof(legacy_suffix[0]); i++) {
-        snprintf(p, sizeof(p), "%s%s", filepath, legacy_suffix[i]);
-        if (stat(p, &st) == 0) total += (uint64_t) st.st_size;
+        snprintf(s->p, sizeof(s->p), "%s%s", filepath, legacy_suffix[i]);
+        if (stat(s->p, &st) == 0) total += (uint64_t) st.st_size;
     }
-    DIR *d = opendir(dir);
+    DIR *d = opendir(s->dir);
     if (d != NULL) {
         struct dirent *e;
         while ((e = readdir(d)) != NULL) {
             uint32_t seq;
-            if (!parse_seq(e->d_name, base, &seq)) continue;
-            int n = snprintf(p, sizeof(p), "%s/%s", dir, e->d_name);
-            if (n < 0 || (size_t) n >= sizeof(p)) continue;
-            if (stat(p, &st) == 0) total += (uint64_t) st.st_size;
+            if (!parse_seq(e->d_name, s->base, &seq)) continue;
+            int n = snprintf(s->p, sizeof(s->p), "%s/%s", s->dir, e->d_name);
+            if (n < 0 || (size_t) n >= sizeof(s->p)) continue;
+            if (stat(s->p, &st) == 0) total += (uint64_t) st.st_size;
         }
         closedir(d);
     }
+    free(s);
     *bytes = total;
     return ESP_OK;
 }
