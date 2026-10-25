@@ -6,3 +6,9 @@ test_multi
 test_schema
 test_resize
 test_freecap
+test_lfs_cost
+test_compat_new
+test_compat_old
+.compat_old/
+.littlefs/
+.lfs_build/

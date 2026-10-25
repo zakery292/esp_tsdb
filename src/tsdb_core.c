@@ -154,8 +154,32 @@ static uint32_t tsdb_crc32_(const void *data, size_t len) {
     return ~crc;
 }
 
-static void tsdb_sidecar_path_(const char *filepath, uint8_t slot, char *out, size_t out_len) {
+// <db>.h0 / <db>.h1 — TSH1, the 2.4.0-2.4.3 location (mirror, see
+// TSDB_SIDECAR_LEGACY_EVERY).
+static void tsdb_legacy_path_(const char *filepath, uint8_t slot, char *out, size_t out_len) {
     snprintf(out, out_len, "%s.h%u", filepath, (unsigned) (slot & 1));
+}
+
+static void tsdb_side_dir_(const char *filepath, char *out, size_t out_len) {
+    snprintf(out, out_len, "%s.d", filepath);
+}
+
+// <db>.d/h0 / <db>.d/h1 — TSH2, written on every record.
+static void tsdb_side_path_(const char *filepath, uint8_t slot, char *out, size_t out_len) {
+    snprintf(out, out_len, "%s.d/h%u", filepath, (unsigned) (slot & 1));
+}
+
+// One whole small file. "wb" truncates — cheap, the file is tiny. The OTHER
+// slot is the durable copy meanwhile.
+static bool tsdb_write_small_file_(const char *path, const void *data, size_t len) {
+    FILE *f = fopen(path, "wb");
+    if (f == NULL) {
+        return false;
+    }
+    size_t written = fwrite(data, len, 1, f);
+    tsdb_flush_and_sync(f);
+    bool closed = (fclose(f) == 0);
+    return written == 1 && closed;
 }
 
 esp_err_t tsdb_sidecar_write(tsdb_t *db) {
@@ -163,46 +187,72 @@ esp_err_t tsdb_sidecar_write(tsdb_t *db) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    tsdb_sidecar_t sidecar;
-    sidecar.magic = TSDB_SIDECAR_MAGIC;
-    sidecar.seq = ++db->sidecar_seq;
-    sidecar.header = db->header;
-    sidecar.header_crc = tsdb_crc32_(&sidecar.header, sizeof(sidecar.header));
+    char path[160];
+    uint32_t seq = ++db->sidecar_seq;
+
+    // 1. Compact slot in the private subdirectory. If the filesystem cannot
+    // make one, the open below fails and the mirror is written every record
+    // instead, i.e. 2.4.3 behaviour.
+    if (!db->side_dir_ready) {
+        tsdb_side_dir_(db->filepath, path, sizeof(path));
+        mkdir(path, 0775);   // EEXIST is the common case
+        db->side_dir_ready = true;
+    }
+    tsdb_sidecar2_t s2;
+    s2.magic = TSDB_SIDECAR2_MAGIC;
+    s2.seq = seq;
+    s2.legacy_seq = db->legacy_seq;
+    memcpy(s2.pre, &db->header, TSDB_HDR_PRE_LEN);
+    memcpy(s2.post, (const uint8_t *) &db->header + TSDB_HDR_POST_OFF, TSDB_HDR_POST_LEN);
+    s2.crc = tsdb_crc32_(&s2.legacy_seq, sizeof(s2) - offsetof(tsdb_sidecar2_t, legacy_seq));
 
     // Alternate slots so the previous one survives a torn write.
     db->sidecar_slot ^= 1;
-    char path[160];
-    tsdb_sidecar_path_(db->filepath, db->sidecar_slot, path, sizeof(path));
-
-    // "wb" truncates — cheap on littlefs because the file is one block and
-    // nothing follows it. The OTHER slot is the durable copy meanwhile.
-    FILE *f = fopen(path, "wb");
-    if (f == NULL) {
-        ESP_LOGW(TAG, "sidecar open failed: %s", path);
-        return ESP_FAIL;
-    }
-    size_t written = fwrite(&sidecar, sizeof(sidecar), 1, f);
-    tsdb_flush_and_sync(f);
-    fclose(f);
-
-    if (written != 1) {
+    tsdb_side_path_(db->filepath, db->sidecar_slot, path, sizeof(path));
+    bool ok = tsdb_write_small_file_(path, &s2, sizeof(s2));
+    if (!ok) {
         ESP_LOGW(TAG, "sidecar write failed: %s", path);
-        return ESP_FAIL;
     }
-    return ESP_OK;
+
+    // 2. TSH1 mirror for older readers (and the fallback when 1. failed).
+    bool mirror_ok = false;
+    if (!ok || !db->legacy_mirrored ||
+        (uint32_t) (seq - db->legacy_seq) >= TSDB_SIDECAR_LEGACY_EVERY) {
+        tsdb_sidecar_t s1;
+        s1.magic = TSDB_SIDECAR_MAGIC;
+        s1.seq = seq;
+        s1.header = db->header;
+        s1.header_crc = tsdb_crc32_(&s1.header, sizeof(s1.header));
+        db->legacy_slot ^= 1;
+        tsdb_legacy_path_(db->filepath, db->legacy_slot, path, sizeof(path));
+        mirror_ok = tsdb_write_small_file_(path, &s1, sizeof(s1));
+        if (mirror_ok) {
+            db->legacy_seq = seq;
+            db->legacy_mirrored = true;
+        } else {
+            ESP_LOGW(TAG, "sidecar mirror write failed: %s", path);
+        }
+    }
+
+    return (ok || mirror_ok) ? ESP_OK : ESP_FAIL;
 }
 
-esp_err_t tsdb_sidecar_load(const char *filepath, tsdb_header_t *out, uint32_t *seq_out) {
-    if (filepath == NULL || out == NULL) {
+esp_err_t tsdb_sidecar_load(tsdb_t *db, const tsdb_header_t *base, tsdb_header_t *out) {
+    if (db == NULL || base == NULL || out == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    bool found = false;
-    uint32_t best_seq = 0;
+    char path[160];
+    uint32_t max_seq = 0;
 
+    // TSH1 slots (<db>.h0/.h1): written by 2.4.0-2.4.3 every record, and by
+    // this version as a periodic mirror.
+    bool found_r = false;
+    uint32_t seq_r = 0;
+    uint8_t slot_r = 0;
+    tsdb_header_t hdr_r;
     for (uint8_t slot = 0; slot < 2; slot++) {
-        char path[160];
-        tsdb_sidecar_path_(filepath, slot, path, sizeof(path));
+        tsdb_legacy_path_(db->filepath, slot, path, sizeof(path));
         FILE *f = fopen(path, "rb");
         if (f == NULL) {
             continue;
@@ -219,28 +269,186 @@ esp_err_t tsdb_sidecar_load(const char *filepath, tsdb_header_t *out, uint32_t *
         }
         // seq is monotonic, so the larger value is the later write. Wrap is
         // not handled: at one write per record it would take ~4 billion.
-        if (!found || sidecar.seq > best_seq) {
-            found = true;
-            best_seq = sidecar.seq;
-            *out = sidecar.header;
+        if (!found_r || sidecar.seq > seq_r) {
+            found_r = true;
+            seq_r = sidecar.seq;
+            slot_r = slot;
+            hdr_r = sidecar.header;
         }
     }
 
-    if (!found) {
-        return ESP_ERR_NOT_FOUND;
+    // TSH2 slots (<db>.d/h0, h1).
+    bool found_d = false;
+    uint32_t seq_d = 0, legacy_seq_d = 0;
+    uint8_t slot_d = 0;
+    tsdb_sidecar2_t best_d;
+    for (uint8_t slot = 0; slot < 2; slot++) {
+        tsdb_side_path_(db->filepath, slot, path, sizeof(path));
+        FILE *f = fopen(path, "rb");
+        if (f == NULL) {
+            continue;
+        }
+        tsdb_sidecar2_t s2;
+        size_t items_read = fread(&s2, sizeof(s2), 1, f);
+        fclose(f);
+        if (items_read != 1 || s2.magic != TSDB_SIDECAR2_MAGIC) {
+            continue;
+        }
+        if (tsdb_crc32_(&s2.legacy_seq, sizeof(s2) - offsetof(tsdb_sidecar2_t, legacy_seq)) != s2.crc) {
+            ESP_LOGW(TAG, "sidecar slot d%u CRC mismatch — ignoring", (unsigned) slot);
+            continue;
+        }
+        if (!found_d || s2.seq > seq_d) {
+            found_d = true;
+            seq_d = s2.seq;
+            legacy_seq_d = s2.legacy_seq;
+            slot_d = slot;
+            best_d = s2;
+        }
     }
-    if (seq_out != NULL) {
-        *seq_out = best_seq;
+
+    // Continue the sequence past everything on disk, and make the first
+    // write of each kind go to the OLDER slot, so the newest survives a torn
+    // write.
+    if (found_r && seq_r > max_seq) max_seq = seq_r;
+    if (found_d && seq_d > max_seq) max_seq = seq_d;
+    db->sidecar_seq = max_seq;
+    db->legacy_seq = found_r ? seq_r : 0;
+    db->legacy_slot = found_r ? slot_r : 0;      // write does ^= 1 first
+    db->sidecar_slot = found_d ? slot_d : 0;
+    db->legacy_mirrored = false;
+
+    // Which one is authoritative:
+    //  - TSH2 newest, unless a TSH1 slot is newer than the last mirror that
+    //    TSH2 slot knew about — then an older esp_tsdb wrote after a
+    //    downgrade, and its state is the later one.
+    //  - TSH2 present but its mirror gone (legacy_seq != 0, no valid TSH1):
+    //    an older version closed the database cleanly, which removes only the
+    //    TSH1 slots. The in-file header is then newer than the TSH2 slot.
+    bool use_d = false;
+    if (found_d) {
+        use_d = found_r ? (seq_r <= legacy_seq_d) : (legacy_seq_d == 0);
     }
-    return ESP_OK;
+    if (use_d) {
+        *out = *base;
+        memcpy(out, best_d.pre, TSDB_HDR_PRE_LEN);
+        memcpy((uint8_t *) out + TSDB_HDR_POST_OFF, best_d.post, TSDB_HDR_POST_LEN);
+        return ESP_OK;
+    }
+    if (found_r) {
+        *out = hdr_r;
+        return ESP_OK;
+    }
+    return ESP_ERR_NOT_FOUND;
 }
 
 void tsdb_sidecar_remove(const char *filepath) {
+    char path[160];
+    // Subdirectory first: if this is interrupted, what remains is a TSH1
+    // slot, which describes the same state as the in-file header.
     for (uint8_t slot = 0; slot < 2; slot++) {
-        char path[160];
-        tsdb_sidecar_path_(filepath, slot, path, sizeof(path));
+        tsdb_side_path_(filepath, slot, path, sizeof(path));
         unlink(path);
     }
+    tsdb_side_dir_(filepath, path, sizeof(path));
+    rmdir(path);
+    for (uint8_t slot = 0; slot < 2; slot++) {
+        tsdb_legacy_path_(filepath, slot, path, sizeof(path));
+        unlink(path);
+    }
+}
+
+// Rebuild the sparse index into buf (which holds file bytes [0, len)) from
+// the timestamps actually stored at each index slot. Identical to what the
+// per-write updates of 2.4.3 produced: entry k = {ts of the record in slot
+// k*stride, its block}.
+static void tsdb_rebuild_index_(tsdb_t *db, uint8_t *buf, uint32_t entries) {
+    const tsdb_header_t *h = &db->header;
+    for (uint32_t k = 0; k < entries; k++) {
+        uint32_t slot = k * h->index_stride;
+        uint32_t block = slot / h->records_per_block;
+        uint32_t rec = slot % h->records_per_block;
+        uint32_t ts = 0;
+        fseek(db->file, tsdb_calc_block_offset(h, block) + 8 + rec * 4, SEEK_SET);
+        if (fread(&ts, sizeof(ts), 1, db->file) != 1) {
+            continue;   // leave whatever the file had
+        }
+        tsdb_index_entry_t e = { .timestamp = ts, .block_number = block };
+        memcpy(buf + h->index_offset + k * sizeof(e), &e, sizeof(e));
+    }
+}
+
+// Upper bound on the temporary buffer for header + index (firmware geometry
+// needs ~4 KB). Bigger indexes fall back to a header-only write.
+#ifndef TSDB_FOLD_MAX_BYTES
+#define TSDB_FOLD_MAX_BYTES (16 * 1024)
+#endif
+
+esp_err_t tsdb_fold_header(tsdb_t *db) {
+    if (db == NULL || db->file == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const tsdb_header_t *h = &db->header;
+
+    // Index slots that hold a record: [0, written) in slot space.
+    uint32_t written = (h->max_records > 0 && h->total_records > h->max_records)
+                           ? h->max_records : h->total_records;
+    uint32_t entries = 0;
+    if (db->index_stale && h->index_stride > 0) {
+        entries = (written + h->index_stride - 1) / h->index_stride;
+        if (entries > h->index_entries) {
+            entries = h->index_entries;
+        }
+    }
+    size_t len = entries ? h->index_offset + entries * sizeof(tsdb_index_entry_t) : 0;
+
+    bool ok;
+    uint8_t *buf = (len > 0 && len <= TSDB_FOLD_MAX_BYTES) ? malloc(len) : NULL;
+    if (buf == NULL) {
+        if (entries) {
+            ESP_LOGW(TAG, "fold: index not rebuilt (%u bytes)", (unsigned) len);
+        }
+        fseek(db->file, 0, SEEK_SET);
+        ok = fwrite(h, sizeof(*h), 1, db->file) == 1;
+    } else {
+        // Header, the bytes between it and the index (V4 names region), and
+        // the index, as ONE contiguous write from offset 0. littlefs rewrites
+        // a file from the first modified block to EOF on the next seek or
+        // sync, and all of this sits in the first block: a second write to a
+        // different offset there would pay for a second whole-file rewrite.
+        fseek(db->file, 0, SEEK_SET);
+        size_t got = fread(buf, 1, len, db->file);
+        if (got < len) {
+            memset(buf + got, 0, len - got);
+        }
+        tsdb_rebuild_index_(db, buf, entries);
+        memcpy(buf, h, sizeof(*h));
+        fseek(db->file, 0, SEEK_SET);
+        ok = fwrite(buf, 1, len, db->file) == len;
+        free(buf);
+    }
+    // Checked, unlike tsdb_flush_and_sync(): on littlefs a full filesystem
+    // surfaces here (the rewrite is copy-on-write and needs free space the
+    // size of the file), and the sidecars must then be kept.
+    if (fflush(db->file) != 0 || fsync(fileno(db->file)) != 0) {
+        ok = false;
+    }
+    esp_err_t ret = ok ? ESP_OK : ESP_FAIL;
+    if (!ok) {
+        ESP_LOGE(TAG, "Failed to write header%s — keeping sidecars", entries ? " + index" : "");
+    }
+
+    if (ret == ESP_OK) {
+        db->in_file_header_stale = false;
+        db->index_stale = false;
+        // The file is self-contained again; stale sidecars must not outlive
+        // it (a later open would prefer one over this write).
+        tsdb_sidecar_remove(db->filepath);
+        db->side_dir_ready = false;
+        db->legacy_mirrored = false;
+        db->legacy_seq = 0;
+    }
+    return ret;
 }
 
 /**
@@ -562,6 +770,9 @@ tsdb_t *tsdb_open(const tsdb_config_t *config) {
     // before deciding whether the main file exists.
     tsdb_migrate_recover(config->filepath);
 
+    // Needed before the sidecar load below (it derives the slot paths).
+    strncpy(db->filepath, config->filepath, sizeof(db->filepath) - 1);
+
     // Check if file exists by trying to open it for read+write. stat() is
     // unreliable on esp_littlefs (joltwallet) — empirical test on 1.21.1
     // showed stat() returning ENOENT for files that fopen("rb") successfully
@@ -622,8 +833,9 @@ tsdb_t *tsdb_open(const tsdb_config_t *config) {
         // describe the same geometry.
         if (!needs_reconstruction && !torn_migration) {
             tsdb_header_t sidecar_header;
-            uint32_t sidecar_seq = 0;
-            if (tsdb_sidecar_load(config->filepath, &sidecar_header, &sidecar_seq) == ESP_OK) {
+            // Also positions db->sidecar_seq past every slot on disk, so
+            // subsequent sidecar writes still increase.
+            if (tsdb_sidecar_load(db, &db->header, &sidecar_header) == ESP_OK) {
                 if (sidecar_header.magic == TSDB_MAGIC && tsdb_header_is_sane(&sidecar_header) &&
                     sidecar_header.num_params == db->header.num_params &&
                     sidecar_header.records_per_block == db->header.records_per_block &&
@@ -632,14 +844,13 @@ tsdb_t *tsdb_open(const tsdb_config_t *config) {
                     ESP_LOGI(TAG, "sidecar is ahead of in-file header (%lu -> %lu records, seq %lu)",
                              (unsigned long) db->header.total_records,
                              (unsigned long) sidecar_header.total_records,
-                             (unsigned long) sidecar_seq);
+                             (unsigned long) db->sidecar_seq);
                     db->header = sidecar_header;
-                    db->sidecar_seq = sidecar_seq;
+                    // The in-file sparse index lags the same way.
+                    db->index_stale = true;
                 } else if (sidecar_header.total_records < db->header.total_records) {
                     // In-file is newer (e.g. a clean close after the last
-                    // sidecar write). Keep it, but carry the sequence forward
-                    // so subsequent sidecar writes still increase.
-                    db->sidecar_seq = sidecar_seq;
+                    // sidecar write). Keep it.
                 } else {
                     ESP_LOGW(TAG, "sidecar geometry mismatch — ignoring it");
                 }
@@ -840,6 +1051,10 @@ migration_done: ;
             tsdb_retire_handle(db);
             return NULL;
         }
+        // Sidecars left by a previous database at this path (deleted, or
+        // recreated after corruption) must not be adopted by a later open.
+        tsdb_sidecar_remove(config->filepath);
+        db->sidecar_seq = 0;
 
         // Initialize header. >16 params = V4 wide layout (extended names
         // region between the fixed header and an index at 2048).
@@ -977,12 +1192,13 @@ esp_err_t tsdb_close_h(tsdb_t *db) {
         db->cache_dirty = false;
     }
 
-    // Refresh the in-file header so a cleanly closed file is self-contained
-    // and readable by an unmodified esp_tsdb. Then drop the sidecar: keeping a
-    // stale one around risks a future open preferring it over this write.
-    tsdb_write_header(db->file, &db->header);
-    db->in_file_header_stale = false;
-    tsdb_sidecar_remove(db->filepath);
+    // Refresh the in-file header (and the sparse index, if writes skipped
+    // it) so a cleanly closed file is self-contained and readable by an
+    // unmodified esp_tsdb. On success that also drops the sidecars: keeping a
+    // stale one around risks a future open preferring it over this write. On
+    // failure (e.g. ENOSPC — the rewrite is copy-on-write) they stay, and the
+    // next open recovers from them.
+    tsdb_fold_header(db);
 
     // Close file
     fclose(db->file);
@@ -1017,13 +1233,11 @@ esp_err_t tsdb_sync_h(tsdb_t *db) {
     // the caller already holds the lock (e.g. sync after write on one task).
     TSDB_LOCK_OPEN_OR_RETURN(db, 30000, ESP_ERR_TIMEOUT);
 
-    // Explicit "make it durable" entry point, so fold the sidecar back into
-    // the file. The handle stays open and writes continue afterwards, so the
-    // sidecar is refreshed rather than removed.
-    if (db->in_file_header_stale) {
-        tsdb_write_header(db->file, &db->header);
-        db->in_file_header_stale = false;
-        tsdb_sidecar_write(db);
+    // Explicit "make it durable" entry point, so fold the sidecar (and any
+    // skipped index entries) back into the file. The next write recreates
+    // the sidecars.
+    if (db->in_file_header_stale || db->index_stale) {
+        tsdb_fold_header(db);
     }
 
     fflush(db->file);
@@ -1120,9 +1334,11 @@ esp_err_t tsdb_clear_h(tsdb_t *db) {
         fwrite(&zero_entry, sizeof(zero_entry), 1, db->file);
     }
 
-    // Write updated header
-    tsdb_write_header(db->file, &db->header);
-    tsdb_flush_and_sync(db->file);
+    // Write updated header. Through tsdb_fold_header so the sidecars go too:
+    // left in place, they still describe the pre-clear records and a reopen
+    // before the next write would adopt them.
+    db->index_stale = false;
+    tsdb_fold_header(db);
 
     ESP_LOGI(TAG, "Database cleared");
 

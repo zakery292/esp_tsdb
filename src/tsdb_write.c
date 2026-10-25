@@ -280,28 +280,18 @@ retry_write:
         db->header.oldest_timestamp = timestamp;
     }
 
-    // Update sparse index if at stride boundary. Bounds-guarded: after a
-    // tsdb_resize() grow, record_idx can exceed the capacity the index was
-    // sized for at creation — an unguarded write here would land PAST the
-    // preallocated index region, inside the first data blocks.
+    // Sparse index: mark it stale instead of writing the entry. The index
+    // sits in the first littlefs block of the file, and littlefs rewrites a
+    // file from the first modified block to EOF — so one 8-byte entry cost a
+    // whole-file copy every index_stride records (89 block erases at 370 KB,
+    // growing with the file; host_test/test_lfs_cost.c). Nothing reads the
+    // index since 2.1.0; tsdb_fold_header() rebuilds it on close/sync, as part
+    // of the header write that already rewrites that block. Bounds-guarded as
+    // before: after a tsdb_resize() grow, record_idx can exceed the capacity
+    // the index was sized for.
     if (record_idx % db->header.index_stride == 0 &&
         (record_idx / db->header.index_stride) < db->header.index_entries) {
-        uint32_t index_entry_num = record_idx / db->header.index_stride;
-        tsdb_index_entry_t entry = {
-            .timestamp = timestamp,
-            .block_number = block_num
-        };
-
-        uint32_t index_file_offset = db->header.index_offset +
-                                     (index_entry_num * sizeof(tsdb_index_entry_t));
-
-        fseek(db->file, index_file_offset, SEEK_SET);
-        fwrite(&entry, sizeof(tsdb_index_entry_t), 1, db->file);
-
-        ESP_LOGD(TAG, "Updated index entry %lu: timestamp=%lu, block=%lu",
-                 (unsigned long)index_entry_num,
-                 (unsigned long)timestamp,
-                 (unsigned long)block_num);
+        db->index_stale = true;
     }
 
     // Persist the header to the SIDECAR, not to offset 0 of this file.

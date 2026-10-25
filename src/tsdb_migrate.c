@@ -542,7 +542,9 @@ esp_err_t tsdb_resize_h(tsdb_t *db, uint32_t new_max_records,
     if (linear && covers && db->extra_param_count == 0) {
         uint32_t old_max = db->header.max_records;
         db->header.max_records = new_max_records;
-        esp_err_t ret = tsdb_write_header(db->file, &db->header);
+        // fold, not a bare header write: the sidecars carry the old
+        // max_records and would win on the next open.
+        esp_err_t ret = tsdb_fold_header(db);
         if (ret != ESP_OK) {
             db->header.max_records = old_max;   // keep RAM/disk consistent
         } else {
