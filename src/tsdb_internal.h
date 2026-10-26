@@ -11,6 +11,7 @@
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include <stdio.h>
+#include <stddef.h>
 
 // ============================================================================
 // FILE FORMAT STRUCTURES (internal only)
@@ -96,7 +97,43 @@ void tsdb_buffer_write(tsdb_buffer_pool_t *pool, size_t offset, const void *src,
 // 268 KB database. Crash recovery is verified on hardware: with the last clean
 // close two commits behind, power was pulled with no shutdown handler and both
 // commits came back, with no records lost or altered.
+//
+// 2.4.4: the per-record slots moved into a subdirectory, <db>.d/h0 and h1.
+// Measured on littlefs 2.11 (host_test/test_lfs_cost.c, the firmware's config
+// and file set): every writable fopen through esp_littlefs is a metadata
+// commit (it syncs right after open, and the mtime attribute marks the file
+// dirty), and so is every fsync. Writing a slot next to the database put two
+// commits per record into the ROOT directory's metadata pair, on top of the
+// data file's own fsync. That pair also holds every other file in the root
+// (configs, certificates, inlined small files), so each time it fills it is
+// compacted — O(tags^2) reads of the whole pair, ~1900 block-device reads.
+// In a private subdirectory the slot commits land in a pair holding two
+// entries, and root only takes the data file's one commit per record.
+//
+// The subdirectory slots are the compact TSH2 form: the mutable header fields
+// only (everything except param_names, which only schema migration changes,
+// and that rewrites the file). 88 bytes is small enough for littlefs to store
+// inline in the directory's metadata — no data block to allocate and erase
+// per record, unlike the 596-byte TSH1 slot.
+//
+// Older readers only know <db>.h0/.h1, so those are still written, as a
+// MIRROR: on the first write after open, then every
+// TSDB_SIDECAR_LEGACY_EVERY records. An older version opening the database
+// after an unclean shutdown therefore loses at most that many records — not
+// everything since the last clean close. Each TSH2 slot records the sequence
+// number of the last mirror it knows about (legacy_seq), which is how a newer
+// reader tells its own mirror from slots an older version wrote after a
+// downgrade: a legacy slot newer than legacy_seq wins.
 #define TSDB_SIDECAR_MAGIC 0x54534831u  /* "TSH1" */
+#define TSDB_SIDECAR2_MAGIC 0x54534832u /* "TSH2" */
+
+#ifndef TSDB_SIDECAR_LEGACY_EVERY
+#define TSDB_SIDECAR_LEGACY_EVERY 32
+#endif
+
+#define TSDB_HDR_PRE_LEN  (offsetof(tsdb_header_t, param_names))
+#define TSDB_HDR_POST_OFF (offsetof(tsdb_header_t, base_params))
+#define TSDB_HDR_POST_LEN (sizeof(tsdb_header_t) - TSDB_HDR_POST_OFF)
 
 typedef struct {
     uint32_t magic;
@@ -104,6 +141,15 @@ typedef struct {
     uint32_t header_crc;  // crc32 over `header` only — detects a torn write
     tsdb_header_t header;
 } tsdb_sidecar_t;
+
+typedef struct {
+    uint32_t magic;       // TSDB_SIDECAR2_MAGIC
+    uint32_t seq;         // shared sequence with the TSH1 mirror slots
+    uint32_t crc;         // crc32 over legacy_seq..end — detects a torn write
+    uint32_t legacy_seq;  // seq of the last TSH1 mirror this writer made, 0 = none
+    uint8_t  pre[TSDB_HDR_PRE_LEN];    // header bytes before param_names
+    uint8_t  post[TSDB_HDR_POST_LEN];  // header bytes after param_names
+} __attribute__((packed)) tsdb_sidecar2_t;
 
 struct tsdb_s {
     FILE *file;
@@ -141,6 +187,19 @@ struct tsdb_s {
     // slot alternates 0/1 so the previous one always survives a torn write.
     uint32_t sidecar_seq;
     uint8_t sidecar_slot;
+    // TSH1 mirror slots at <db>.h0/.h1 (see TSDB_SIDECAR_LEGACY_EVERY).
+    uint8_t legacy_slot;
+    uint32_t legacy_seq;      // seq of the newest valid TSH1 slot on disk
+    bool legacy_mirrored;     // a mirror has been written since open
+    bool side_dir_ready;      // mkdir(<db>.d) attempted since open
+
+    // Sparse-index entries are no longer written by tsdb_write_h: the index
+    // lives in the file's first littlefs block, so updating one entry
+    // rewrites the whole file (see tsdb_fold_header). They are rebuilt when
+    // the header is folded back into the file on close/sync. Nothing reads
+    // the index since 2.1.0. Set when a write lands on an index slot, or a
+    // sidecar was adopted at open.
+    bool index_stale;
 
     // Set for the duration of tsdb_migrate_schema_h(). Writers/queriers check
     // this BEFORE taking the mutex so they fail fast with
@@ -242,10 +301,18 @@ esp_err_t tsdb_write_header(FILE *file, const tsdb_header_t *header);
 
 // Sidecar header persistence — see TSDB_SIDECAR_MAGIC.
 esp_err_t tsdb_sidecar_write(tsdb_t *db);
-// Loads the newest valid sidecar slot into *out. ESP_ERR_NOT_FOUND if neither
-// slot is present/valid, in which case the caller keeps the in-file header.
-esp_err_t tsdb_sidecar_load(const char *filepath, tsdb_header_t *out, uint32_t *seq_out);
+// Picks the authoritative sidecar state (newest valid TSH2 slot, unless an
+// older version wrote a newer TSH1 slot) into *out, starting from `base` (the
+// in-file header — TSH2 slots do not carry param_names). ESP_ERR_NOT_FOUND if
+// no slot is usable, in which case the caller keeps the in-file header.
+// Always sets db->sidecar_seq / legacy_seq / slot state, so later writes
+// continue the sequence past every slot on disk.
+esp_err_t tsdb_sidecar_load(tsdb_t *db, const tsdb_header_t *base, tsdb_header_t *out);
 void tsdb_sidecar_remove(const char *filepath);
+// Writes the header to the file — together with the rebuilt sparse index when
+// db->index_stale, as one contiguous write — then drops the sidecars, which
+// are now redundant. Use wherever the in-file header is made current.
+esp_err_t tsdb_fold_header(tsdb_t *db);
 
 // Block operations (tsdb_write.c, tsdb_query.c)
 esp_err_t tsdb_read_block(tsdb_t *db, uint32_t block_num, tsdb_block_t *block);
