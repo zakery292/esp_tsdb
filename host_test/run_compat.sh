@@ -1,71 +1,56 @@
 #!/bin/bash
-# Cross-version compatibility: this tree ("new") against an older release
-# ("old", default v2.4.3), alternating on one database. "crash" = the process
-# exits with the database open, as a power cut would leave it.
+# Upgrade compatibility: databases written by the last 2.x releases (v2.4.3,
+# v2.4.4), opened by this tree. "crash" = the old version exits with the
+# database open, as a power cut would leave it: 2.4.3 keeps its newest state
+# in <db>.h0/.h1, 2.4.4 in <db>.d/h0,h1 (with a <db>.h0/.h1 mirror up to 31
+# records behind). Downgrading from 3.x is not supported and not tested.
 cd "$(dirname "$0")"
 ./build_compat.sh || exit 1
 DB=${COMPAT_DB:-/tmp/tsdb_compat_test.tsdb}
 NEW=./test_compat_new
-OLD=./test_compat_old
 fails=0
 
-clean() { rm -rf "$DB" "$DB.h0" "$DB.h1" "$DB.d" "$1" "$1.h0" "$1.h1" "$1.d"; }
-count() { "$1" "$DB" count | cut -d' ' -f1; }
-last()  { "$1" "$DB" count | cut -d' ' -f3; }
-ordered() { "$1" "$DB" count | cut -d' ' -f4; }
+clean() { rm -rf "$DB" "$DB.h0" "$DB.h1" "$DB.d" "$DB.mig" "$DB".s*; }
+field() { "$1" "$DB" count | cut -d' ' -f"$2"; }
 check() {   # label got want
   if [ "$2" = "$3" ]; then echo "  [PASS] $1: $2"; else echo "  [FAIL] $1: got $2, want $3"; fails=$((fails+1)); fi
 }
-next_ts() { echo $(( $(last "$1") + 1 )); }
+leftovers() { ls -d "$DB" "$DB.h0" "$DB.h1" "$DB.d" 2>/dev/null | wc -l; }
 
-echo "S1 upgrade after a clean close"
-clean; $OLD "$DB" write 100 1000 close
-check "new reads old's clean DB" "$(count $NEW)" 100
+for REF in ${COMPAT_REFS:-v2.4.3 v2.4.4}; do
+  OLD=./test_compat_$REF
+  echo "== from $REF"
 
-echo "S2 upgrade after an unclean shutdown (old's sidecar only)"
-clean; $OLD "$DB" write 100 1000 crash
-check "new adopts old's sidecar" "$(count $NEW)" 100
-$NEW "$DB" write 10 $(next_ts $NEW) crash
-check "new after its own crash" "$(count $NEW)" 110
+  echo "S1 clean close"
+  clean; $OLD "$DB" write 100 1000 close
+  check "count" "$(field $NEW 1)" 100
+  check "first..last" "$(field $NEW 2)..$(field $NEW 3)" "1000..1099"
 
-echo "S3 downgrade after an unclean shutdown"
-# The mirror was written on new's first write after open: old sees 101 of 110.
-check "old sees new's mirror" "$(count $OLD)" 101
-check "old view ordered" "$(ordered $OLD)" 1
+  echo "S2 unclean shutdown, ring not wrapped (40 records: 2.4.4's mirror holds 33)"
+  clean; $OLD "$DB" write 40 1000 crash
+  check "count" "$(field $NEW 1)" 40
+  check "last" "$(field $NEW 3)" 1039
+  check "ordered + values" "$(field $NEW 4)" 1
 
-echo "S4 ...old writes on, crashes, then upgrade again"
-$OLD "$DB" write 5 $(next_ts $OLD) crash
-check "old after its own crash" "$(count $OLD)" 106
-check "new prefers old's newer slot" "$(count $NEW)" 106
-check "new view ordered" "$(ordered $NEW)" 1
-$NEW "$DB" write 1 $(next_ts $NEW) crash
-check "new continues" "$(count $NEW)" 107
+  echo "S3 unclean shutdown across the wrap (350 into a ring of 300)"
+  clean; $OLD "$DB" write 350 1000 crash
+  check "count" "$(field $NEW 1)" 300
+  check "first..last" "$(field $NEW 2)..$(field $NEW 3)" "1050..1349"
+  check "ordered + values" "$(field $NEW 4)" 1
 
-echo "S5 old closes cleanly while new's subdirectory slots remain"
-clean; $NEW "$DB" write 40 1000 crash            # mirror after writes 1 and 33
-check "old sees mirror" "$(count $OLD)" 33
-$OLD "$DB" write 3 $(next_ts $OLD) close        # removes only <db>.h0/.h1
-check "new trusts old's clean close, not stale slots" "$(count $NEW)" 36
-check "new view ordered" "$(ordered $NEW)" 1
+  echo "S4 3.x writes on, crashes, reopens"
+  $NEW "$DB" write 50 1350 crash
+  check "count (capacity 300)" "$(field $NEW 1)" 300
+  check "first..last" "$(field $NEW 2)..$(field $NEW 3)" "1100..1399"
+  check "ordered + values" "$(field $NEW 4)" 1
 
-echo "S6 clean close produces the same file as the old version"
-clean "$DB.old"
-$OLD "$DB.old" write 350 1000 close
-$NEW "$DB" write 350 1000 close
-if cmp -s "$DB" "$DB.old"; then echo "  [PASS] byte-identical after 350 writes (ring of 300, wrapped)"; else echo "  [FAIL] files differ"; cmp "$DB" "$DB.old" | head -3; fails=$((fails+1)); fi
-check "no slots left" "$(ls -d "$DB".h0 "$DB".h1 "$DB".d 2>/dev/null | wc -l)" 0
-check "old reads new's clean DB" "$(count $OLD)" 300
+  echo "S5 once the window has passed the legacy records, its files are gone"
+  $NEW "$DB" write 300 1400 close
+  check "count" "$(field $NEW 1)" 300
+  check "first..last" "$(field $NEW 2)..$(field $NEW 3)" "1400..1699"
+  check "legacy file and sidecars (.h0 .h1 .d) left" "$(leftovers)" 0
+done
 
-echo "S7 new across the ring wrap with a crash"
-clean; $NEW "$DB" write 350 1000 crash
-check "new after crash, wrapped" "$(count $NEW)" 300
-check "ordered" "$(ordered $NEW)" 1
-# Old adopts the mirror (written at record 321): it opens, and sees all 300
-# slots. The up-to-31 records new wrote after the mirror sit in slots old
-# believes hold the OLDEST records, so its scan is out of order there until
-# old overwrites them — the bounded cost of a downgrade after a power cut.
-check "old after new crashed, wrapped" "$(count $OLD)" 300
-
-clean "$DB.old"
+clean
 [ $fails -eq 0 ] && echo "ALL PASS" || echo "$fails FAILED"
 exit $fails

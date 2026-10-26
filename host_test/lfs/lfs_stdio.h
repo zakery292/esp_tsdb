@@ -70,3 +70,16 @@ void hfs_reset_phases(void);
 
 // Direct helpers for the test (bypass stdio).
 int hfs_write_file(const char *path, const void *data, size_t len);
+
+// Free bytes on the filesystem (block_count - lfs_fs_size, in bytes). Not counted.
+int64_t hfs_free_bytes(void);
+// Sum of regular-file sizes in dir_path whose name starts with prefix. Not counted.
+int64_t hfs_tree_bytes(const char *dir_path, const char *prefix);
+// Fault injection: when >= 0, the block device fails every program after this
+// many more succeed (LFS_ERR_IO). -1 = off.
+extern int hfs_fail_progs_after;
+// Every LFS_ERR_NOSPC littlefs returned through the stdio mapping.
+extern uint64_t hfs_nospc;
+// Fault injection: the next N fsync() calls on littlefs files fail with EIO
+// without syncing.
+extern int hfs_fail_fsyncs;

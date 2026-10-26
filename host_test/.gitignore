@@ -15,7 +15,10 @@ build_common.sh.swp
 !fixtures/*.h1
 test_lfs_cost
 test_compat_new
-test_compat_old
+test_compat_v2.4.*
 .compat_old/
 .littlefs/
 .lfs_build/
+.legacy_gen/
+test_lfs_upgrade
+.littlefs

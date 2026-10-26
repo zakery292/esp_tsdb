@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 hfs_counters_t hfs_ctr;
+int hfs_fail_fsyncs;
 bool hfs_counting = true;
 hfs_phase_t hfs_phases[HFS_MAX_PHASES];
 int hfs_nphases;
@@ -45,6 +46,7 @@ void hfs_reset_phases(void) {
 static const char *path_class(const char *p) {
     size_t n = strlen(p);
     if (strstr(p, ".tsdb.h") != NULL || strstr(p, ".tsdb.d") != NULL) return "side";
+    if (strstr(p, ".tsdb.s") != NULL) return "seg";
     if (n >= 5 && strcmp(p + n - 5, ".tsdb") == 0) return "data";
     if (strstr(p, ".mig") != NULL) return "mig";
     return "other";
@@ -119,7 +121,10 @@ static int bd_read(const struct lfs_config *c, lfs_block_t b, lfs_off_t off, voi
     BUMP(read_bytes, sz);
     return 0;
 }
+extern int hfs_fail_progs_after;
 static int bd_prog(const struct lfs_config *c, lfs_block_t b, lfs_off_t off, const void *buf, lfs_size_t sz) {
+    if (hfs_fail_progs_after == 0) return LFS_ERR_IO;          // injected device failure
+    if (hfs_fail_progs_after > 0) hfs_fail_progs_after--;
     uint8_t *dst = g_ram + (size_t) b * c->block_size + off;
     for (lfs_size_t i = 0; i < sz; i++) dst[i] &= ((const uint8_t *) buf)[i];  // NOR semantics
     BUMP(progs, 1);
@@ -189,7 +194,12 @@ void hfs_unmount(void) {
     g_mounted = false;
 }
 
+static void detach_open_files(void);
 int hfs_remount(void) {
+    // Every FILE still open belongs to the "previous boot": detach them so
+    // later stdio calls on them (glibc flushes streams at exit) cannot reach
+    // the new mount.
+    detach_open_files();
     hfs_unmount();
     int err = lfs_mount(&g_lfs, &g_cfg);
     g_mounted = (err == 0);
@@ -213,11 +223,18 @@ typedef struct hfs_file {
     int fd;
     FILE *fp;
     bool writable;
+    bool dead;                  // abandoned by hfs_remount (a power cut)
 } hfs_file_t;
 
 #define HFS_MAX_FILES 16
 #define HFS_FD_BASE 0x4000
 static hfs_file_t *g_files[HFS_MAX_FILES];
+
+static void detach_open_files(void) {
+    for (int i = 0; i < HFS_MAX_FILES; i++) {
+        if (g_files[i] != NULL) { g_files[i]->dead = true; g_files[i] = NULL; }
+    }
+}
 
 static const char *lfs_path(const char *p) {
     size_t n = strlen(HFS_MOUNT);
@@ -227,7 +244,10 @@ static const char *lfs_path(const char *p) {
     return NULL;
 }
 
+uint64_t hfs_nospc;
+
 static int lfs_to_errno(int e) {
+    if (e == LFS_ERR_NOSPC) hfs_nospc++;
     switch (e) {
         case LFS_ERR_NOENT: return ENOENT;
         case LFS_ERR_EXIST: return EEXIST;
@@ -250,6 +270,7 @@ static int esp_sync(hfs_file_t *h) {
 
 static ssize_t ck_read(void *ck, char *buf, size_t size) {
     hfs_file_t *h = ck;
+    if (h->dead) { errno = EIO; return -1; }
     int prev = phase_begin("read", h->path);
     lfs_ssize_t r = lfs_file_read(&g_lfs, &h->file, buf, size);
     phase_end(prev);
@@ -259,6 +280,7 @@ static ssize_t ck_read(void *ck, char *buf, size_t size) {
 
 static ssize_t ck_write(void *ck, const char *buf, size_t size) {
     hfs_file_t *h = ck;
+    if (h->dead) { errno = EIO; return 0; }
     int prev = phase_begin("write", h->path);
     lfs_ssize_t r = lfs_file_write(&g_lfs, &h->file, buf, size);
     phase_end(prev);
@@ -268,6 +290,7 @@ static ssize_t ck_write(void *ck, const char *buf, size_t size) {
 
 static int ck_seek(void *ck, off64_t *pos, int whence) {
     hfs_file_t *h = ck;
+    if (h->dead) { errno = EIO; return -1; }
     int lw = whence == SEEK_SET ? LFS_SEEK_SET : whence == SEEK_CUR ? LFS_SEEK_CUR : LFS_SEEK_END;
     int prev = phase_begin("seek", h->path);
     lfs_soff_t r = lfs_file_seek(&g_lfs, &h->file, (lfs_soff_t) *pos, lw);
@@ -279,6 +302,7 @@ static int ck_seek(void *ck, off64_t *pos, int whence) {
 
 static int ck_close(void *ck) {
     hfs_file_t *h = ck;
+    if (h->dead) { free(h->cache); free(h); return 0; }
     int prev = phase_begin("close", h->path);
     if (g_hcfg.mtime && h->writable) h->mtime = (int64_t) time(NULL);
     int r = lfs_file_close(&g_lfs, &h->file);
@@ -365,6 +389,7 @@ int __wrap_fsync(int fd) {
     int i = fd - HFS_FD_BASE;
     if (i < 0 || i >= HFS_MAX_FILES || g_files[i] == NULL) return __real_fsync(fd);
     hfs_file_t *h = g_files[i];
+    if (hfs_fail_fsyncs > 0) { hfs_fail_fsyncs--; errno = EIO; return -1; }   // injected
     int prev = phase_begin("fsync", h->path);
     int r = esp_sync(h);
     phase_end(prev);
@@ -440,3 +465,126 @@ int hfs_write_file(const char *path, const void *data, size_t len) {
     fclose(f);
     return n == len ? 0 : -1;
 }
+
+// ---------------------------------------------------------------------------
+// Directories (3.x scans for segment files) and truncate
+// ---------------------------------------------------------------------------
+
+#include <dirent.h>
+
+typedef struct {
+    lfs_dir_t dir;
+    struct dirent ent;
+    char path[192];
+} hfs_dir_t;
+
+#define HFS_MAX_DIRS 4
+static hfs_dir_t *g_dirs[HFS_MAX_DIRS];
+
+static int dir_slot(const void *p) {
+    for (int i = 0; i < HFS_MAX_DIRS; i++) if (g_dirs[i] != NULL && (const void *) g_dirs[i] == p) return i;
+    return -1;
+}
+
+DIR *__real_opendir(const char *path);
+DIR *__wrap_opendir(const char *path) {
+    const char *lp = lfs_path(path);
+    if (lp == NULL) return __real_opendir(path);
+    int slot = -1;
+    for (int i = 0; i < HFS_MAX_DIRS; i++) if (g_dirs[i] == NULL) { slot = i; break; }
+    if (slot < 0) { errno = EMFILE; return NULL; }
+    hfs_dir_t *d = calloc(1, sizeof(*d));
+    snprintf(d->path, sizeof(d->path), "%s", path);
+    int prev = phase_begin("opendir", path);
+    int r = lfs_dir_open(&g_lfs, &d->dir, lp);
+    phase_end(prev);
+    if (r < 0) { free(d); errno = lfs_to_errno(r); return NULL; }
+    g_dirs[slot] = d;
+    return (DIR *) d;
+}
+
+struct dirent *__real_readdir(DIR *dp);
+struct dirent *__wrap_readdir(DIR *dp) {
+    int slot = dir_slot(dp);
+    if (slot < 0) return __real_readdir(dp);
+    hfs_dir_t *d = g_dirs[slot];
+    struct lfs_info info;
+    int prev = phase_begin("readdir", d->path);
+    for (;;) {
+        int r = lfs_dir_read(&g_lfs, &d->dir, &info);
+        if (r <= 0) { phase_end(prev); return NULL; }
+        if (strcmp(info.name, ".") == 0 || strcmp(info.name, "..") == 0) continue;
+        break;
+    }
+    phase_end(prev);
+    memset(&d->ent, 0, sizeof(d->ent));
+    snprintf(d->ent.d_name, sizeof(d->ent.d_name), "%s", info.name);
+    d->ent.d_type = info.type == LFS_TYPE_DIR ? DT_DIR : DT_REG;
+    return &d->ent;
+}
+
+int __real_closedir(DIR *dp);
+int __wrap_closedir(DIR *dp) {
+    int slot = dir_slot(dp);
+    if (slot < 0) return __real_closedir(dp);
+    hfs_dir_t *d = g_dirs[slot];
+    lfs_dir_close(&g_lfs, &d->dir);
+    g_dirs[slot] = NULL;
+    free(d);
+    return 0;
+}
+
+// esp_littlefs vfs_littlefs_truncate(): open, lfs_file_truncate, close.
+int __real_truncate(const char *path, off_t len);
+int __wrap_truncate(const char *path, off_t len) {
+    const char *lp = lfs_path(path);
+    if (lp == NULL) return __real_truncate(path, len);
+    int prev = phase_begin("truncate", path);
+    lfs_file_t f;
+    int r = lfs_file_open(&g_lfs, &f, lp, LFS_O_RDWR);
+    if (r == 0) {
+        r = lfs_file_truncate(&g_lfs, &f, (lfs_off_t) len);
+        int c = lfs_file_close(&g_lfs, &f);
+        if (r == 0) r = c;
+    }
+    phase_end(prev);
+    if (r < 0) { errno = lfs_to_errno(r); return -1; }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Free space and fault injection
+// ---------------------------------------------------------------------------
+
+int64_t hfs_free_bytes(void) {
+    bool was = hfs_counting;
+    hfs_counting = false;
+    lfs_ssize_t used = lfs_fs_size(&g_lfs);
+    hfs_counting = was;
+    if (used < 0) return -1;
+    return ((int64_t) g_cfg.block_count - used) * g_cfg.block_size;
+}
+
+int64_t hfs_tree_bytes(const char *dir_path, const char *prefix) {
+    // Sum of file sizes under dir_path whose name starts with prefix.
+    const char *lp = lfs_path(dir_path);
+    if (lp == NULL) return -1;
+    bool was = hfs_counting;
+    hfs_counting = false;
+    lfs_dir_t d;
+    int64_t total = 0;
+    if (lfs_dir_open(&g_lfs, &d, lp) == 0) {
+        struct lfs_info info;
+        while (lfs_dir_read(&g_lfs, &d, &info) > 0) {
+            if (info.type == LFS_TYPE_REG && strncmp(info.name, prefix, strlen(prefix)) == 0) {
+                total += info.size;
+            }
+        }
+        lfs_dir_close(&g_lfs, &d);
+    }
+    hfs_counting = was;
+    return total;
+}
+
+int hfs_fail_progs_after = -1;
+
