@@ -250,8 +250,10 @@ esp_err_t tsdb_write_batch_h(tsdb_t *db, const uint32_t *timestamps,
 
     esp_err_t ret = ESP_OK;
     uint32_t done = 0;
+    // Last point at which everything counted in the active segment was on
+    // disk (the write cache clean).
+    uint32_t committed_seq = db->nsegs ? db->segs[db->nsegs - 1].seq : UINT32_MAX;
     uint32_t committed_records = db->nsegs ? db->segs[db->nsegs - 1].records : 0;
-    uint32_t committed_physical = db->total_physical;
     uint32_t committed_last_ts = db->nsegs ? db->segs[db->nsegs - 1].last_ts : 0;
 
     for (uint32_t i = 0; i < count; i++) {
@@ -263,25 +265,30 @@ esp_err_t tsdb_write_batch_h(tsdb_t *db, const uint32_t *timestamps,
         }
         done++;
         if (!db->cache_dirty) {
+            committed_seq = db->segs[db->nsegs - 1].seq;
             committed_records = db->segs[db->nsegs - 1].records;
-            committed_physical = db->total_physical;
             committed_last_ts = db->segs[db->nsegs - 1].last_ts;
         }
     }
 
     if (db->cache_dirty) {
         esp_err_t fr = tsdb_write_cache_flush(db);
-        if (fr != ESP_OK) {
-            // The unflushed block's records never reached disk: forget them.
-            tsdb_seg_t *a = &db->segs[db->nsegs - 1];
-            ESP_LOGE(TAG, "Batch final flush failed — dropping %lu unflushed records",
-                     (unsigned long)(a->records - committed_records));
-            a->records = committed_records;
-            a->last_ts = committed_last_ts;
-            db->total_physical = committed_physical;
-            tsdb_apply_capacity(db);
-            if (ret == ESP_OK) ret = fr;
-        }
+        if (ret == ESP_OK) ret = fr;
+    }
+    if (ret != ESP_OK && db->nsegs > 0 && db->segs[db->nsegs - 1].seq == committed_seq &&
+        db->segs[db->nsegs - 1].records > committed_records) {
+        // A deferred block that failed to flush (here or mid-batch, when the
+        // batch moved to the next block) took its records with it: forget
+        // them, so the table only counts what reached disk. Records of it
+        // that did land are overwritten by the next write.
+        tsdb_seg_t *a = &db->segs[db->nsegs - 1];
+        uint32_t lost = a->records - committed_records;
+        ESP_LOGE(TAG, "Batch: dropping %lu records that did not reach disk", (unsigned long) lost);
+        a->records = committed_records;
+        a->last_ts = committed_last_ts;
+        db->total_physical -= lost;
+        tsdb_write_cache_invalidate(db);
+        tsdb_apply_capacity(db);
     }
 
     tsdb_unlock(db);

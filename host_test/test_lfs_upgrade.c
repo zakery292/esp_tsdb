@@ -605,7 +605,8 @@ static uint32_t write_n(tsdb_t *db, uint32_t ts, uint32_t n) {
 }
 
 static void fault_case(const char *label, int mode) {
-    // mode 0: fsync fails; 1: device program failure; 2: ENOSPC with nothing to evict
+    // mode 0: fsync fails; 1: device program failure; 2: ENOSPC with nothing
+    // to evict; 3: fsync fails in a batch, when it moves to the next block
     opts_t o = {.fs_blocks = 64, .other_kb = 24};
     mount_fs(&o);
     tsdb_config_t cfg = small_config(20000);
@@ -618,6 +619,17 @@ static void fault_case(const char *label, int mode) {
         hfs_fail_fsyncs = 1;
         e = tsdb_write_h(db, ts, v);
         hfs_fail_fsyncs = 0;
+    } else if (mode == 3) {
+        // 100 records fill 1 block + 44 of the next; the batch tops that
+        // block up in RAM and flushes it when it moves on, at record 12.
+        static uint32_t tss[40];
+        static int16_t rows[40][NPARAM];
+        const int16_t *vals[40];
+        for (int i = 0; i < 40; i++) { tss[i] = ts + i * 60; fill(rows[i], tss[i]); vals[i] = rows[i]; }
+        hfs_fail_fsyncs = 1;
+        e = tsdb_write_batch_h(db, tss, vals, 40);
+        hfs_fail_fsyncs = 0;
+        ts += 40 * 60;
     } else if (mode == 1) {
         hfs_fail_progs_after = 0;
         e = tsdb_write_h(db, ts, v);
@@ -644,6 +656,9 @@ static void fault_case(const char *label, int mode) {
     CHECK(e != ESP_OK, "%s: tsdb_write returns the failure (got %d)", label, e);
     tsdb_stats_t sb;
     tsdb_get_stats_h(db, &sb);
+    scan_t s0 = scan(db);
+    CHECK(sb.total_records == s0.n && s0.ordered && s0.values,
+          "%s: the database counts only what a scan finds (stats %u, scan %u)", label, sb.total_records, s0.n);
     ts += 60;
     ts = write_n(db, ts, 30);
     tsdb_stats_t sm;
@@ -739,6 +754,7 @@ static int run_faults(void) {
     fault_case("fsync failure", 0);
     fault_case("device program failure", 1);
     fault_case("ENOSPC, nothing to evict", 2);
+    fault_case("batch, fsync failure mid-batch", 3);
     fault_legacy_migration();
     return 0;
 }
