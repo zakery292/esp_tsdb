@@ -150,13 +150,16 @@ typedef struct {
     uint16_t overflow_record_size;
 } tsdb_legacy_t;
 
-// Opens <path> if it is a pre-3.0 database. ESP_ERR_NOT_FOUND if absent;
-// ESP_FAIL if present but unusable (it is then removed so the next open is
-// clean). Performs the pre-3.0 recovery steps (sidecar adoption, header
-// reconstruction, V2->V3 block layout migration, .mig adoption).
+// Opens <path> if it is a pre-3.0 database, read-only. ESP_ERR_NOT_FOUND if
+// absent; ESP_ERR_INVALID_RESPONSE if present but unusable (it is then
+// removed so the next open is clean); any other error (I/O failure while
+// converting a V2 file, out of memory) is the caller's to report — the file
+// is left in place. Performs the pre-3.0 recovery steps (sidecar adoption
+// incl. 2.4.4's <path>.d/ slots, header reconstruction, V2->V3 block layout
+// migration, .mig adoption).
 esp_err_t tsdb_legacy_open(const char *path, const tsdb_config_t *config, tsdb_legacy_t **out);
 void tsdb_legacy_close(tsdb_legacy_t *l);
-// Unlinks the file, its sidecars and any .mig leftover.
+// Unlinks the file, its sidecars (<path>.h0/.h1, <path>.d/) and any .mig leftover.
 void tsdb_legacy_remove(const char *path);
 uint8_t tsdb_legacy_columns(const tsdb_legacy_t *l);
 // Column name (base, V4 extended or overflow) into out[TSDB_NAME_LEN].

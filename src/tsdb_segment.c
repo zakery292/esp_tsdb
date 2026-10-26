@@ -566,7 +566,7 @@ esp_err_t tsdb_disk_usage(const char *filepath, uint64_t *bytes) {
     split_path(filepath, s->dir, sizeof(s->dir), s->base, sizeof(s->base));
     uint64_t total = 0;
     struct stat st;
-    static const char *const legacy_suffix[] = { "", ".h0", ".h1", ".mig" };
+    static const char *const legacy_suffix[] = { "", ".h0", ".h1", ".d/h0", ".d/h1", ".mig" };
     for (size_t i = 0; i < sizeof(legacy_suffix) / sizeof(legacy_suffix[0]); i++) {
         snprintf(s->p, sizeof(s->p), "%s%s", filepath, legacy_suffix[i]);
         if (stat(s->p, &st) == 0) total += (uint64_t) st.st_size;

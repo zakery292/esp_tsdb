@@ -550,7 +550,8 @@ esp_err_t tsdb_remove(const char *filepath);
 /**
  * @brief On-disk size of a database without opening it (path-level)
  *
- * Sums the legacy file, its sidecars and every segment file at @p filepath.
+ * Sums the legacy file, its sidecars (incl. 2.4.4's <path>.d/ slots) and
+ * every segment file at @p filepath.
  * Lets a caller that sizes the capacity from free space add the database's
  * own bytes back in before tsdb_open(); 3.0 applies the configured
  * max_records at every open.

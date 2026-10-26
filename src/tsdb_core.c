@@ -216,6 +216,14 @@ tsdb_t *tsdb_open(const tsdb_config_t *config) {
     // ---- 1. Legacy single file (pre-3.0) becomes segment 0, read-only.
     tsdb_legacy_t *legacy = NULL;
     esp_err_t lr = tsdb_legacy_open(config->filepath, config, &legacy);
+    if (lr != ESP_OK && lr != ESP_ERR_NOT_FOUND && lr != ESP_ERR_INVALID_RESPONSE) {
+        // The legacy file exists and could not be adopted (I/O error while
+        // converting it, out of memory): fail the open rather than start a
+        // new database beside it and report success.
+        ESP_LOGE(TAG, "Cannot adopt the pre-3.0 database at %s (%d)", config->filepath, lr);
+        teardown(db);
+        return NULL;
+    }
     if (lr == ESP_OK) {
         if (legacy->available > 0) {
             tsdb_seg_t seg;

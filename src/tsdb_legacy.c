@@ -61,11 +61,11 @@ static esp_err_t read_header(FILE *file, tsdb_header_t *header) {
 }
 
 static esp_err_t write_header(FILE *file, const tsdb_header_t *header) {
-    fseek(file, 0, SEEK_SET);
+    if (fseek(file, 0, SEEK_SET) != 0) return ESP_FAIL;
     size_t written = fwrite(header, sizeof(tsdb_header_t), 1, file);
-    fflush(file);
-    fsync(fileno(file));
-    return written == 1 ? ESP_OK : ESP_FAIL;
+    int fl = fflush(file);
+    int fs = fsync(fileno(file));
+    return (written == 1 && fl == 0 && fs == 0) ? ESP_OK : ESP_FAIL;
 }
 
 static uint32_t data_offset_of(const tsdb_header_t *h) {
@@ -73,10 +73,20 @@ static uint32_t data_offset_of(const tsdb_header_t *h) {
 }
 
 // ---------------------------------------------------------------------------
-// Sidecar header (2.4+): <path>.h0 / <path>.h1 = {magic, seq, crc32, header}
+// Sidecar headers
+//
+// 2.4.0-2.4.3 wrote the whole header to one of two alternating slots,
+// <path>.h0 / <path>.h1 = {"TSH1", seq, crc32, header}, on every record.
+// 2.4.4 writes a compact slot (the mutable header fields only) to
+// <path>.d/h0 / <path>.d/h1 = {"TSH2", seq, crc32, legacy_seq, ...} on every
+// record, and the TSH1 slots only as a mirror every 32 records — so after an
+// unclean shutdown under 2.4.4 the TSH1 slots can be up to 31 records behind,
+// and the TSH2 slots hold the real state. The selection below is 2.4.4's
+// tsdb_sidecar_load(), read-only.
 // ---------------------------------------------------------------------------
 
-#define TSDB_SIDECAR_MAGIC 0x54534831u  /* "TSH1" */
+#define TSDB_SIDECAR_MAGIC  0x54534831u  /* "TSH1" */
+#define TSDB_SIDECAR2_MAGIC 0x54534832u  /* "TSH2" */
 
 typedef struct {
     uint32_t magic;
@@ -84,6 +94,19 @@ typedef struct {
     uint32_t header_crc;
     tsdb_header_t header;
 } tsdb_sidecar_t;
+
+#define TSDB_HDR_PRE_LEN  (offsetof(tsdb_header_t, param_names))
+#define TSDB_HDR_POST_OFF (offsetof(tsdb_header_t, base_params))
+#define TSDB_HDR_POST_LEN (sizeof(tsdb_header_t) - TSDB_HDR_POST_OFF)
+
+typedef struct {
+    uint32_t magic;       // TSDB_SIDECAR2_MAGIC
+    uint32_t seq;         // shared sequence with the TSH1 mirror slots
+    uint32_t crc;         // crc32 over legacy_seq..end
+    uint32_t legacy_seq;  // seq of the last TSH1 mirror its writer made, 0 = none
+    uint8_t  pre[TSDB_HDR_PRE_LEN];
+    uint8_t  post[TSDB_HDR_POST_LEN];
+} __attribute__((packed)) tsdb_sidecar2_t;
 
 static uint32_t crc32_(const void *data, size_t len) {
     const uint8_t *p = (const uint8_t *) data;
@@ -97,38 +120,83 @@ static uint32_t crc32_(const void *data, size_t len) {
     return ~crc;
 }
 
-// Heap, not stack, for the ~600-byte sidecar: open runs on whatever task
-// the caller has (a 4.6 KB main task on the dongle firmware).
-static esp_err_t sidecar_load(const char *filepath, tsdb_header_t *out) {
-    tsdb_sidecar_t *sc = malloc(sizeof(*sc));
+// The authoritative sidecar state, starting from `base` (the in-file header:
+// TSH2 slots do not carry param_names). Heap, not stack, for the slots: open
+// runs on whatever task the caller has (a 4.6 KB main task on the dongle).
+static esp_err_t sidecar_load(const char *filepath, const tsdb_header_t *base, tsdb_header_t *out) {
+    typedef struct { tsdb_sidecar_t s1; tsdb_sidecar2_t s2, best2; char path[160]; } scratch_t;
+    scratch_t *sc = malloc(sizeof(*sc));
     if (sc == NULL) return ESP_ERR_NO_MEM;
-    bool found = false;
-    uint32_t best_seq = 0;
+
+    bool found_r = false, found_d = false;
+    uint32_t seq_r = 0, seq_d = 0;
     for (uint8_t slot = 0; slot < 2; slot++) {
-        char path[160];
-        snprintf(path, sizeof(path), "%s.h%u", filepath, (unsigned) slot);
-        FILE *f = fopen(path, "rb");
+        snprintf(sc->path, sizeof(sc->path), "%s.h%u", filepath, (unsigned) slot);
+        FILE *f = fopen(sc->path, "rb");
         if (f == NULL) continue;
-        size_t n = fread(sc, sizeof(*sc), 1, f);
+        size_t n = fread(&sc->s1, sizeof(sc->s1), 1, f);
         fclose(f);
-        if (n != 1 || sc->magic != TSDB_SIDECAR_MAGIC) continue;
-        if (crc32_(&sc->header, sizeof(sc->header)) != sc->header_crc) {
+        if (n != 1 || sc->s1.magic != TSDB_SIDECAR_MAGIC) continue;
+        if (crc32_(&sc->s1.header, sizeof(sc->s1.header)) != sc->s1.header_crc) {
             ESP_LOGW(TAG, "sidecar slot %u CRC mismatch — ignoring", (unsigned) slot);
             continue;
         }
-        if (!found || sc->seq > best_seq) {
-            found = true;
-            best_seq = sc->seq;
-            *out = sc->header;
+        if (!found_r || sc->s1.seq > seq_r) {
+            found_r = true;
+            seq_r = sc->s1.seq;
+            *out = sc->s1.header;               // provisional; TSH2 may win below
         }
     }
+    for (uint8_t slot = 0; slot < 2; slot++) {
+        snprintf(sc->path, sizeof(sc->path), "%s.d/h%u", filepath, (unsigned) slot);
+        FILE *f = fopen(sc->path, "rb");
+        if (f == NULL) continue;
+        size_t n = fread(&sc->s2, sizeof(sc->s2), 1, f);
+        fclose(f);
+        if (n != 1 || sc->s2.magic != TSDB_SIDECAR2_MAGIC) continue;
+        if (crc32_(&sc->s2.legacy_seq, sizeof(sc->s2) - offsetof(tsdb_sidecar2_t, legacy_seq)) != sc->s2.crc) {
+            ESP_LOGW(TAG, "sidecar slot d%u CRC mismatch — ignoring", (unsigned) slot);
+            continue;
+        }
+        if (!found_d || sc->s2.seq > seq_d) {
+            found_d = true;
+            seq_d = sc->s2.seq;
+            sc->best2 = sc->s2;
+        }
+    }
+
+    // TSH2 is authoritative unless a TSH1 slot is newer than the last mirror
+    // its writer knew of (an older version wrote after a downgrade). A TSH2
+    // slot that references a mirror which is gone means an older version
+    // closed the database cleanly: the in-file header is newer than both.
+    bool use_d = false;
+    if (found_d) {
+        use_d = found_r ? (seq_r <= sc->best2.legacy_seq) : (sc->best2.legacy_seq == 0);
+    }
+    esp_err_t ret = ESP_ERR_NOT_FOUND;
+    if (use_d) {
+        *out = *base;
+        memcpy(out, sc->best2.pre, TSDB_HDR_PRE_LEN);
+        memcpy((uint8_t *) out + TSDB_HDR_POST_OFF, sc->best2.post, TSDB_HDR_POST_LEN);
+        ret = ESP_OK;
+    } else if (found_r) {
+        ret = ESP_OK;
+    }
     free(sc);
-    return found ? ESP_OK : ESP_ERR_NOT_FOUND;
+    return ret;
 }
 
 static void sidecar_remove(const char *filepath) {
+    char path[160];
+    // Subdirectory first (2.4.4's order): if this is interrupted, what is
+    // left is a TSH1 slot, which the next open handles as before.
     for (uint8_t slot = 0; slot < 2; slot++) {
-        char path[160];
+        snprintf(path, sizeof(path), "%s.d/h%u", filepath, (unsigned) slot);
+        unlink(path);
+    }
+    snprintf(path, sizeof(path), "%s.d", filepath);
+    rmdir(path);
+    for (uint8_t slot = 0; slot < 2; slot++) {
         snprintf(path, sizeof(path), "%s.h%u", filepath, (unsigned) slot);
         unlink(path);
     }
@@ -290,12 +358,20 @@ static esp_err_t migrate_v2_blocks(tsdb_legacy_t *l) {
         return ESP_ERR_NO_MEM;
     }
 
-    // Sentinel: version 99 while blocks are mixed; a crash here makes the
-    // next open discard the file.
+    // Sentinel: version 99 while blocks are mixed; a crash (or a failed
+    // write below) makes the next open discard the file.
+    uint32_t version = h->version;
     h->version = 99;
-    write_header(l->file, h);
+    esp_err_t ret = write_header(l->file, h);
+    if (ret != ESP_OK) {
+        // Nothing converted yet: the file is as it was, retry next boot.
+        h->version = version;
+        free(disk_block); free(new_block);
+        ESP_LOGE(TAG, "V2->V3 migration: sentinel write failed — will retry next boot");
+        return ret;
+    }
 
-    for (uint32_t b = 0; b < total_blocks; b++) {
+    for (uint32_t b = 0; b < total_blocks && ret == ESP_OK; b++) {
         uint32_t off = tsdb_legacy_block_offset(l, b);
         fseek(l->file, off, SEEK_SET);
         if (fread(disk_block, TSDB_BLOCK_SIZE, 1, l->file) != 1) continue;
@@ -313,17 +389,23 @@ static esp_err_t migrate_v2_blocks(tsdb_legacy_t *l) {
                 TSDB_BLOCK_PARAM(new_block, rpb, p, r) = val;
             }
         }
-        fseek(l->file, off, SEEK_SET);
-        fwrite(new_block, TSDB_BLOCK_SIZE, 1, l->file);
+        if (fseek(l->file, off, SEEK_SET) != 0 || fwrite(new_block, TSDB_BLOCK_SIZE, 1, l->file) != 1) {
+            ret = ESP_FAIL;
+        }
     }
     #undef OLD_TS_OFFSET
     #undef OLD_PARAM_OFFSET
     free(disk_block);
     free(new_block);
-    fflush(l->file);
-    fsync(fileno(l->file));
-    h->version = 3;
-    write_header(l->file, h);
+    if (ret == ESP_OK && (fflush(l->file) != 0 || fsync(fileno(l->file)) != 0)) ret = ESP_FAIL;
+    if (ret == ESP_OK) {
+        h->version = 3;
+        ret = write_header(l->file, h);
+    }
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "V2->V3 block layout migration failed writing the file");
+        return ret;
+    }
     ESP_LOGI(TAG, "V2->V3 block layout migration complete (%lu blocks)", (unsigned long) total_blocks);
     return ESP_OK;
 }
@@ -350,7 +432,11 @@ esp_err_t tsdb_legacy_open(const char *path, const tsdb_config_t *config, tsdb_l
     *out = NULL;
     migrate_recover(path);
 
-    FILE *f = fopen(path, "r+b");
+    // Read-only: 3.0 never writes to the adopted file (a writable open is a
+    // metadata commit on esp_littlefs, and an in-place write rewrites the
+    // file from that point to its end). The one exception, the V2->V3
+    // block conversion below, reopens it for writing.
+    FILE *f = fopen(path, "rb");
     if (f == NULL) {
         return ESP_ERR_NOT_FOUND;
     }
@@ -371,7 +457,7 @@ esp_err_t tsdb_legacy_open(const char *path, const tsdb_config_t *config, tsdb_l
         ESP_LOGE(TAG, "Legacy file %s: torn V2->V3 migration — discarding", path);
         tsdb_legacy_close(l);
         tsdb_legacy_remove(path);
-        return ESP_FAIL;
+        return ESP_ERR_INVALID_RESPONSE;
     } else if (!header_is_sane(&l->header)) {
         ESP_LOGW(TAG, "Legacy file %s: header fields implausible — reconstructing", path);
         needs_reconstruction = true;
@@ -381,7 +467,7 @@ esp_err_t tsdb_legacy_open(const char *path, const tsdb_config_t *config, tsdb_l
         // A sidecar that is valid, geometrically identical and ahead of the
         // in-file header holds the records an unclean shutdown would lose.
         tsdb_header_t *sc = malloc(sizeof(*sc));
-        if (sc != NULL && sidecar_load(path, sc) == ESP_OK) {
+        if (sc != NULL && sidecar_load(path, &l->header, sc) == ESP_OK) {
             if (sc->magic == TSDB_MAGIC && header_is_sane(sc) &&
                 sc->num_params == l->header.num_params &&
                 sc->records_per_block == l->header.records_per_block &&
@@ -396,14 +482,20 @@ esp_err_t tsdb_legacy_open(const char *path, const tsdb_config_t *config, tsdb_l
     } else {
         fseek(f, 0, SEEK_END);
         long size = ftell(f);
-        if (size < 512 || reconstruct_header(f, &l->header, config) != ESP_OK) {
+        esp_err_t rr = size < 512 ? ESP_FAIL : reconstruct_header(f, &l->header, config);
+        if (rr == ESP_ERR_NO_MEM) {
+            tsdb_legacy_close(l);
+            return rr;
+        }
+        if (rr != ESP_OK) {
             ESP_LOGE(TAG, "Legacy file %s unusable — discarding", path);
             tsdb_legacy_close(l);
             tsdb_legacy_remove(path);
-            return ESP_FAIL;
+            return ESP_ERR_INVALID_RESPONSE;
         }
-        // Persist so the next boot does not rescan (one-time in-place write).
-        write_header(f, &l->header);
+        // Not written back: an in-place header write rewrites the whole file
+        // on littlefs and needs that much free space. The next open simply
+        // reconstructs again, until the capacity window evicts the file.
     }
 
     if (l->header.base_params == 0) {
@@ -411,9 +503,14 @@ esp_err_t tsdb_legacy_open(const char *path, const tsdb_config_t *config, tsdb_l
     }
 
     if (l->header.version < 3 && l->header.records_per_block > 38) {
-        if (migrate_v2_blocks(l) != ESP_OK) {
+        fclose(l->file);
+        l->file = fopen(path, "r+b");
+        esp_err_t mr = (l->file == NULL) ? ESP_FAIL : migrate_v2_blocks(l);
+        if (mr != ESP_OK) {
+            // Reported to the caller (tsdb_open fails). The file stays; the
+            // next open retries, or discards it if the conversion was torn.
             tsdb_legacy_close(l);
-            return ESP_FAIL;   // leave the file; retry next boot
+            return mr == ESP_ERR_NO_MEM ? mr : ESP_FAIL;
         }
     }
 
