@@ -13,3 +13,9 @@ build_common.sh.swp
 !fixtures/*.tsdb
 !fixtures/*.h0
 !fixtures/*.h1
+test_lfs_cost
+test_compat_new
+test_compat_old
+.compat_old/
+.littlefs/
+.lfs_build/

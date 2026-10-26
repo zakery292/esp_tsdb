@@ -60,6 +60,33 @@
 ### Known limitation (unchanged, now documented)
 - On littlefs, once the ring has wrapped, every write lands in a block near the **head** of the file and littlefs copy-on-writes every block after it — the same linear cost 2.4.0 measured for the header (~20 ms/KB). A 2 MB ring that has wrapped costs tens of seconds per write on littlefs. Pre-wrap writes append and are cheap; SD/FAT in-place writes are cheap at any point. See the README for the arithmetic and the planned segment-file format.
 
+## [2.4.4] - 2026-10-26
+### Fixed
+- **Multi-second stall every `index_stride` records.** `tsdb_write()` updated a sparse-index entry each time a record landed on an index slot. The index sits in the database's first littlefs block, and littlefs rewrites a file from the first modified block to EOF, so that 8-byte write copied the **whole file** — the same cost the 2.4.0 sidecar removed from the header write, just every 380 records instead of every record. Measured on the host harness below (firmware geometry: 7 columns, ~2.5 MB budget, stride 380): 92 block erases + 725 programs in one write at 370 KB, 270 erases at 1.1 MB, growing with the file — ~6 s and ~18 s by a rough ESP32 cost model (30 us/read call, 0.7 ms/program, 60 ms/erase; it puts a whole-file rewrite at ~16 ms/KB against ~20 ms/KB measured on hardware). The writer holds the filesystem lock throughout, so every other LittleFS user waits that long. This is the likely cause of task-watchdog resets seen on a live unit, whose backtrace landed in the root-directory compaction of the sidecar fsync later in the same write. Confirmed on hardware (ESP32 WROOM, firmware partition, ~1 MB database, one record every 2 s): 2.4.3 had two writes over 1 s in 748, at 9.8 s and 10.0 s, ~380 records apart; this version's slowest of 743 writes took 466 ms. Index entries are no longer written per record: nothing has read the index since 2.1.0, and `tsdb_close()`/`tsdb_sync()` rebuild it from the stored timestamps in the same single contiguous write that already rewrites the header (one whole-file rewrite, as before). A cleanly closed file is byte-identical to what 2.4.3 writes for the same input.
+- `tsdb_clear()` and the fast path of `tsdb_resize()` rewrote the in-file header but left the sidecars, which still described the old state (pre-clear records / old `max_records`) and would be adopted by an open before the next write. Both now drop the sidecars, as close does. A newly created database also removes sidecars left at its path by a previous one.
+
+### Changed
+- **Per-record sidecar slots moved to a subdirectory, in a compact form.** Every writable `fopen` through esp_littlefs is a metadata commit (it syncs right after open, and the mtime attribute marks the file dirty), and so is every `fsync` — which is why dropping the sidecar's explicit fsync measures no difference: `fclose` then makes the same commit. Writing `<db>.h0`/`.h1` beside the database therefore cost two commits per record in the **root** directory, plus the data file's own fsync. The root metadata pair also holds every other file in that directory, so it filled every ~6 records and was compacted — ~1900 block-device reads each, an O(tags²) traversal, every read a cache-disable + IPC on an ESP32. The slots now live in `<db>.d/h0`/`h1`, a directory holding just those two entries, and carry only the mutable header fields (TSH2, 88 bytes, everything but `param_names`) — small enough for littlefs to keep inline in the directory's metadata, so a slot write no longer allocates and erases a data block.
+
+  The 2.4.0 slots (`<db>.h0`/`.h1`, TSH1) are still written as a mirror on the first write after open and every `TSDB_SIDECAR_LEGACY_EVERY` (32) records, so an older esp_tsdb opening the database after an unclean shutdown loses at most 31 records of header state instead of everything since the last clean close. Each TSH2 slot records the sequence number of the last mirror it knows of, which lets this version recognise slots an older version wrote after a downgrade (and an older version's clean close) and prefer the newer state. On open, both locations are read; the alternating-slot torn-write protection is unchanged, and the first write after open now goes to the older slot so the newest survives a torn write. A cleanly closed database is still a plain file: close removes both kinds of slot and the directory. If the filesystem cannot create the directory, every write falls back to the TSH1 slots (2.4.3 behaviour).
+
+  Measured with the host harness, 20 000 records on the firmware's configuration (littlefs 2.11.3, read/prog 128, cache 512, block 4096, mtime on, 16 other files + a /logs tree in the root):
+
+  | per write | 2.4.3 | 2.4.4 |
+  |---|---|---|
+  | block-device reads, mean / p99 / max | 359 / 1891 / 3299 | 217 / 1953 / 3382 |
+  | erases, mean / max | 2.54 / 92 | 1.47 / 5 |
+  | root-dir commits | 3.00 | 1.06 |
+  | root-dir compactions | 1 per 6.0 records | 1 per 15.3 records |
+  | est. ESP32 ms, mean / max | 178 / 6175 | 106 / 424 |
+
+  The worst write is now one root compaction (plus, occasionally, one in the slot directory) rather than a whole-file copy, and it no longer grows with the database.
+
+### Added
+- `host_test/test_lfs_cost.c` (`build_lfs_cost.sh`): runs esp_tsdb on the real littlefs that esp_littlefs ships (fetched, or `LFS_DIR`), instrumented to count metadata commits, compactions and full-filesystem traversals, over a RAM block device configured like the firmware's partition, with esp_littlefs's open-sync and mtime behaviour emulated. Reports block-device reads/programs/erases per write (mean, percentiles, worst) broken down by stdio operation, checks power-cut recovery and clean close, and with `--check` fails on a whole-file rewrite in the write path or more than ~1 root commit per record. `TSDB_SRC` builds it against another release for comparison.
+- `host_test/run_compat.sh` (`build_compat.sh`, `test_compat.c`): builds this tree and v2.4.3 and alternates them on one database — upgrade and downgrade, each after a clean close and after an unclean shutdown, across the ring wrap — and checks a clean close produces a byte-identical file.
+- `host_test/test_sidecar.c`: torn newest slot, mirror-only (what 2.4.3 sees), clean close leaves no slots, rebuilt index matches per-write updates.
+
 ## [2.4.3] - 2026-08-31
 ### Fixed
 - The published PlatformIO package no longer carries build byproducts. `release_notes.md` and `dist/` are written by earlier steps of the release workflow and were being swept into the package tarball; `.github/` was shipping too. All three are now excluded, alongside `host_test/`. Harmless (nothing was compiled from them), but they are not part of the library.
