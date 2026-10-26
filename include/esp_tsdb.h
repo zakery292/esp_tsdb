@@ -132,10 +132,13 @@ typedef struct {
     const struct tsdb_migrate_opts_s *migrate_opts;
 
     // v3: data blocks per segment file, as bytes (rounded down to whole 1 KB
-    // blocks). 0 = auto: the capacity split into ~32 segments, clamped to
-    // [1 KB, 256 KB] per segment. Smaller segments evict in finer steps and
-    // cost one more file; larger ones mean fewer files. Capacity is exact
-    // either way (eviction is logical at the head, physical per segment).
+    // blocks). 0 = auto: the capacity split into ~32 segments, at least 6
+    // and at most ~256 blocks each, rounded so a segment file (header +
+    // data) is 4n - 1 KB and fills n 4 KB flash blocks exactly. Smaller
+    // segments evict in finer steps and cost one more file; larger ones mean
+    // fewer files. Capacity is exact either way (eviction is logical at the
+    // head, physical per segment); on disk the database stays within
+    // max_records plus one segment, plus a header block per segment.
     uint32_t segment_bytes;
 } tsdb_config_t;
 

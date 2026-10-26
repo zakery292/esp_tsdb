@@ -141,12 +141,29 @@ set to NULL — positional mapping is then ambiguous. Keep names in the config.
 ## Upgrading From 1.x / 2.x
 
 Nothing to do. A single-file database at the configured path is adopted as the
-oldest segment without copying: all of 2.5's recovery logic (sidecar adoption,
-header reconstruction, V2→V3 block layout, orphaned `.mig`) runs on the first
-open, after which the file is read-only. New records go to segment files next
-to it; when the capacity window has moved past its last record, the old file
-and its sidecars are deleted. Legacy overflow extras are read from the old
-file's overflow region and carried into the schema as runtime extras.
+oldest segment without copying: all of 2.5's recovery logic (sidecar adoption —
+including 2.4.4's `<path>.d/` slots —, header reconstruction, V2→V3 block
+layout, orphaned `.mig`) runs on the first open, after which the file is
+read-only. New records go to segment files next to it. Legacy overflow extras
+are read from the old file's overflow region and carried into the schema as
+runtime extras.
+
+**When the old file goes.** Its records count toward `max_records` from the
+first open, and the database's on-disk total is held to `max_records` plus one
+segment. The old file is a single file that can only be deleted as a whole, so
+it is evicted — with its sidecars — as soon as keeping it would break that
+bound: once the records written since the upgrade exceed
+`max_records + one segment − (records in the old file)`, or earlier if the
+window has passed all of it. For a **full** 2.x database that is one segment
+after the upgrade: on the OpenEVSE energy logger (7 columns, 2.5 MB, 142,108
+records, 4,592-record segments) every pre-upgrade record is dropped after 4,593
+new ones — 3.2 days at one record a minute, 16 days at one per 5 minutes — and
+the history then rebuilds to full depth as before. A database holding N records
+lasts `142,108 + 4,592 − N` new records (N = 130,000: 16,701). Nothing here
+depends on free space; `host_test/run_lfs_upgrade.sh` checks it on littlefs
+with the firmware's partition. (Earlier betas kept the old file until the window
+had passed it, i.e. beside a full capacity of new segments — twice the budget —
+and on a full partition met ENOSPC first.)
 
 Firmware older than 3.0 does not know about segment files. A rollback after an
 upgrade sees (and keeps using) the original single file if it has not been
@@ -283,8 +300,9 @@ current numbers.
 // Records per block = (1024 - 8) / 24 = 42 records/block
 
 // Each segment adds a 1 KB header (2 KB above 24 columns).
-// Default segment size = capacity / 32, clamped to [1 KB, 256 KB] of blocks;
-// override with tsdb_config_t.segment_bytes.
+// Default segment size = capacity / 32, at least 6 and at most ~256 blocks,
+// rounded so the file (header + data) is 4n - 1 KB and fills n 4 KB flash
+// blocks; override with tsdb_config_t.segment_bytes.
 ```
 
 ```c
@@ -375,8 +393,15 @@ Every function above has an `_h` variant taking a `tsdb_t *` handle.
 cd host_test
 for s in build.sh build_*.sh; do bash $s; done
 for t in test_wrap test_multi test_schema test_sidecar test_resize test_freecap test_v25 test_legacy test_segments; do ./$t | tail -1; done
+./run_compat.sh      # databases written by v2.4.3 / v2.4.4 (clean and power cut) opened by this tree
+./run_lfs_upgrade.sh # on real littlefs: upgrades of full 2.x databases, a 2.2x-capacity run, failure reporting
+./test_lfs_cost      # per-write littlefs cost (reads, programs, erases, commits)
 ./make_fixtures.sh   # regenerate the 2.5.0 legacy fixtures (needs git history)
 ```
+
+`build_lfs_*.sh` fetch littlefs v2.11.3 (the version esp_littlefs ships) into
+`.littlefs/` unless `LFS_DIR` points at a checkout; `run_compat.sh` and
+`run_lfs_upgrade.sh` build the 2.x releases from git history.
 
 ## License
 

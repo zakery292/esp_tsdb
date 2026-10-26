@@ -500,6 +500,12 @@ bool tsdb_evict_oldest(tsdb_t *db) {
     return true;
 }
 
+// Records a new segment holds under the current schema.
+static uint32_t seg_room(const tsdb_t *db) {
+    uint16_t rpb = (TSDB_BLOCK_SIZE - 8) / (4 + 2u * db->schema.count);
+    return db->seg_blocks * (uint32_t) rpb;
+}
+
 void tsdb_apply_capacity(tsdb_t *db) {
     if (db->max_records == 0) {
         db->head_skip = 0;
@@ -508,7 +514,25 @@ void tsdb_apply_capacity(tsdb_t *db) {
     for (;;) {
         db->head_skip = (db->total_physical > db->max_records) ?
                         (db->total_physical - db->max_records) : 0;
-        if (db->nsegs == 0 || db->head_skip < db->segs[0].records) break;
+        if (db->nsegs == 0) break;
+        // The oldest unit goes once the window has passed all of it — and an
+        // adopted pre-3.0 file also once what is on disk exceeds the window
+        // by more than one segment. A segment can never break that bound
+        // (it is at most one segment), but the legacy file holds up to a
+        // whole former capacity in one file that can only be unlinked as a
+        // unit: kept until the window passes it, it would sit beside a full
+        // capacity's worth of new segments — twice the budget the caller
+        // sized max_records for, which is how an upgraded unit filled its
+        // filesystem. Its records count toward the capacity throughout.
+        bool passed = db->head_skip >= db->segs[0].records;
+        bool legacy_over = db->segs[0].seq == 0 && db->head_skip > seg_room(db);
+        if (!passed && !legacy_over) break;
+        if (legacy_over && !passed) {
+            ESP_LOGW(TAG, "Capacity: on-disk total exceeds max_records by more than one segment — "
+                          "evicting the adopted pre-3.0 file (%lu of its %lu records still in the window)",
+                     (unsigned long) (db->segs[0].records - db->head_skip),
+                     (unsigned long) db->segs[0].records);
+        }
         if (!tsdb_evict_oldest(db)) {
             // Only the active segment left and it exceeds the capacity
             // (capacity shrunk below one segment): keep skipping logically.

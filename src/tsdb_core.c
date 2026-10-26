@@ -155,13 +155,28 @@ static uint32_t auto_seg_blocks(const tsdb_config_t *config, uint8_t np) {
         if (b > 4096) b = 4096;
         return b;
     }
-    if (config->max_records == 0) return 256;
-    uint16_t rpb = (TSDB_BLOCK_SIZE - 8) / (4 + 2u * np);
-    uint32_t max_blocks = (config->max_records + rpb - 1) / rpb;
-    uint32_t b = (max_blocks + 31) / 32;
-    if (b < 1) b = 1;
-    if (b > 256) b = 256;
-    return b;
+    uint32_t b = 256;
+    if (config->max_records > 0) {
+        uint16_t rpb = (TSDB_BLOCK_SIZE - 8) / (4 + 2u * np);
+        uint32_t max_blocks = (config->max_records + rpb - 1) / rpb;
+        b = (max_blocks + 31) / 32;
+        // Floor: a segment is a file, and a file costs at least one 4 KB
+        // flash block on littlefs. At 1 data block per segment (any capacity
+        // under ~1800 records) the window plus its slack took ~33 files =
+        // 132 KB — more than the whole 128 KB LittleFS of a 4 MB board.
+        if (b < 6) b = 6;
+        if (b > 256) b = 256;
+    }
+    // Size the whole file (header blocks + data) at 4n - 1 KB: littlefs
+    // stores a file in 4 KB blocks, each after the first carrying a few bytes
+    // of skip-list pointers, so a file of exactly 4n KB spills into an
+    // (n+1)th block. 4n - 1 KB fills n blocks with no spill (81 KB files took
+    // 21 blocks = 84 KB each; 83 KB files take the same 21).
+    uint32_t prefix = TSDB_SEG_HEADER_SIZE + 2u * np * TSDB_NAME_LEN;
+    uint32_t hdr = (prefix + TSDB_BLOCK_SIZE - 1) / TSDB_BLOCK_SIZE;
+    uint32_t total = hdr + b;
+    total = (total + 1 + 3) / 4 * 4 - 1;
+    return total - hdr;
 }
 
 tsdb_t *tsdb_open(const tsdb_config_t *config) {

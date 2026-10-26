@@ -43,13 +43,16 @@ static uint64_t fake_free_space(void) { g_probe_calls++; return g_fake_free; }
 static tsdb_config_t base_cfg(void) {
     tsdb_config_t c = {0};
     c.filepath = DB_PATH;
-    c.num_params = 1;                 // record_size 6 -> 681 records/block
+    c.num_params = 1;                 // record_size 6 -> 169 records/block
     c.max_records = 5000;
     c.index_stride = 100;
     c.buffer_pool_size = 16 * 1024;
     c.alloc_strategy = TSDB_ALLOC_INTERNAL_RAM;
     c.free_space_cb = fake_free_space;
     c.min_free_bytes = 100000;
+    // One data block per segment, so "the file set did not grow" can be
+    // checked to within a block (auto sizing has a 6-block floor).
+    c.segment_bytes = 1024;
     return c;
 }
 
