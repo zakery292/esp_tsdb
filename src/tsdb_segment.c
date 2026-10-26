@@ -48,24 +48,42 @@ esp_err_t tsdb_seg_read_block(FILE *f, uint32_t data_offset, uint32_t block, voi
     return fread(buf, TSDB_BLOCK_SIZE, 1, f) == 1 ? ESP_OK : ESP_ERR_NOT_FOUND;
 }
 
+// Write, flush and fsync; the first failure of the three decides the result.
+// On littlefs the data only becomes durable (and ENOSPC typically only shows
+// up) at the fsync, so its result is as important as fwrite's.
+static esp_err_t write_sync(FILE *f, long pos, const void *buf, size_t len, int *err_out) {
+    int err = 0;
+    errno = 0;
+    if (pos >= 0 && fseek(f, pos, SEEK_SET) != 0) err = errno ? errno : EIO;
+    if (err == 0 && len > 0) {
+        errno = 0;
+        if (fwrite(buf, len, 1, f) != 1) err = errno ? errno : EIO;
+    }
+    errno = 0;
+    if (fflush(f) != 0 && err == 0) err = errno ? errno : EIO;
+    errno = 0;
+    if (fsync(fileno(f)) != 0 && err == 0) err = errno ? errno : EIO;
+    if (err != 0) clearerr(f);
+    if (err_out) *err_out = err;
+    if (err == 0) return ESP_OK;
+    return err == ENOSPC ? ESP_ERR_NO_MEM : ESP_FAIL;
+}
+
 esp_err_t tsdb_seg_write_block(FILE *f, uint32_t data_offset, uint32_t block, const void *buf) {
     if (f == NULL || buf == NULL) return ESP_ERR_INVALID_ARG;
-    fseek(f, data_offset + block * TSDB_BLOCK_SIZE, SEEK_SET);
-    errno = 0;
-    size_t written = fwrite(buf, TSDB_BLOCK_SIZE, 1, f);
-    int werr = errno;
-    fflush(f);
-    fsync(fileno(f));
-    if (written != 1) {
-        clearerr(f);
-        if (werr == ENOSPC) {
-            ESP_LOGW(TAG, "Block %lu write: filesystem full (ENOSPC)", (unsigned long) block);
-            return ESP_ERR_NO_MEM;
-        }
-        ESP_LOGE(TAG, "Block %lu write failed (errno=%d)", (unsigned long) block, werr);
-        return ESP_FAIL;
+    int err = 0;
+    esp_err_t ret = write_sync(f, (long) data_offset + (long) block * TSDB_BLOCK_SIZE, buf, TSDB_BLOCK_SIZE, &err);
+    if (ret == ESP_ERR_NO_MEM) {
+        ESP_LOGW(TAG, "Block %lu write: filesystem full (ENOSPC)", (unsigned long) block);
+    } else if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Block %lu write failed (errno=%d)", (unsigned long) block, err);
     }
-    return ESP_OK;
+    return ret;
+}
+
+esp_err_t tsdb_file_sync(FILE *f) {
+    if (f == NULL) return ESP_OK;
+    return write_sync(f, -1, NULL, 0, NULL);
 }
 
 // ---------------------------------------------------------------------------
@@ -386,6 +404,7 @@ esp_err_t tsdb_seg_create(tsdb_t *db, uint32_t first_ts) {
     }
 
     bool ok = true;
+    int werr = 0;
     uint32_t written = 0;
     while (written < data_offset && ok) {
         uint32_t chunk = data_offset - written;
@@ -404,14 +423,18 @@ esp_err_t tsdb_seg_create(tsdb_t *db, uint32_t first_ts) {
                 buf[i] = (uint8_t) s->aliases[o / TSDB_NAME_LEN][o % TSDB_NAME_LEN];
             }
         }
-        errno = 0;
-        ok = fwrite(buf, chunk, 1, f) == 1;
+        bool last = written + chunk >= data_offset;
+        // The last chunk goes out with the flush + fsync that commits the file.
+        if (last) {
+            ok = write_sync(f, -1, buf, chunk, &werr) == ESP_OK;
+        } else {
+            errno = 0;
+            ok = fwrite(buf, chunk, 1, f) == 1;
+            if (!ok) werr = errno ? errno : EIO;
+        }
         written += chunk;
     }
-    int werr = errno;
     free(heapbuf);
-    fflush(f);
-    fsync(fileno(f));
     if (!ok) {
         fclose(f);
         unlink(path);

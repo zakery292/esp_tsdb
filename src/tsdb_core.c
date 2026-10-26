@@ -375,26 +375,31 @@ esp_err_t tsdb_close_h(tsdb_t *db) {
         return ESP_OK;
     }
     ESP_LOGI(TAG, "Closing TSDB");
-    if (db->cache_dirty) tsdb_write_cache_flush(db);
+    esp_err_t ret = ESP_OK;
+    if (db->cache_dirty) ret = tsdb_write_cache_flush(db);
     tsdb_write_cache_invalidate(db);
-    if (db->active) { fclose(db->active); db->active = NULL; }
+    if (db->active) {
+        if (fclose(db->active) != 0 && ret == ESP_OK) ret = ESP_FAIL;
+        db->active = NULL;
+    }
     if (db->legacy) { tsdb_legacy_close(db->legacy); db->legacy = NULL; }
     tsdb_free_buffer_pool(&db->pool);
     db->is_open = false;
     db->closing = false;
     tsdb_unlock(db);
     tsdb_retire_handle(db);
-    return ESP_OK;
+    return ret;
 }
 
 esp_err_t tsdb_sync_h(tsdb_t *db) {
     if (db == NULL || !db->is_open) return ESP_ERR_INVALID_STATE;
     TSDB_LOCK_OPEN_OR_RETURN(db, 30000, ESP_ERR_TIMEOUT);
-    if (db->cache_dirty) tsdb_write_cache_flush(db);
+    esp_err_t ret = ESP_OK;
+    if (db->cache_dirty) ret = tsdb_write_cache_flush(db);
     if (db->active) {
-        fflush(db->active);
-        fsync(fileno(db->active));
-        fclose(db->active);
+        esp_err_t sr = tsdb_file_sync(db->active);
+        if (ret == ESP_OK) ret = sr;
+        if (fclose(db->active) != 0 && ret == ESP_OK) ret = ESP_FAIL;
         db->active = NULL;
         char path[160];
         tsdb_seg_path(db, db->segs[db->nsegs - 1].seq, path, sizeof(path));
@@ -408,7 +413,7 @@ esp_err_t tsdb_sync_h(tsdb_t *db) {
         tsdb_write_cache_invalidate(db);
     }
     tsdb_unlock(db);
-    return ESP_OK;
+    return ret;
 }
 
 bool tsdb_is_initialized_h(const tsdb_t *db) {

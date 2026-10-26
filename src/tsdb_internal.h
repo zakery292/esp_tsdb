@@ -292,6 +292,13 @@ void tsdb_remove_all_files(tsdb_t *db);
 // Block I/O on a segment file. ESP_ERR_NO_MEM on ENOSPC.
 esp_err_t tsdb_seg_read_block(FILE *f, uint32_t data_offset, uint32_t block, void *buf);
 esp_err_t tsdb_seg_write_block(FILE *f, uint32_t data_offset, uint32_t block, const void *buf);
+// fflush + fsync with the result reported (ESP_ERR_NO_MEM on ENOSPC).
+esp_err_t tsdb_file_sync(FILE *f);
+// Close and reopen the active segment after a failed write: littlefs leaves
+// a file handle that failed mid-write unusable ("not safe to do anything if
+// our file errored"); the reopened handle sees the last synced state.
+// db->active is NULL if the reopen fails (the next write starts a segment).
+void tsdb_reopen_active(tsdb_t *db);
 // Column mapping: for each current logical column c, the index of the
 // matching column in a segment with the given names (NULL = all empty), or -1.
 void tsdb_map_columns(const tsdb_schema_t *cur, uint8_t seg_np,

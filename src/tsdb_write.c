@@ -18,6 +18,18 @@ static tsdb_block_t *write_cache_ptr(tsdb_t *db) {
     return (tsdb_block_t *) tsdb_get_buffer_ptr(&db->pool, db->write_cache_offset, TSDB_BLOCK_SIZE);
 }
 
+void tsdb_reopen_active(tsdb_t *db) {
+    tsdb_write_cache_invalidate(db);
+    if (db->active == NULL || db->nsegs == 0) return;
+    fclose(db->active);
+    char path[160];
+    tsdb_seg_path(db, db->segs[db->nsegs - 1].seq, path, sizeof(path));
+    db->active = fopen(path, "r+b");
+    if (db->active == NULL) {
+        ESP_LOGE(TAG, "Reopen of %s after a failed write failed — next write starts a new segment", path);
+    }
+}
+
 esp_err_t tsdb_write_cache_flush(tsdb_t *db) {
     if (db == NULL || !db->cache_dirty) return ESP_OK;
     tsdb_block_t *blk = write_cache_ptr(db);
@@ -28,7 +40,7 @@ esp_err_t tsdb_write_cache_flush(tsdb_t *db) {
     const tsdb_seg_t *a = &db->segs[db->nsegs - 1];
     esp_err_t ret = tsdb_seg_write_block(db->active, a->data_offset, db->cached_block_num, blk);
     db->cache_dirty = false;
-    if (ret != ESP_OK) tsdb_write_cache_invalidate(db);
+    if (ret != ESP_OK) tsdb_reopen_active(db);
     return ret;
 }
 
@@ -174,9 +186,14 @@ static esp_err_t tsdb_write_locked(tsdb_t *db, uint32_t timestamp, const int16_t
     if (flush_now) {
         for (int attempt = 0; attempt < 64; attempt++) {
             ret = tsdb_seg_write_block(db->active, a->data_offset, block_num, block);
+            if (ret == ESP_OK) break;
+            // Never write through a handle that failed (littlefs: an errored
+            // file is not safe to use); the reopened one has the last synced
+            // state, and the tail block's slot in it is unchanged.
+            tsdb_reopen_active(db);
+            if (db->active == NULL) break;
             if (ret != ESP_ERR_NO_MEM) break;
-            // Filesystem full: free the oldest segment and retry in place.
-            // The tail block's slot in the active file is unchanged.
+            // Filesystem full: free the oldest segment and retry.
             if (db->nsegs <= 1 ||
                 !make_room(db, a->blocks_cap * (uint32_t) rpb - a->records,
                            "Filesystem full appending a block")) {
@@ -191,6 +208,7 @@ static esp_err_t tsdb_write_locked(tsdb_t *db, uint32_t timestamp, const int16_t
             TSDB_BLOCK_COUNT(raw) = off;
             return ret;
         }
+        if (cacheable) db->cached_block_num = block_num;
         db->cache_dirty = false;
     } else {
         db->cache_dirty = true;
