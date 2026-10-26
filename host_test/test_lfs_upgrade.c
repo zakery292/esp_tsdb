@@ -23,7 +23,9 @@
 // Options: --fs-blocks N (864 = the 16 MB build's 3.375 MB partition; 32 = the
 // 4 MB build's 128 KB), --other-kb N (other files, default 400 / 24),
 // --writes N (upgrade: default 1.3 x capacity), --multiple X (fresh: 2.2),
-// --interval S (300), --min-free-kb N (required free-space floor).
+// --interval S (300), --min-free-kb N (required free-space floor),
+// --guard-kb N (configure the free-space guard with this reserve; off by
+// default, as in the firmware).
 #include "esp_tsdb.h"
 #include "lfs/lfs_stdio.h"
 
@@ -201,7 +203,7 @@ static void seg_files(int64_t *max_size, int *count) {
 // ---------------------------------------------------------------------------
 
 typedef struct {
-    uint32_t fs_blocks, other_kb, interval, min_free_kb;
+    uint32_t fs_blocks, other_kb, interval, min_free_kb, guard_kb;
     uint32_t writes;
     double multiple;
 } opts_t;
@@ -215,6 +217,12 @@ static uint32_t fw_max_records(uint32_t fs_total) {
     return TSDB_CALC_MAX_RECORDS(budget, NPARAM);
 }
 
+static uint64_t guard_free_space(void) {
+    int64_t f = hfs_free_bytes();
+    return f < 0 ? UINT64_MAX : (uint64_t) f;
+}
+static uint32_t g_guard_kb;
+
 static tsdb_config_t fw_config(uint32_t max_records) {
     tsdb_config_t cfg = {0};
     cfg.filepath = DB_PATH;
@@ -226,6 +234,11 @@ static tsdb_config_t fw_config(uint32_t max_records) {
     cfg.buffer_pool_size = 16 * 1024;
     cfg.use_paged_allocation = true;
     cfg.page_size = 4096;
+    if (g_guard_kb) {
+        // The free-space guard, as a firmware would wire it to LittleFS.
+        cfg.free_space_cb = guard_free_space;
+        cfg.min_free_bytes = g_guard_kb * 1024;
+    }
     return cfg;
 }
 
@@ -291,8 +304,6 @@ typedef struct {
     uint32_t min_free_at;
     uint32_t config_writes, config_fails;
     int64_t max_slack;          // disk usage - data_bytes(max_records)
-    int64_t max_slack_allow;    // the bound at that moment
-    uint32_t slack_violations;
     uint32_t retained_over_cap;
     uint64_t usage_at[8];       // disk usage at k * capacity / 2 written records
     uint64_t max_usage_late;    // max disk usage after 1.2 x capacity
@@ -305,6 +316,9 @@ typedef struct {
     uint32_t history_mismatch;  // retained != expected while the legacy file was present
     bool saw_nospc;
     int last_nseg;
+    int64_t max_over;           // slack beyond file prefixes
+    uint32_t max_over_at;
+    int64_t max_seg_file;       // largest segment file seen (a full segment)
 } run_t;
 
 static void write_loop(tsdb_t *db, const tsdb_config_t *cfg, uint32_t writes, uint32_t *ts,
@@ -350,8 +364,7 @@ static void write_loop(tsdb_t *db, const tsdb_config_t *cfg, uint32_t writes, ui
         // Free space moves by whole 4 KB blocks as files grow (every ~220
         // records here) or go: sampling every 8 writes and around every
         // change of the file set finds the minimum to within one block.
-        int nseg_now; int64_t maxseg_now;
-        seg_files(&maxseg_now, &nseg_now);
+        int nseg_now = (int) s.segment_count;
         bool files_changed = nseg_now != r->last_nseg || s.total_records != retained_prev + 1;
         r->last_nseg = nseg_now;
         if ((w & 7) == 0 || files_changed || w + 1 == writes) {
@@ -361,17 +374,20 @@ static void write_loop(tsdb_t *db, const tsdb_config_t *cfg, uint32_t writes, ui
             int64_t maxseg; int nseg;
             seg_files(&maxseg, &nseg);
             int64_t legacy_now = (stat(DB_PATH, &st) == 0) ? st.st_size : 0;
-            // max_records worth of data blocks, plus one segment file of
-            // slack, plus every file's prefix (1 KB segment headers; the
-            // legacy file's header + index).
-            int64_t legacy_prefix = legacy_now > 0 ? 4096 : 0;
-            int64_t allow = maxseg + (int64_t) nseg * TSDB_BLOCK_SIZE + legacy_prefix;
+            // Slack over max_records worth of data blocks, less what every
+            // file carries beyond its records: its prefix (1 KB segment
+            // header; the legacy file's header + index, < 4 KB) and a
+            // partly filled last block. Compared at the end against one
+            // full segment file.
+            int64_t legacy_extra = legacy_now > 0 ? 4096 + TSDB_BLOCK_SIZE : 0;
             int64_t slack = (int64_t) use - (int64_t) data_bytes(cfg->max_records);
-            if (slack > r->max_slack) { r->max_slack = slack; r->max_slack_allow = allow; }
-            if (slack > allow) r->slack_violations++;
+            int64_t over = slack - (int64_t) nseg * 2 * TSDB_BLOCK_SIZE - legacy_extra;
+            if (slack > r->max_slack) r->max_slack = slack;
+            if (over > r->max_over) { r->max_over = over; r->max_over_at = w; }
+            if (maxseg > r->max_seg_file) r->max_seg_file = maxseg;
             uint64_t written = (uint64_t) legacy_count + w + 1;
-            for (int k = 0; k < 8; k++) {
-                if (written == (uint64_t) cfg->max_records * k / 2 && r->usage_at[k] == 0) r->usage_at[k] = use;
+            for (int k = 1; k < 8; k++) {
+                if (written >= (uint64_t) cfg->max_records * k / 2 && r->usage_at[k] == 0) r->usage_at[k] = use;
             }
             if ((double) (w + 1) > 1.2 * cfg->max_records && use > r->max_usage_late) r->max_usage_late = use;
         }
@@ -468,9 +484,11 @@ static int run_upgrade(const char *legacy_dir, const opts_t *o) {
     CHECK(r.config_fails == 0, "other files stay writable: %u of %u config saves failed",
           r.config_fails, r.config_writes);
     CHECK(r.retained_over_cap == 0, "retained records never exceed max_records");
-    CHECK(r.slack_violations == 0,
-          "on-disk total within max_records + one segment: max slack %lld KB (allowed %lld KB)",
-          (long long) r.max_slack / 1024, (long long) r.max_slack_allow / 1024);
+    CHECK(r.max_over <= r.max_seg_file,
+          "on-disk total within max_records + one segment: max %lld KB over max_records, %lld KB of it "
+          "beyond file headers (write %u); one segment file = %lld KB",
+          (long long) r.max_slack / 1024, (long long) r.max_over / 1024, r.max_over_at,
+          (long long) r.max_seg_file / 1024);
     CHECK(r.history_mismatch == 0,
           "while the legacy file is whole, every adopted record stays readable until the window passes it "
           "(%u mismatches)", r.history_mismatch);
@@ -528,6 +546,11 @@ static int run_fresh(const opts_t *o) {
     int64_t maxseg; int nseg;
     seg_files(&maxseg, &nseg);
     uint64_t seg_erase_blocks = (uint64_t) (maxseg + 4095) / 4096;
+    // A write that starts a segment also commits the directory (create +
+    // unlink) and may compact it: a few blocks that do not scale with the
+    // database. On the 4 MB build a segment is only 2 blocks, so the bound
+    // there is that fixed metadata work instead.
+    uint64_t erase_bound = seg_erase_blocks > 8 ? seg_erase_blocks : 8;
 
     CHECK(r.writes_ok == writes, "every write succeeds: %u of %u (first failure at %u, err %d)",
           r.writes_ok, writes, r.first_fail_at, r.first_fail_err);
@@ -536,13 +559,17 @@ static int run_fresh(const opts_t *o) {
           (long long) r.min_free / 1024, o->min_free_kb);
     CHECK(r.config_fails == 0, "other files stay writable: %u of %u config saves failed",
           r.config_fails, r.config_writes);
-    CHECK(r.max_erases <= seg_erase_blocks,
-          "worst write: %llu erases (one segment file = %llu blocks of 4 KB), est %.0f ms at write %u; mean %.1f ms",
-          (unsigned long long) r.max_erases, (unsigned long long) seg_erase_blocks, r.max_ms, r.max_ms_at,
+    CHECK(r.max_erases <= erase_bound,
+          "worst write: %llu erases (bound %llu; one segment file = %llu blocks of 4 KB), est %.0f ms at write %u; "
+          "mean %.1f ms",
+          (unsigned long long) r.max_erases, (unsigned long long) erase_bound,
+          (unsigned long long) seg_erase_blocks, r.max_ms, r.max_ms_at,
           r.sum_ms / (r.writes_ok ? r.writes_ok : 1));
-    CHECK(r.slack_violations == 0,
-          "on-disk total within max_records + one segment: max slack %lld KB (allowed %lld KB)",
-          (long long) r.max_slack / 1024, (long long) r.max_slack_allow / 1024);
+    CHECK(r.max_over <= r.max_seg_file,
+          "on-disk total within max_records + one segment: max %lld KB over max_records, %lld KB of it "
+          "beyond file headers (write %u); one segment file = %lld KB",
+          (long long) r.max_slack / 1024, (long long) r.max_over / 1024, r.max_over_at,
+          (long long) r.max_seg_file / 1024);
     printf("  disk usage at 0.5x/1x/1.5x/2x capacity: %llu / %llu / %llu / %llu KB; max after 1.2x: %llu KB; "
            "%d segment files of up to %lld bytes\n",
            (unsigned long long) r.usage_at[1] / 1024, (unsigned long long) r.usage_at[2] / 1024,
@@ -647,7 +674,7 @@ static void make_v2_file(const char *path, uint32_t n) {
     h.max_records = 1000;
     h.index_stride = 380;
     h.index_offset = 512;
-    h.index_entries = 3;
+    h.index_entries = 16;            // data starts at 640, past the 584-byte header
     h.total_records = n;
     h.total_writes = n;
     h.oldest_record_idx = 0;
@@ -741,6 +768,7 @@ int main(int argc, char **argv) {
         OPT("--writes", o.writes, (void) 0);
         OPT("--interval", o.interval, (void) 0);
         OPT("--min-free-kb", o.min_free_kb, floor_set = true);
+        OPT("--guard-kb", o.guard_kb, (void) 0);
 #undef OPT
         if (strcmp(a, "--multiple") == 0) { o.multiple = atof(v); i++; continue; }
         fprintf(stderr, "unknown option %s\n", a);
@@ -752,6 +780,7 @@ int main(int argc, char **argv) {
     // free-space guard; this is what the other files need to keep saving.
     if (!floor_set) o.min_free_kb = small ? 16 : 128;
 
+    g_guard_kb = o.guard_kb;
     int r;
     if (strcmp(mode, "upgrade") == 0) r = run_upgrade(dir, &o);
     else if (strcmp(mode, "fresh") == 0) r = run_fresh(&o);
