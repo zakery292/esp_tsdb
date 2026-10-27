@@ -242,6 +242,7 @@ esp_err_t tsdb_write_h(tsdb_t *db, uint32_t timestamp, const int16_t *values) {
     if (db->closing) return ESP_ERR_INVALID_STATE;
 
     TSDB_LOCK_OPEN_OR_RETURN(db, 5000, ESP_ERR_TIMEOUT);
+    if (tsdb_refuse_if_query_open(db, __func__)) return ESP_ERR_INVALID_STATE;
     esp_err_t ret = tsdb_write_locked(db, timestamp, values, false);
     tsdb_unlock(db);
     return ret;
@@ -254,6 +255,7 @@ esp_err_t tsdb_write_batch_h(tsdb_t *db, const uint32_t *timestamps,
     if (db->closing) return ESP_ERR_INVALID_STATE;
 
     TSDB_LOCK_OPEN_OR_RETURN(db, 5000, ESP_ERR_TIMEOUT);
+    if (tsdb_refuse_if_query_open(db, __func__)) return ESP_ERR_INVALID_STATE;
 
     esp_err_t ret = ESP_OK;
     uint32_t done = 0;

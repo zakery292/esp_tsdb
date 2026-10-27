@@ -137,6 +137,14 @@ uint32_t tsdb_oldest_retained_ts(tsdb_t *db) {
     return ts;
 }
 
+bool tsdb_refuse_if_query_open(tsdb_t *db, const char *what) {
+    if (db->open_queries == 0) return false;
+    ESP_LOGE(TAG, "%s: refused while %u quer%s open on this handle — close them first",
+             what, db->open_queries, db->open_queries == 1 ? "y is" : "ies are");
+    tsdb_unlock(db);
+    return true;
+}
+
 // ============================================================================
 // OPEN
 // ============================================================================
@@ -472,12 +480,7 @@ esp_err_t tsdb_get_stats_h(tsdb_t *db, tsdb_stats_t *stats) {
 esp_err_t tsdb_clear_h(tsdb_t *db) {
     if (db == NULL || !db->is_open) return ESP_ERR_INVALID_STATE;
     TSDB_LOCK_OPEN_OR_RETURN(db, 5000, ESP_ERR_TIMEOUT);
-    if (db->open_queries > 0) {
-        ESP_LOGE(TAG, "%s: refused while %u quer%s open on this handle — close them first",
-                 __func__, db->open_queries, db->open_queries == 1 ? "y is" : "ies are");
-        tsdb_unlock(db);
-        return ESP_ERR_INVALID_STATE;
-    }
+    if (tsdb_refuse_if_query_open(db, __func__)) return ESP_ERR_INVALID_STATE;
     ESP_LOGW(TAG, "Clearing all data");
     tsdb_remove_all_files(db);
     db->capacity_adapted = false;
@@ -490,12 +493,7 @@ esp_err_t tsdb_clear_h(tsdb_t *db) {
 esp_err_t tsdb_delete_h(tsdb_t *db) {
     if (db == NULL || !db->is_open) return ESP_ERR_INVALID_STATE;
     TSDB_LOCK_OPEN_OR_RETURN(db, 5000, ESP_ERR_TIMEOUT);
-    if (db->open_queries > 0) {
-        ESP_LOGE(TAG, "%s: refused while %u quer%s open on this handle — close them first",
-                 __func__, db->open_queries, db->open_queries == 1 ? "y is" : "ies are");
-        tsdb_unlock(db);
-        return ESP_ERR_INVALID_STATE;
-    }
+    if (tsdb_refuse_if_query_open(db, __func__)) return ESP_ERR_INVALID_STATE;
     tsdb_remove_all_files(db);
     tsdb_unlock(db);
     esp_err_t ret = tsdb_close_h(db);
@@ -536,12 +534,7 @@ esp_err_t tsdb_add_extra_params_h(tsdb_t *db, const char **param_names, uint8_t 
     if (db == NULL || !db->is_open) return ESP_ERR_INVALID_STATE;
     if (count == 0 || count > TSDB_MAX_EXTRA_PARAMS || param_names == NULL) return ESP_ERR_INVALID_ARG;
     TSDB_LOCK_OPEN_OR_RETURN(db, 5000, ESP_ERR_TIMEOUT);
-    if (db->open_queries > 0) {
-        ESP_LOGE(TAG, "%s: refused while %u quer%s open on this handle — close them first",
-                 __func__, db->open_queries, db->open_queries == 1 ? "y is" : "ies are");
-        tsdb_unlock(db);
-        return ESP_ERR_INVALID_STATE;
-    }
+    if (tsdb_refuse_if_query_open(db, __func__)) return ESP_ERR_INVALID_STATE;
     tsdb_schema_t *s = &db->schema;
     if (s->count > s->base_count) {
         ESP_LOGW(TAG, "Extras already present (%u)", s->count - s->base_count);
@@ -568,12 +561,7 @@ esp_err_t tsdb_migrate_overflow_h(tsdb_t *db, const char **new_names, uint8_t ne
     if (new_count > TSDB_MAX_EXTRA_PARAMS) return ESP_ERR_INVALID_ARG;
     if (new_count > 0 && new_names == NULL) return ESP_ERR_INVALID_ARG;
     TSDB_LOCK_OPEN_OR_RETURN(db, 5000, ESP_ERR_TIMEOUT);
-    if (db->open_queries > 0) {
-        ESP_LOGE(TAG, "%s: refused while %u quer%s open on this handle — close them first",
-                 __func__, db->open_queries, db->open_queries == 1 ? "y is" : "ies are");
-        tsdb_unlock(db);
-        return ESP_ERR_INVALID_STATE;
-    }
+    if (tsdb_refuse_if_query_open(db, __func__)) return ESP_ERR_INVALID_STATE;
     tsdb_schema_t *s = &db->schema;
     if ((uint16_t) s->base_count + new_count > TSDB_MAX_PARAMS) {
         tsdb_unlock(db);
@@ -605,12 +593,7 @@ esp_err_t tsdb_migrate_schema_h(tsdb_t *db, const char **new_names, uint8_t new_
     if (db == NULL || !db->is_open) return ESP_ERR_INVALID_STATE;
     if (new_names == NULL || new_count == 0 || new_count > TSDB_MAX_PARAMS) return ESP_ERR_INVALID_ARG;
     TSDB_LOCK_OPEN_OR_RETURN(db, 5000, ESP_ERR_TIMEOUT);
-    if (db->open_queries > 0) {
-        ESP_LOGE(TAG, "%s: refused while %u quer%s open on this handle — close them first",
-                 __func__, db->open_queries, db->open_queries == 1 ? "y is" : "ies are");
-        tsdb_unlock(db);
-        return ESP_ERR_INVALID_STATE;
-    }
+    if (tsdb_refuse_if_query_open(db, __func__)) return ESP_ERR_INVALID_STATE;
     tsdb_schema_t *s = &db->schema;
 
     // Heap: tsdb_schema_t is ~2.6 KB (64 names + 64 aliases).
@@ -675,12 +658,7 @@ esp_err_t tsdb_rename_param_h(tsdb_t *db, uint8_t index, const char *new_name) {
     if (db == NULL || !db->is_open) return ESP_ERR_INVALID_STATE;
     if (new_name == NULL || new_name[0] == '\0') return ESP_ERR_INVALID_ARG;
     TSDB_LOCK_OPEN_OR_RETURN(db, 5000, ESP_ERR_TIMEOUT);
-    if (db->open_queries > 0) {
-        ESP_LOGE(TAG, "%s: refused while %u quer%s open on this handle — close them first",
-                 __func__, db->open_queries, db->open_queries == 1 ? "y is" : "ies are");
-        tsdb_unlock(db);
-        return ESP_ERR_INVALID_STATE;
-    }
+    if (tsdb_refuse_if_query_open(db, __func__)) return ESP_ERR_INVALID_STATE;
     tsdb_schema_t *s = &db->schema;
     if (index >= s->count) {
         tsdb_unlock(db);

@@ -266,6 +266,14 @@ static inline void tsdb_unlock(tsdb_t *db) {
             return (errval); \
         } } while (0)
 
+// With the lock held: a query open on this handle means the caller is the
+// query's own task (any other task would be blocked on the lock, which the
+// query holds from init to close). Writes, conversion steps, clear, delete
+// and schema changes close, truncate or unlink files the query may be reading
+// through and shift the segment table under its cursor, so they refuse:
+// returns true after logging and releasing the lock.
+bool tsdb_refuse_if_query_open(tsdb_t *db, const char *what);
+
 // ============================================================================
 // INTERNAL FUNCTIONS
 // ============================================================================

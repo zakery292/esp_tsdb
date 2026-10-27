@@ -737,6 +737,44 @@ static void fault_batch_segment_create(void) {
     }
 }
 
+// Review B5: a write on the task that holds a query open (the handle lock is
+// recursive, so it is not blocked). A write can close the active segment the
+// query reads through (segment roll-over), unlink files and shift the segment
+// table under the query's cursor; it must be refused while a query is open on
+// the handle, like the schema operations are. Other tasks block on the lock,
+// which the query holds from tsdb_query_init to tsdb_query_close.
+static void fault_write_during_query(void) {
+    opts_t o = {.fs_blocks = 64, .other_kb = 24};
+    mount_fs(&o);
+    tsdb_config_t cfg = small_config(20000);
+    tsdb_t *db = tsdb_open(&cfg);
+    uint32_t ts = write_n(db, 1700000000u, 1000);   // segment 1 full, segment 2 active
+    tsdb_query_t q;
+    uint8_t cols[NPARAM] = {0, 1, 2, 3, 4, 5, 6};
+    uint32_t from = ts - 100 * 60;                  // the newest 100: inside the active segment
+    tsdb_query_init_h(db, &q, from, 0xFFFFFFFFu, cols, NPARAM);
+    uint32_t t; int16_t v[NPARAM], w[NPARAM];
+    bool ok = tsdb_query_next(&q, &t, v) == ESP_OK && t == from;
+    fill(w, ts);
+    esp_err_t e1 = tsdb_write_h(db, ts, w);
+    const int16_t *rows[1] = {w};
+    uint32_t tss[1] = {ts};
+    esp_err_t e2 = tsdb_write_batch_h(db, tss, rows, 1);
+    int n = 1;
+    while (tsdb_query_next(&q, &t, v) == ESP_OK) {
+        fill(w, t);
+        if (memcmp(v, w, sizeof(v)) != 0) ok = false;
+        n++;
+    }
+    tsdb_query_close(&q);
+    CHECK(e1 == ESP_ERR_INVALID_STATE && e2 == ESP_ERR_INVALID_STATE,
+          "write and batch on the query's own task are refused while it is open (got %d, %d)", e1, e2);
+    CHECK(ok && n == 100, "the open query is unaffected (%d records)", n);
+    fill(w, ts);
+    CHECK(tsdb_write_h(db, ts, w) == ESP_OK, "the write succeeds once the query is closed");
+    tsdb_close_h(db);
+}
+
 // A pre-2.0.1 (V2) file: records_per_block > 38 with the old struct offsets,
 // which open converts in place.
 static void make_v2_file(const char *path, uint32_t n) {
@@ -818,6 +856,7 @@ static int run_faults(void) {
     fault_case("ENOSPC, nothing to evict", 2);
     fault_case("batch, fsync failure mid-batch", 3);
     fault_batch_segment_create();
+    fault_write_during_query();
     fault_legacy_migration();
     return 0;
 }
