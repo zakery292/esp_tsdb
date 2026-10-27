@@ -40,7 +40,14 @@ esp_err_t tsdb_write_cache_flush(tsdb_t *db) {
     const tsdb_seg_t *a = &db->segs[db->nsegs - 1];
     esp_err_t ret = tsdb_seg_write_block(db->active, a->data_offset, db->cached_block_num, blk);
     db->cache_dirty = false;
-    if (ret != ESP_OK) tsdb_reopen_active(db);
+    if (ret != ESP_OK) {
+        tsdb_reopen_active(db);
+    } else {
+        // The dirty block is the tail block: everything counted is on disk.
+        db->flushed_seq = a->seq;
+        db->flushed_records = a->records;
+        db->flushed_last_ts = a->last_ts;
+    }
     return ret;
 }
 
@@ -255,6 +262,7 @@ esp_err_t tsdb_write_batch_h(tsdb_t *db, const uint32_t *timestamps,
     uint32_t committed_seq = db->nsegs ? db->segs[db->nsegs - 1].seq : UINT32_MAX;
     uint32_t committed_records = db->nsegs ? db->segs[db->nsegs - 1].records : 0;
     uint32_t committed_last_ts = db->nsegs ? db->segs[db->nsegs - 1].last_ts : 0;
+    db->flushed_seq = UINT32_MAX;
 
     for (uint32_t i = 0; i < count; i++) {
         if (values[i] == NULL) { ret = ESP_ERR_INVALID_ARG; break; }
@@ -274,6 +282,13 @@ esp_err_t tsdb_write_batch_h(tsdb_t *db, const uint32_t *timestamps,
     if (db->cache_dirty) {
         esp_err_t fr = tsdb_write_cache_flush(db);
         if (ret == ESP_OK) ret = fr;
+    }
+    // A deferred block can also have been flushed by the failing record
+    // itself (moving to a new segment flushes the full one before creating
+    // the next, and the creation failed): those records are on disk.
+    if (db->flushed_seq == committed_seq && db->flushed_records > committed_records) {
+        committed_records = db->flushed_records;
+        committed_last_ts = db->flushed_last_ts;
     }
     if (ret != ESP_OK && db->nsegs > 0 && db->segs[db->nsegs - 1].seq == committed_seq &&
         db->segs[db->nsegs - 1].records > committed_records) {

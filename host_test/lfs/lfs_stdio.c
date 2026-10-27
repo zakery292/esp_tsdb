@@ -16,6 +16,21 @@ bool hfs_counting = true;
 hfs_phase_t hfs_phases[HFS_MAX_PHASES];
 int hfs_nphases;
 
+long hfs_crash_after = -1;
+jmp_buf *hfs_crash_jmp;
+uint64_t hfs_mut_ops;
+int hfs_fail_creates;
+const char *hfs_fail_create_match = "";
+
+static void mut_point(void) {
+    hfs_mut_ops++;
+    if (hfs_crash_after < 0) return;
+    if (hfs_crash_after-- == 0) {
+        hfs_crash_after = -1;
+        longjmp(*hfs_crash_jmp, 1);
+    }
+}
+
 static lfs_t g_lfs;
 static struct lfs_config g_cfg;
 static hfs_config_t g_hcfg;
@@ -303,6 +318,7 @@ static int ck_seek(void *ck, off64_t *pos, int whence) {
 static int ck_close(void *ck) {
     hfs_file_t *h = ck;
     if (h->dead) { free(h->cache); free(h); return 0; }
+    if (h->writable) mut_point();
     int prev = phase_begin("close", h->path);
     if (g_hcfg.mtime && h->writable) h->mtime = (int64_t) time(NULL);
     int r = lfs_file_close(&g_lfs, &h->file);
@@ -344,6 +360,16 @@ FILE *__wrap_fopen(const char *path, const char *mode) {
         h->fcfg.attr_count = 1;
     }
     h->writable = (flags & 3) != LFS_O_RDONLY;
+    if (h->writable) {
+        if (hfs_fail_creates > 0 && strstr(path, hfs_fail_create_match) != NULL) {
+            hfs_fail_creates--;
+            free(h->cache);
+            free(h);
+            errno = EIO;
+            return NULL;
+        }
+        mut_point();
+    }
 
     int prev = phase_begin("open", path);
     int err = lfs_file_opencfg(&g_lfs, &h->file, lp, flags, &h->fcfg);
@@ -389,6 +415,7 @@ int __wrap_fsync(int fd) {
     int i = fd - HFS_FD_BASE;
     if (i < 0 || i >= HFS_MAX_FILES || g_files[i] == NULL) return __real_fsync(fd);
     hfs_file_t *h = g_files[i];
+    mut_point();
     if (hfs_fail_fsyncs > 0) { hfs_fail_fsyncs--; errno = EIO; return -1; }   // injected
     int prev = phase_begin("fsync", h->path);
     int r = esp_sync(h);
@@ -401,6 +428,7 @@ int __real_unlink(const char *path);
 int __wrap_unlink(const char *path) {
     const char *lp = lfs_path(path);
     if (lp == NULL) return __real_unlink(path);
+    mut_point();
     int prev = phase_begin("unlink", path);
     int r = lfs_remove(&g_lfs, lp);
     phase_end(prev);
@@ -413,6 +441,7 @@ int __wrap_rename(const char *a, const char *b) {
     const char *la = lfs_path(a), *lb = lfs_path(b);
     if (la == NULL && lb == NULL) return __real_rename(a, b);
     if (la == NULL || lb == NULL) { errno = EXDEV; return -1; }
+    mut_point();
     int prev = phase_begin("rename", b);
     int r = lfs_rename(&g_lfs, la, lb);
     phase_end(prev);
@@ -424,6 +453,7 @@ int __real_mkdir(const char *path, mode_t mode);
 int __wrap_mkdir(const char *path, mode_t mode) {
     const char *lp = lfs_path(path);
     if (lp == NULL) return __real_mkdir(path, mode);
+    mut_point();
     int prev = phase_begin("mkdir", path);
     int r = lfs_mkdir(&g_lfs, lp);
     phase_end(prev);
@@ -435,6 +465,7 @@ int __real_rmdir(const char *path);
 int __wrap_rmdir(const char *path) {
     const char *lp = lfs_path(path);
     if (lp == NULL) return __real_rmdir(path);
+    mut_point();
     int prev = phase_begin("rmdir", path);
     int r = lfs_remove(&g_lfs, lp);
     phase_end(prev);
@@ -539,6 +570,7 @@ int __real_truncate(const char *path, off_t len);
 int __wrap_truncate(const char *path, off_t len) {
     const char *lp = lfs_path(path);
     if (lp == NULL) return __real_truncate(path, len);
+    mut_point();
     int prev = phase_begin("truncate", path);
     lfs_file_t f;
     int r = lfs_file_open(&g_lfs, &f, lp, LFS_O_RDWR);

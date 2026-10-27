@@ -192,6 +192,11 @@ struct tsdb_s {
     // inside tsdb_write_batch_h (deferred flush).
     uint32_t cached_block_num;      // block index within the active segment; UINT32_MAX = none
     bool cache_dirty;
+    // Last successful flush of a deferred block: the newest segment then had
+    // flushed_records records, all on disk (tsdb_write_batch_h's rollback).
+    uint32_t flushed_seq;
+    uint32_t flushed_records;
+    uint32_t flushed_last_ts;
 
     // Schema and capacity
     tsdb_schema_t schema;

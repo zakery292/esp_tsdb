@@ -675,6 +675,68 @@ static void fault_case(const char *label, int mode) {
     if (db) tsdb_close_h(db);
 }
 
+// Review B2: a batch that crosses a segment boundary. The full segment's last
+// block holds deferred records; moving on flushes it (they are now on disk)
+// and then creating the next segment fails. The batch reports the failure,
+// but the records it had already flushed are on disk and must be counted —
+// "records before the failing one are persisted".
+static void fault_batch_segment_create(void) {
+    opts_t o = {.fs_blocks = 64, .other_kb = 24};
+    mount_fs(&o);
+    tsdb_config_t cfg = small_config(20000);
+    tsdb_t *db = tsdb_open(&cfg);
+    // Fill the first segment to 32 records short of full with single writes.
+    uint32_t ts = write_n(db, 1700000000u, 1);
+    tsdb_stats_t s;
+    int64_t seg_size; int nseg;
+    seg_files(&seg_size, &nseg);
+    uint32_t room = 0;
+    {
+        // Records per segment: data blocks (file size - 1 KB header, at full
+        // size) x RPB. Derived by writing until a second segment appears.
+        uint32_t n = 1;
+        for (;;) {
+            seg_files(&seg_size, &nseg);
+            if (nseg > 1) break;
+            ts = write_n(db, ts, 1);
+            n++;
+        }
+        room = n - 1;
+    }
+    tsdb_close_h(db);
+    // Start over: room - 32 records, then a 64-record batch whose 33rd record
+    // needs the next segment.
+    mount_fs(&o);
+    db = tsdb_open(&cfg);
+    ts = write_n(db, 1700000000u, room - 32);
+    static uint32_t tss[64];
+    static int16_t rows[64][NPARAM];
+    const int16_t *vals[64];
+    for (int i = 0; i < 64; i++) { tss[i] = ts + i * 60; fill(rows[i], tss[i]); vals[i] = rows[i]; }
+    hfs_fail_creates = 1;
+    hfs_fail_create_match = ".tsdb.s";
+    esp_err_t e = tsdb_write_batch_h(db, tss, vals, 64);
+    hfs_fail_creates = 0;
+    CHECK(e != ESP_OK, "batch across a segment boundary, next segment cannot be created: the batch reports it (%d)", e);
+    tsdb_get_stats_h(db, &s);
+    scan_t s0 = scan(db);
+    hfs_remount();   // power cut
+    db = tsdb_open(&cfg);
+    tsdb_stats_t sa = {0};
+    scan_t s1 = {0};
+    if (db) { tsdb_get_stats_h(db, &sa); s1 = scan(db); }
+    CHECK(s.total_records == room && s0.n == room && s1.n == room && sa.total_records == room && s1.ordered &&
+          s1.values,
+          "batch rollback forgets only what did not reach disk: %u records on disk (segment full), stats %u, "
+          "scan %u; after a power cut stats %u, scan %u", room, s.total_records, s0.n, sa.total_records, s1.n);
+    if (db) {
+        int16_t v[NPARAM];
+        fill(v, tss[63] + 60);
+        CHECK(tsdb_write_h(db, tss[63] + 60, v) == ESP_OK, "next write starts the next segment");
+        tsdb_close_h(db);
+    }
+}
+
 // A pre-2.0.1 (V2) file: records_per_block > 38 with the old struct offsets,
 // which open converts in place.
 static void make_v2_file(const char *path, uint32_t n) {
@@ -755,6 +817,7 @@ static int run_faults(void) {
     fault_case("device program failure", 1);
     fault_case("ENOSPC, nothing to evict", 2);
     fault_case("batch, fsync failure mid-batch", 3);
+    fault_batch_segment_create();
     fault_legacy_migration();
     return 0;
 }

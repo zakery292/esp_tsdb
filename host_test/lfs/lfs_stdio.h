@@ -15,6 +15,7 @@
 //     commit per writable fopen, even for "r+b".
 //   - fsync() and close() set mtime = time(NULL) then sync.
 //   - newlib FILE buffering (ESP-IDF's BUFSIZ is 128).
+#include <setjmp.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include "lfs.h"
@@ -83,3 +84,20 @@ extern uint64_t hfs_nospc;
 // Fault injection: the next N fsync() calls on littlefs files fail with EIO
 // without syncing.
 extern int hfs_fail_fsyncs;
+
+// Power-cut injection. Every MUTATING operation on a littlefs path (a writable
+// fopen, fsync, the close of a writable file, unlink, rename, mkdir, rmdir,
+// truncate) is a crash point; hfs_mut_ops counts them. When hfs_crash_after
+// is >= 0 it is decremented at each one, and the operation that finds it at 0
+// does NOT happen: control longjmps to *hfs_crash_jmp instead (the test then
+// calls hfs_remount(), which abandons every open file like a reset would —
+// data written but not synced is lost, as on the device). Crashing "before
+// operation k+1" is crashing "after operation k"; littlefs commits are atomic,
+// so these are all the states a power cut can leave. -1 = off.
+extern long hfs_crash_after;
+extern jmp_buf *hfs_crash_jmp;
+extern uint64_t hfs_mut_ops;
+// Fault injection: the next N writable fopen() calls whose path contains
+// hfs_fail_create_match fail with EIO (nothing created).
+extern int hfs_fail_creates;
+extern const char *hfs_fail_create_match;
