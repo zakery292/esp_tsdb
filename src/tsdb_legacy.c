@@ -416,10 +416,18 @@ static esp_err_t migrate_v2_blocks(tsdb_legacy_t *l) {
 
 void tsdb_legacy_remove(const char *path) {
     char p[160];
-    unlink(path);
+    // Order matters for a power cut part-way. The sidecars go before the
+    // main file, so none can outlive it (nothing would ever remove them:
+    // ~16-20 KB for good). But a main file whose sidecars are gone would be
+    // adopted with its in-file header, up to 31 records (2.4.4) or a whole
+    // session (2.4.3) stale, and out of order on a wrapped ring — so it is
+    // emptied first: one commit, and the next open discards a file too short
+    // to hold a header.
+    if (truncate(path, 0) != 0) { /* absent: nothing to neutralise */ }
     sidecar_remove(path);
     snprintf(p, sizeof(p), "%s.mig", path);
     unlink(p);
+    unlink(path);
 }
 
 void tsdb_legacy_close(tsdb_legacy_t *l) {
@@ -438,6 +446,10 @@ esp_err_t tsdb_legacy_open(const char *path, const tsdb_config_t *config, tsdb_l
     // block conversion below, reopens it for writing.
     FILE *f = fopen(path, "rb");
     if (f == NULL) {
+        // Sidecars without a main file are orphans of a removal cut short by
+        // a power loss (pre-3.0 order: main file first). Nothing reads them;
+        // remove them (no-ops, without a commit, when they are absent).
+        sidecar_remove(path);
         return ESP_ERR_NOT_FOUND;
     }
 

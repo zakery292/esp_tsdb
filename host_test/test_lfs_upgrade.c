@@ -30,6 +30,7 @@
 #include "lfs/lfs_stdio.h"
 
 #include <dirent.h>
+#include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -861,9 +862,98 @@ static int run_faults(void) {
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// legacy: failure cases around an adopted 2.x database
+// ---------------------------------------------------------------------------
+
+typedef struct { uint32_t n, first, last; } expect_t;
+
+static bool read_expected(const char *dir, expect_t *e) {
+    char p[600];
+    snprintf(p, sizeof(p), "%s/expected", dir);
+    FILE *f = fopen(p, "r");
+    bool ok = f && fscanf(f, "%u %u %u", &e->n, &e->first, &e->last) == 3;
+    if (f) fclose(f);
+    return ok;
+}
+
+// Fresh partition (firmware layout) holding the 2.x database from `dir`.
+static void setup_legacy(const char *dir, const opts_t *o) {
+    mount_fs(o);
+    bool was = hfs_counting;
+    hfs_counting = false;
+    import_legacy(dir);
+    hfs_counting = was;
+}
+
+static bool exact(const scan_t *s, const expect_t *e) {
+    return s->n == e->n && s->first == e->first && s->last == e->last && s->ordered && s->values;
+}
+
+// Any file the 2.x database or its conversion leaves besides segments.
+static int legacy_leftovers(void) {
+    static const char *const f[] = {"/energy.tsdb.h0", "/energy.tsdb.h1", "/energy.tsdb.d/h0",
+                                    "/energy.tsdb.d/h1", "/energy.tsdb.d", "/energy.tsdb.mig",
+                                    "/energy.tsdb.cv"};
+    int n = 0;
+    for (size_t i = 0; i < sizeof(f) / sizeof(f[0]); i++) n += lfs_exists(f[i]);
+    return n;
+}
+
+// Review B1: removing an adopted 2.x database (here: tsdb_clear) must not
+// leave its sidecars behind if the power is cut part-way, and must never
+// leave a main file that a reboot would adopt with a stale header (2.4.4's
+// newest state lives only in the sidecars). Power cut before every mutating
+// operation of the clear; after the reboot, the database must read as the
+// whole adopted history or as empty, and once the main file is gone no
+// sidecar may remain.
+static void legacy_clear_crash_sweep(const char *dir, const opts_t *o, const expect_t *e,
+                                     const tsdb_config_t *cfg) {
+    setup_legacy(dir, o);
+    tsdb_t *db = tsdb_open(cfg);
+    uint64_t m0 = hfs_mut_ops;
+    tsdb_clear_h(db);
+    uint32_t ops = (uint32_t) (hfs_mut_ops - m0);
+    tsdb_close_h(db);
+    uint32_t orphaned = 0, stale = 0, failed_open = 0, orphan_at = 0, stale_at = 0;
+    for (uint32_t k = 0; k < ops; k++) {
+        setup_legacy(dir, o);
+        db = tsdb_open(cfg);
+        jmp_buf jb;
+        hfs_crash_jmp = &jb;
+        if (setjmp(jb) == 0) {
+            hfs_crash_after = k;
+            tsdb_clear_h(db);
+        }
+        hfs_crash_after = -1;
+        hfs_remount();
+        db = tsdb_open(cfg);
+        if (db == NULL) { failed_open++; continue; }
+        scan_t s = scan(db);
+        if (!(s.n == 0 || exact(&s, e))) { if (!stale) stale_at = k; stale++; }
+        if (!lfs_exists("/energy.tsdb") && legacy_leftovers() > 0) { if (!orphaned) orphan_at = k; orphaned++; }
+        tsdb_close_h(db);
+    }
+    CHECK(failed_open == 0 && stale == 0,
+          "clear, power cut before each of its %u mutating operations: the reboot reads the whole history "
+          "or none (%u stale, first at op %u; %u failed opens)", ops, stale, stale_at, failed_open);
+    CHECK(orphaned == 0,
+          "clear, power cut part-way: no sidecar outlives the main file (%u of %u crash points left some, "
+          "first at op %u)", orphaned, ops, orphan_at);
+}
+
+static int run_legacy(const char *dir, const opts_t *o) {
+    expect_t e;
+    if (!read_expected(dir, &e)) { printf("cannot read %s/expected\n", dir); return 1; }
+    tsdb_config_t cfg = fw_config(fw_max_records(o->fs_blocks * 4096));
+    printf("legacy %s: %u records %u..%u, max_records %u\n", dir, e.n, e.first, e.last, cfg.max_records);
+    legacy_clear_crash_sweep(dir, o, &e, &cfg);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: test_lfs_upgrade upgrade <legacy_dir> | fresh | faults [opts]\n");
+        fprintf(stderr, "usage: test_lfs_upgrade upgrade <legacy_dir> | legacy <legacy_dir> | fresh | faults [opts]\n");
         return 2;
     }
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -872,7 +962,7 @@ int main(int argc, char **argv) {
     const char *mode = argv[1];
     const char *dir = NULL;
     int i = 2;
-    if (strcmp(mode, "upgrade") == 0) {
+    if (strcmp(mode, "upgrade") == 0 || strcmp(mode, "legacy") == 0) {
         if (argc < 3) return 2;
         dir = argv[2];
         i = 3;
@@ -901,6 +991,7 @@ int main(int argc, char **argv) {
     g_guard_kb = o.guard_kb;
     int r;
     if (strcmp(mode, "upgrade") == 0) r = run_upgrade(dir, &o);
+    else if (strcmp(mode, "legacy") == 0) r = run_legacy(dir, &o);
     else if (strcmp(mode, "fresh") == 0) r = run_fresh(&o);
     else if (strcmp(mode, "faults") == 0) r = run_faults();
     else return 2;
