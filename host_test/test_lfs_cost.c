@@ -25,6 +25,10 @@
 //     --trace N          print the per-operation breakdown of record N
 //     --csv PATH         per-write reads to PATH
 //     --check            assert regression thresholds (used by run_lfs_cost.sh)
+//     --truncate-probe KB  instead: shrink a KB-sized file from its end in
+//                        --probe-chunk-kb steps (default 83) and report the cost
+//     --truncate-probe KB  instead: shrink a KB-sized file from its end in
+//                        --probe-chunk-kb steps (default 83) and report the cost
 //
 // Prints a summary: reads per write (mean/p50/p99/p99.9/max), progs, erases,
 // metadata commits/compactions (all dirs and root only), full-FS traversals,
@@ -39,6 +43,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #define DB_PATH HFS_MOUNT "/energy.tsdb"
 
@@ -105,9 +110,74 @@ static void print_counters(const char *label, const hfs_counters_t *c, uint64_t 
            (unsigned long long) c->ev[LFS_H_ALLOC_SCAN]);
 }
 
+static hfs_counters_t ctr_delta(const hfs_counters_t *a) {
+    hfs_counters_t d;
+    const uint64_t *pa = (const uint64_t *) a, *pc = (const uint64_t *) &hfs_ctr;
+    uint64_t *pd = (uint64_t *) &d;
+    for (size_t k = 0; k < sizeof(d) / sizeof(uint64_t); k++) pd[k] = pc[k] - pa[k];
+    return d;
+}
+
+static void print_step(const char *label, const hfs_counters_t *d) {
+    printf("  %-34s reads %6llu (%7.1f KB) progs %5llu erases %4llu commits %3llu  est %7.1f ms\n", label,
+           (unsigned long long) d->reads, d->read_bytes / 1024.0, (unsigned long long) d->progs,
+           (unsigned long long) d->erases, (unsigned long long) d->ev[LFS_H_COMMIT], est_ms(d));
+}
+
+// --truncate-probe: what the 3.0 upgrade's legacy conversion relies on. A
+// 2.5 MB file (the firmware's full 2.x database) is shrunk from its END in
+// `chunk_kb` steps, with the tail copy each step implies (open read-only,
+// read the last chunk). littlefs stores a file as a backward-linked CTZ
+// skip-list, so cutting the end should only rewrite metadata.
+static int truncate_probe(uint32_t file_kb, uint32_t chunk_kb) {
+    char *buf = malloc(4096);
+    memset(buf, 0x5A, 4096);
+    FILE *f = fopen(DB_PATH, "wb");
+    for (uint32_t done = 0; done < file_kb; done += 4) {
+        uint32_t n = (file_kb - done) * 1024 < 4096 ? (file_kb - done) * 1024 : 4096;
+        fwrite(buf, n, 1, f);
+    }
+    fclose(f);
+    printf("truncate probe: %u KB file, %u KB steps, free %lld KB\n", file_kb, chunk_kb,
+           (long long) hfs_free_bytes() / 1024);
+    uint32_t size = file_kb * 1024, steps = 0;
+    double worst_trunc = 0, worst_read = 0, total = 0;
+    hfs_counters_t worst_t = {0};
+    while (size > chunk_kb * 1024) {
+        uint32_t len = chunk_kb * 1024;
+        hfs_refresh_root_pairs();
+        hfs_counters_t b0 = hfs_ctr;
+        FILE *r = fopen(DB_PATH, "rb");
+        fseek(r, size - len, SEEK_SET);
+        for (uint32_t o = 0; o < len; o += 1024) if (fread(buf, 1024, 1, r) != 1) break;
+        fclose(r);
+        hfs_counters_t dr = ctr_delta(&b0);
+        hfs_counters_t b1 = hfs_ctr;
+        int rc = truncate(DB_PATH, size - len);
+        hfs_counters_t dt = ctr_delta(&b1);
+        if (rc != 0) { printf("  truncate FAIL at %u\n", size); return 1; }
+        if (steps == 0) {
+            print_step("first step: open+seek+read tail", &dr);
+            print_step("first step: truncate", &dt);
+        }
+        if (est_ms(&dt) > worst_trunc) { worst_trunc = est_ms(&dt); worst_t = dt; }
+        if (est_ms(&dr) > worst_read) worst_read = est_ms(&dr);
+        total += est_ms(&dt) + est_ms(&dr);
+        size -= len;
+        steps++;
+    }
+    struct stat st;
+    stat(DB_PATH, &st);
+    print_step("worst truncate", &worst_t);
+    printf("  %u steps, worst tail read %.1f ms, worst truncate %.1f ms, total %.0f ms; final size %ld, free %lld KB\n",
+           steps, worst_read, worst_trunc, total, (long) st.st_size, (long long) hfs_free_bytes() / 1024);
+    free(buf);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     uint32_t records = 20000, budget = 2560000, params = 7, stride = 380, interval = 300, churn = 0;
-    uint32_t trace = UINT32_MAX;
+    uint32_t trace = UINT32_MAX, probe_kb = 0, probe_chunk_kb = 83;
     const char *csv = NULL;
     bool check = false;
     hfs_config_t fc = hfs_default_config();
@@ -130,6 +200,8 @@ int main(int argc, char **argv) {
         OPT("--inline-max", fc.inline_max);
         OPT("--block-cycles", fc.block_cycles);
         OPT("--stdio-buf", fc.stdio_buf);
+        OPT("--truncate-probe", probe_kb);
+        OPT("--probe-chunk-kb", probe_chunk_kb);
 #undef OPT
         if (strcmp(a, "--no-mtime") == 0) { fc.mtime = false; continue; }
         if (strcmp(a, "--csv") == 0) { csv = v; i++; continue; }
@@ -140,6 +212,7 @@ int main(int argc, char **argv) {
 
     if (hfs_format_and_mount(&fc) != 0) { printf("mount FAIL\n"); return 1; }
     populate_root();
+    if (probe_kb) return truncate_probe(probe_kb, probe_chunk_kb);
 
     tsdb_config_t cfg = {0};
     cfg.filepath = DB_PATH;
