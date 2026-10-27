@@ -349,7 +349,8 @@ FILE *__wrap_fopen(const char *path, const char *mode) {
     if (slot < 0) { errno = EMFILE; return NULL; }
 
     hfs_file_t *h = calloc(1, sizeof(*h));
-    h->cache = malloc(g_cfg.cache_size);
+    if (h != NULL) h->cache = malloc(g_cfg.cache_size);
+    if (h == NULL || h->cache == NULL) { free(h); errno = ENOMEM; return NULL; }
     snprintf(h->path, sizeof(h->path), "%s", path);
     h->fcfg.buffer = h->cache;
     if (g_hcfg.mtime) {
@@ -525,6 +526,7 @@ DIR *__wrap_opendir(const char *path) {
     for (int i = 0; i < HFS_MAX_DIRS; i++) if (g_dirs[i] == NULL) { slot = i; break; }
     if (slot < 0) { errno = EMFILE; return NULL; }
     hfs_dir_t *d = calloc(1, sizeof(*d));
+    if (d == NULL) { errno = ENOMEM; return NULL; }
     snprintf(d->path, sizeof(d->path), "%s", path);
     int prev = phase_begin("opendir", path);
     int r = lfs_dir_open(&g_lfs, &d->dir, lp);

@@ -27,6 +27,7 @@
 // --guard-kb N (configure the free-space guard with this reserve; off by
 // default, as in the firmware).
 #include "esp_tsdb.h"
+#include "tsdb_internal.h"
 #include "lfs/lfs_stdio.h"
 
 #include <dirent.h>
@@ -837,7 +838,10 @@ static void fault_legacy_migration(void) {
     hfs_fail_progs_after = 0;          // every program fails during the conversion
     tsdb_t *db = tsdb_open(&cfg);
     hfs_fail_progs_after = -1;
-    CHECK(db == NULL, "legacy V2->V3 conversion: tsdb_open fails when the conversion cannot be written");
+    scan_t s0 = db ? scan(db) : (scan_t){0};
+    CHECK(db == NULL || s0.n == 0,
+          "legacy V2->V3 conversion: when it cannot be written, the file is not adopted (open %s, %u records)",
+          db ? "succeeds without it" : "fails", s0.n);
     if (db) { tsdb_close_h(db); }
     hfs_remount();
     db = tsdb_open(&cfg);
@@ -942,12 +946,115 @@ static void legacy_clear_crash_sweep(const char *dir, const opts_t *o, const exp
           "first at op %u)", orphaned, ops, orphan_at);
 }
 
+// Allocation-failure injection (linked with --wrap=malloc,--wrap=calloc).
+// While g_alloc_arm is set, allocations are counted; the g_alloc_fail_at-th
+// (1-based) fails, or every one of exactly g_alloc_fail_size bytes.
+static bool g_alloc_arm;
+static uint32_t g_alloc_count, g_alloc_fail_at;
+static size_t g_alloc_fail_size;
+void *__real_malloc(size_t n);
+void *__real_calloc(size_t a, size_t b);
+static bool alloc_fails(size_t n) {
+    if (!g_alloc_arm) return false;
+    g_alloc_count++;
+    if (g_alloc_fail_at && g_alloc_count == g_alloc_fail_at) return true;
+    return g_alloc_fail_size && n == g_alloc_fail_size;
+}
+void *__wrap_malloc(size_t n) { return alloc_fails(n) ? NULL : __real_malloc(n); }
+void *__wrap_calloc(size_t a, size_t b) { return alloc_fails(a * b) ? NULL : __real_calloc(a, b); }
+
+typedef struct { int64_t main_size; int sidecars; } legacy_files_t;
+static legacy_files_t legacy_files(void) {
+    legacy_files_t f = {-1, 0};
+    struct stat st;
+    bool was = hfs_counting;
+    hfs_counting = false;
+    if (stat(DB_PATH, &st) == 0) f.main_size = st.st_size;
+    hfs_counting = was;
+    f.sidecars = legacy_leftovers();
+    return f;
+}
+
+// Review B4: a transient out-of-memory while adopting the 2.x file must not
+// fail tsdb_open (that disables history until the next reboot). The handle
+// opens without the legacy history for the moment; the file and its sidecars
+// are left exactly as they are (never deleted, never converted, never adopted
+// with a stale header); a later open adopts all of it.
+static void legacy_nomem(const char *dir, const opts_t *o, const expect_t *e, const tsdb_config_t *cfg) {
+    static const struct { const char *what; size_t size; } cases[] = {
+        {"the legacy handle", sizeof(tsdb_legacy_t)},
+        {"the sidecar header copy", sizeof(tsdb_header_t)},
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        setup_legacy(dir, o);
+        legacy_files_t f0 = legacy_files();
+        g_alloc_count = 0; g_alloc_fail_at = 0; g_alloc_fail_size = cases[c].size; g_alloc_arm = true;
+        tsdb_t *db = tsdb_open(cfg);
+        g_alloc_arm = false; g_alloc_fail_size = 0;
+        scan_t s = db ? scan(db) : (scan_t){0};
+        bool wrote = false;
+        if (db) {
+            int16_t v[NPARAM];
+            fill(v, e->last + 300);
+            wrote = tsdb_write_h(db, e->last + 300, v) == ESP_OK;
+            tsdb_close_h(db);
+        }
+        legacy_files_t f1 = legacy_files();
+        CHECK(db != NULL && wrote && (s.n == 0 || exact(&s, e)) && f1.main_size == f0.main_size &&
+              f1.sidecars == f0.sidecars,
+              "out of memory for %s (%zu B) at open: the database opens (%d) and takes writes (%d), "
+              "reading the adopted history whole or not at all (%u records); the 2.x files untouched "
+              "(%lld -> %lld B, %d -> %d sidecars)", cases[c].what, cases[c].size, db != NULL, wrote, s.n,
+              (long long) f0.main_size, (long long) f1.main_size, f0.sidecars, f1.sidecars);
+        hfs_remount();
+        db = tsdb_open(cfg);
+        s = db ? scan(db) : (scan_t){0};
+        uint32_t want_n = e->n + 1 > cfg->max_records ? cfg->max_records : e->n + 1;
+        uint32_t want_first = e->n + 1 > cfg->max_records ? e->first + 300 : e->first;
+        CHECK(db && s.n == want_n && s.first == want_first && s.last == e->last + 300 && s.ordered && s.values,
+              "the next open adopts the whole history plus the new record (%u records %u..%u)", s.n, s.first,
+              s.last);
+        if (db) tsdb_close_h(db);
+    }
+    // Every allocation tsdb_open makes, failed one at a time: an open that
+    // succeeds never shows a partial or stale adoption.
+    setup_legacy(dir, o);
+    g_alloc_count = 0; g_alloc_fail_at = 0; g_alloc_arm = true;
+    tsdb_t *db = tsdb_open(cfg);
+    g_alloc_arm = false;
+    uint32_t allocs = g_alloc_count, bad = 0, nulls = 0;
+    tsdb_close_h(db);
+    for (uint32_t k = 1; k <= allocs; k++) {
+        setup_legacy(dir, o);
+        legacy_files_t f0 = legacy_files();
+        g_alloc_count = 0; g_alloc_fail_at = k; g_alloc_arm = true;
+        db = tsdb_open(cfg);
+        g_alloc_arm = false; g_alloc_fail_at = 0;
+        legacy_files_t f1 = legacy_files();
+        if (db == NULL) {
+            nulls++;
+            if (f1.main_size != f0.main_size || f1.sidecars != f0.sidecars) bad++;
+            continue;
+        }
+        scan_t s = scan(db);
+        if (!exact(&s, e) && !(s.n == 0 && f1.main_size == f0.main_size && f1.sidecars == f0.sidecars)) {
+            bad++;
+            printf("    allocation %u failed: %u records %u..%u, files %lld B / %d sidecars (were %lld / %d)\n", k,
+                   s.n, s.first, s.last, (long long) f1.main_size, f1.sidecars, (long long) f0.main_size, f0.sidecars);
+        }
+        tsdb_close_h(db);
+    }
+    CHECK(bad == 0, "each of the %u allocations of tsdb_open failed in turn: the history is adopted whole, or "
+                    "not at all with its files untouched (%u bad; %u opens failed outright)", allocs, bad, nulls);
+}
+
 static int run_legacy(const char *dir, const opts_t *o) {
     expect_t e;
     if (!read_expected(dir, &e)) { printf("cannot read %s/expected\n", dir); return 1; }
     tsdb_config_t cfg = fw_config(fw_max_records(o->fs_blocks * 4096));
     printf("legacy %s: %u records %u..%u, max_records %u\n", dir, e.n, e.first, e.last, cfg.max_records);
     legacy_clear_crash_sweep(dir, o, &e, &cfg);
+    legacy_nomem(dir, o, &e, &cfg);
     return 0;
 }
 

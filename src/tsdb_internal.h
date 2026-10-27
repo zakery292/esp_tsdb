@@ -153,8 +153,8 @@ typedef struct {
 // Opens <path> if it is a pre-3.0 database, read-only. ESP_ERR_NOT_FOUND if
 // absent; ESP_ERR_INVALID_RESPONSE if present but unusable (it is then
 // removed so the next open is clean); any other error (I/O failure while
-// converting a V2 file, out of memory) is the caller's to report — the file
-// is left in place. Performs the pre-3.0 recovery steps (sidecar adoption
+// converting a V2 file, out of memory) leaves every file exactly as it was —
+// the caller runs without it and retries later. Performs the pre-3.0 recovery steps (sidecar adoption
 // incl. 2.4.4's <path>.d/ slots, header reconstruction, V2->V3 block layout
 // migration, .mig adoption).
 esp_err_t tsdb_legacy_open(const char *path, const tsdb_config_t *config, tsdb_legacy_t **out);
@@ -221,6 +221,10 @@ struct tsdb_s {
     FILE *active;
 
     tsdb_legacy_t *legacy;          // non-NULL while segs[0] is the legacy file
+    // A 2.x file is present but could not be adopted at open for a transient
+    // reason (out of memory): the handle runs without its history, and never
+    // deletes or converts it, until a later attempt adopts it.
+    bool legacy_retry;
 
     // Queries open on this handle (same task, recursive mutex). Schema
     // changes, clear and delete close/unlink files a query may be reading

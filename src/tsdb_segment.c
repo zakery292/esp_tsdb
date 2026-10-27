@@ -556,6 +556,11 @@ void tsdb_remove_all_files(tsdb_t *db) {
         }
         tsdb_seg_table_pop_front(db);
     }
+    if (db->legacy_retry) {
+        // Cleared while a 2.x file was present but not adopted: it goes too.
+        tsdb_legacy_remove(db->filepath);
+        db->legacy_retry = false;
+    }
     db->total_physical = 0;
     db->head_skip = 0;
 }

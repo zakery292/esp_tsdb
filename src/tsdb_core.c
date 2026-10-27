@@ -240,12 +240,15 @@ tsdb_t *tsdb_open(const tsdb_config_t *config) {
     tsdb_legacy_t *legacy = NULL;
     esp_err_t lr = tsdb_legacy_open(config->filepath, config, &legacy);
     if (lr != ESP_OK && lr != ESP_ERR_NOT_FOUND && lr != ESP_ERR_INVALID_RESPONSE) {
-        // The legacy file exists and could not be adopted (I/O error while
-        // converting it, out of memory): fail the open rather than start a
-        // new database beside it and report success.
-        ESP_LOGE(TAG, "Cannot adopt the pre-3.0 database at %s (%d)", config->filepath, lr);
-        teardown(db);
-        return NULL;
+        // The legacy file exists and could not be adopted now (out of
+        // memory, an I/O error). Failing the open would disable history until
+        // the next reboot; run without the old history instead and leave its
+        // files alone (never deleted or converted in this state). New records
+        // go to segments, which sort after it; the next adoption attempt
+        // brings it back in order.
+        ESP_LOGE(TAG, "Cannot adopt the pre-3.0 database at %s now (%d) — opening without its history",
+                 config->filepath, lr);
+        db->legacy_retry = true;
     }
     if (lr == ESP_OK) {
         if (legacy->available > 0) {

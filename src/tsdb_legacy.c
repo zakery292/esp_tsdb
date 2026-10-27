@@ -120,6 +120,14 @@ static uint32_t crc32_(const void *data, size_t len) {
     return ~crc;
 }
 
+// Existence by stat(): an fopen() can also fail for lack of memory, and
+// "absent" decides which header is adopted and what gets deleted.
+static int path_state(const char *path) {
+    struct stat st;
+    if (stat(path, &st) == 0) return 1;
+    return errno == ENOENT ? 0 : -1;
+}
+
 // The authoritative sidecar state, starting from `base` (the in-file header:
 // TSH2 slots do not carry param_names). Heap, not stack, for the slots: open
 // runs on whatever task the caller has (a 4.6 KB main task on the dongle).
@@ -132,8 +140,16 @@ static esp_err_t sidecar_load(const char *filepath, const tsdb_header_t *base, t
     uint32_t seq_r = 0, seq_d = 0;
     for (uint8_t slot = 0; slot < 2; slot++) {
         snprintf(sc->path, sizeof(sc->path), "%s.h%u", filepath, (unsigned) slot);
-        FILE *f = fopen(sc->path, "rb");
-        if (f == NULL) continue;
+        int st = path_state(sc->path);
+        if (st == 0) continue;
+        FILE *f = st > 0 ? fopen(sc->path, "rb") : NULL;
+        if (f == NULL) {
+            // Present but unreadable now: deciding without it could pick a
+            // stale slot. Report; the caller retries the adoption later.
+            esp_err_t e = errno == ENOMEM ? ESP_ERR_NO_MEM : ESP_FAIL;
+            free(sc);
+            return e;
+        }
         size_t n = fread(&sc->s1, sizeof(sc->s1), 1, f);
         fclose(f);
         if (n != 1 || sc->s1.magic != TSDB_SIDECAR_MAGIC) continue;
@@ -149,8 +165,16 @@ static esp_err_t sidecar_load(const char *filepath, const tsdb_header_t *base, t
     }
     for (uint8_t slot = 0; slot < 2; slot++) {
         snprintf(sc->path, sizeof(sc->path), "%s.d/h%u", filepath, (unsigned) slot);
-        FILE *f = fopen(sc->path, "rb");
-        if (f == NULL) continue;
+        int st = path_state(sc->path);
+        if (st == 0) continue;
+        FILE *f = st > 0 ? fopen(sc->path, "rb") : NULL;
+        if (f == NULL) {
+            // Present but unreadable now: deciding without it could pick a
+            // stale slot. Report; the caller retries the adoption later.
+            esp_err_t e = errno == ENOMEM ? ESP_ERR_NO_MEM : ESP_FAIL;
+            free(sc);
+            return e;
+        }
         size_t n = fread(&sc->s2, sizeof(sc->s2), 1, f);
         fclose(f);
         if (n != 1 || sc->s2.magic != TSDB_SIDECAR2_MAGIC) continue;
@@ -206,22 +230,25 @@ static void sidecar_remove(const char *filepath) {
 // Orphaned .mig (2.2–2.5 schema migration crash window)
 // ---------------------------------------------------------------------------
 
-static void migrate_recover(const char *filepath) {
+static esp_err_t migrate_recover(const char *filepath) {
     char mig_path[140];
     snprintf(mig_path, sizeof(mig_path), "%s.mig", filepath);
-    FILE *mig = fopen(mig_path, "rb");
-    if (mig == NULL) return;
+    int ms = path_state(mig_path);
+    if (ms == 0) return ESP_OK;
+    if (ms < 0) return ESP_FAIL;
 
-    FILE *main_f = fopen(filepath, "rb");
-    if (main_f != NULL) {
-        fclose(main_f);
-        fclose(mig);
+    int main_state = path_state(filepath);
+    if (main_state < 0) return ESP_FAIL;
+    if (main_state == 1) {
         unlink(mig_path);
         ESP_LOGW(TAG, "Removed stale migration file %s", mig_path);
-        return;
+        return ESP_OK;
     }
     tsdb_header_t *hdr = malloc(sizeof(*hdr));
-    bool valid = hdr != NULL && (fread(hdr, sizeof(*hdr), 1, mig) == 1) && (hdr->magic == TSDB_MAGIC);
+    if (hdr == NULL) return ESP_ERR_NO_MEM;
+    FILE *mig = fopen(mig_path, "rb");
+    if (mig == NULL) { free(hdr); return ESP_FAIL; }
+    bool valid = (fread(hdr, sizeof(*hdr), 1, mig) == 1) && (hdr->magic == TSDB_MAGIC);
     free(hdr);
     fclose(mig);
     if (valid) {
@@ -234,6 +261,7 @@ static void migrate_recover(const char *filepath) {
         unlink(mig_path);
         ESP_LOGW(TAG, "Removed invalid orphaned migration file %s", mig_path);
     }
+    return ESP_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -438,19 +466,26 @@ void tsdb_legacy_close(tsdb_legacy_t *l) {
 
 esp_err_t tsdb_legacy_open(const char *path, const tsdb_config_t *config, tsdb_legacy_t **out) {
     *out = NULL;
-    migrate_recover(path);
+    esp_err_t mr0 = migrate_recover(path);
+    if (mr0 != ESP_OK) return mr0;
 
     // Read-only: 3.0 never writes to the adopted file (a writable open is a
     // metadata commit on esp_littlefs, and an in-place write rewrites the
     // file from that point to its end). The one exception, the V2->V3
     // block conversion below, reopens it for writing.
-    FILE *f = fopen(path, "rb");
-    if (f == NULL) {
+    int present = path_state(path);
+    if (present == 0) {
         // Sidecars without a main file are orphans of a removal cut short by
         // a power loss (pre-3.0 order: main file first). Nothing reads them;
         // remove them (no-ops, without a commit, when they are absent).
         sidecar_remove(path);
         return ESP_ERR_NOT_FOUND;
+    }
+    FILE *f = present < 0 ? NULL : fopen(path, "rb");
+    if (f == NULL) {
+        // Present (or unknown) but not openable now: out of memory, too many
+        // open files. Nothing is decided on it; the caller retries.
+        return errno == ENOMEM ? ESP_ERR_NO_MEM : ESP_FAIL;
     }
 
     tsdb_legacy_t *l = calloc(1, sizeof(*l));
@@ -478,8 +513,17 @@ esp_err_t tsdb_legacy_open(const char *path, const tsdb_config_t *config, tsdb_l
     if (!needs_reconstruction) {
         // A sidecar that is valid, geometrically identical and ahead of the
         // in-file header holds the records an unclean shutdown would lose.
+        // Out of memory here must not fall back to the in-file header: for a
+        // 2.4.x database closed by a power cut that is stale (records lost,
+        // a wrapped ring read out of order, an empty-looking file deleted).
         tsdb_header_t *sc = malloc(sizeof(*sc));
-        if (sc != NULL && sidecar_load(path, &l->header, sc) == ESP_OK) {
+        esp_err_t sr = sc == NULL ? ESP_ERR_NO_MEM : sidecar_load(path, &l->header, sc);
+        if (sr != ESP_OK && sr != ESP_ERR_NOT_FOUND) {
+            free(sc);
+            tsdb_legacy_close(l);
+            return sr;
+        }
+        if (sr == ESP_OK) {
             if (sc->magic == TSDB_MAGIC && header_is_sane(sc) &&
                 sc->num_params == l->header.num_params &&
                 sc->records_per_block == l->header.records_per_block &&

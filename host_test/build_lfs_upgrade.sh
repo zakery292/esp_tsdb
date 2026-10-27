@@ -18,4 +18,5 @@ gcc -O2 -g -Wall -Wno-unused -I shims -I ../include -I ../src -I lfs -I "$LFS_DI
   ../src/tsdb_legacy.c ../src/tsdb_segment.c \
   -Wl,--wrap=fopen,--wrap=fileno,--wrap=fsync,--wrap=unlink,--wrap=rename,--wrap=stat,--wrap=mkdir,--wrap=rmdir \
   -Wl,--wrap=opendir,--wrap=readdir,--wrap=closedir,--wrap=truncate \
+  -Wl,--wrap=malloc,--wrap=calloc \
   -o test_lfs_upgrade
