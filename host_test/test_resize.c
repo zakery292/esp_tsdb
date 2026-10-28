@@ -1,10 +1,9 @@
-// Host regression for tsdb_resize_h (v2.3): live ring-capacity changes.
-// Covers: fast header-only grow on an unwrapped DB (incl. writing past the
-// old capacity and past the preallocated index region — exercises the
-// index-write bounds guard), grow of a wrapped ring (streaming rewrite),
-// shrink keeping the newest records, overflow-extras fold on resize, and
-// no-op resize. Build with ./build_resize.sh.
+// Host regression for tsdb_resize_h: live capacity changes. Since 3.0 every
+// resize is instant: grow raises the window (records still on disk but
+// logically evicted come back into view), shrink keeps the newest records,
+// extras are untouched. Build with ./build_resize.sh.
 #include "esp_tsdb.h"
+#include "testutil.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,7 +35,7 @@ static int qscan(tsdb_t *db, uint32_t s, uint32_t e, int16_t *first0, int16_t *l
 }
 
 static tsdb_t *mk(uint32_t maxrec, uint8_t np, const char **names, int nwrite) {
-    remove(PATH); remove(PATH ".mig");
+    tsdb_test_wipe(PATH);
     tsdb_config_t c = {0};
     c.filepath = PATH; c.num_params = np; c.max_records = maxrec;
     c.index_stride = 10; c.buffer_pool_size = 16 * 1024;
@@ -94,24 +93,27 @@ int main(void) {
     CHECK(tsdb_resize_h(db, 300, NULL) == ESP_OK, "no-op resize OK");
     tsdb_close_h(db);
 
-    // ---- 2. Wrapped grow: 100 writes into a 60-ring, grow to 200 (rewrite).
-    printf("PART 2: wrapped grow (rewrite)\n");
+    // ---- 2. Wrapped grow: 100 writes into a 60-ring (retained 40..99), grow
+    //         to 200. Records 0..39 were only logically evicted and are still
+    //         in the (single, active) segment, so they come back into view.
+    printf("PART 2: wrapped grow (instant)\n");
     db = mk(60, 2, two, 100);
+    n = qscan(db, 0, 999999u, &f0, &l0);
+    CHECK(n == 60 && f0 == 40 && l0 == 99, "before: records 40..99 retained");
     CHECK(tsdb_resize_h(db, 200, NULL) == ESP_OK, "grow wrapped 60 -> 200");
     tsdb_get_stats_h(db, &st);
     CHECK(st.max_records == 200, "capacity now 200");
-    CHECK(st.total_records == 60, "retained 60 records");
+    CHECK(st.total_records == 100, "all 100 on-disk records visible again");
     n = qscan(db, 0, 999999u, &f0, &l0);
-    CHECK(n == 60 && f0 == 40 && l0 == 99, "records 40..99 survive, ordered");
-    // Ring continues cleanly after the rewrite.
+    CHECK(n == 100 && f0 == 0 && l0 == 99, "records 0..99, ordered");
     for (int i = 100; i < 130; i++) {
         int16_t v[2] = {(int16_t)i, (int16_t)(i + 1000)};
         tsdb_write_h(db, T0 + (uint32_t)i * DT, v);
     }
     n = qscan(db, 0, 999999u, &f0, &l0);
-    CHECK(n == 90 && f0 == 40 && l0 == 129, "writes continue after grow");
+    CHECK(n == 130 && f0 == 0 && l0 == 129, "writes continue after grow");
 
-    // ---- 3. Shrink: 90 retained -> keep newest 25.
+    // ---- 3. Shrink: 130 retained -> keep newest 25.
     printf("PART 3: shrink keeps newest\n");
     CHECK(tsdb_resize_h(db, 25, NULL) == ESP_OK, "shrink to 25");
     tsdb_get_stats_h(db, &st);
@@ -120,8 +122,8 @@ int main(void) {
     CHECK(n == 25 && f0 == 105 && l0 == 129, "newest 25 kept (105..129)");
     tsdb_close_h(db);
 
-    // ---- 4. Overflow extras force the rewrite path and get folded.
-    printf("PART 4: resize folds extras\n");
+    // ---- 4. Extras are untouched by a resize.
+    printf("PART 4: resize with extras\n");
     db = mk(100, 2, two, 20);
     const char *extras[] = {"tbat"};
     CHECK(tsdb_add_extra_params_h(db, extras, 1) == ESP_OK, "add extra");
@@ -129,17 +131,17 @@ int main(void) {
         int16_t v[3] = {(int16_t)i, (int16_t)(i + 1000), (int16_t)(i + 2000)};
         tsdb_write_h(db, T0 + (uint32_t)i * DT, v);
     }
-    CHECK(tsdb_resize_h(db, 500, NULL) == ESP_OK, "resize with extras (rewrite)");
+    CHECK(tsdb_resize_h(db, 500, NULL) == ESP_OK, "resize with extras");
     tsdb_get_stats_h(db, &st);
     CHECK(st.max_records == 500, "capacity 500");
-    CHECK(st.num_params == 3 && st.extra_params == 0, "extras folded to base");
+    CHECK(st.num_params == 2 && st.extra_params == 1, "extras still extras");
     tsdb_query_t q;
     uint32_t ts; int16_t v3[3];
     tsdb_query_init_h(db, &q, T0 + 30 * DT, T0 + 30 * DT, NULL, 0);
     n = 0;
     while (tsdb_query_next(&q, &ts, v3) == ESP_OK) n++;
     tsdb_query_close(&q);
-    CHECK(n == 1 && v3[2] == 2030, "extra value survives fold");
+    CHECK(n == 1 && v3[2] == 2030, "extra value survives resize");
     tsdb_close_h(db);
 
     printf("\n%s (%d failed)\n", fails ? "*** FAIL ***" : "*** PASS ***", fails);

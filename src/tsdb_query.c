@@ -1,552 +1,529 @@
 /**
  * @file tsdb_query.c
- * @brief Query and aggregation operations with streaming
+ * @brief Queries and aggregations across segments.
+ *
+ * Records are addressed by LOGICAL position: 0 = oldest retained record,
+ * total-1 = newest, spanning every segment in time order (the first
+ * `head_skip` physical records of the oldest segment are invisible). Each
+ * segment covers [seg_start, seg_start + records) of that space.
+ *
+ * Within a segment, blocks are time-ordered, so a window seek is a binary
+ * search over the in-RAM segment table (by last timestamp) followed by a
+ * binary search over that segment's records: O(log n) block reads.
  */
 
 #include "tsdb_internal.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
-#include <string.h>
+#include <stdlib.h>
 
 static const char *TAG = "TSDB_QUERY";
 
 // ============================================================================
-// QUERY OPERATIONS
+// SEGMENT CURSOR
+// ============================================================================
+
+static int64_t seg_logical_start(const tsdb_t *db, int i) {
+    int64_t start = -(int64_t) db->head_skip;
+    for (int j = 0; j < i; j++) start += db->segs[j].records;
+    return start;
+}
+
+static int seg_for_pos(const tsdb_t *db, uint32_t pos) {
+    int64_t start = -(int64_t) db->head_skip;
+    for (int i = 0; i < db->nsegs; i++) {
+        int64_t end = start + db->segs[i].records;
+        if ((int64_t) pos < end) return i;
+        start = end;
+    }
+    return -1;
+}
+
+static void q_leave(tsdb_query_t *q) {
+    if (q->owns_file && q->seg_file) fclose(q->seg_file);
+    q->seg_file = NULL;
+    q->owns_file = false;
+    q->seg_i = -1;
+    q->block_loaded = false;
+    q->cur_block = UINT32_MAX;
+}
+
+static esp_err_t q_enter(tsdb_query_t *q, int i) {
+    tsdb_t *db = q->db;
+    if (q->seg_i == i) return ESP_OK;
+    q_leave(q);
+    const tsdb_seg_t *seg = &db->segs[i];
+
+    q->seg_i = i;
+    q->seg_start = seg_logical_start(db, i);
+    q->seg_records = seg->records;
+    q->seg_rpb = seg->rpb;
+    q->seg_np = seg->np;
+    q->seg_data_offset = seg->data_offset;
+    q->seg_legacy = (seg->kind == TSDB_SEG_LEGACY);
+    q->seg_rank = seg->rank;
+    q->needs_extras = false;
+
+    // File handle: the legacy file and the active segment are read through
+    // the handle's own FILE* (littlefs forbids a second handle on a file that
+    // is open for writing); frozen and converted segments are opened
+    // read-only. Nothing closes or truncates these while the query is open:
+    // it holds the lock, and its own task's writes and maintenance steps are
+    // refused until it closes.
+    if (q->seg_legacy) {
+        // Closed only if the reopen after a cut failed: try again here.
+        if (db->legacy && db->legacy->file == NULL) db->legacy->file = fopen(db->legacy->path, "rb");
+        q->seg_file = db->legacy ? db->legacy->file : NULL;
+    } else if (i == db->nsegs - 1 && seg->kind == TSDB_SEG_NORMAL && db->active != NULL) {
+        q->seg_file = db->active;
+    } else {
+        char path[160];
+        tsdb_entry_path(db, seg, path, sizeof(path));
+        q->seg_file = fopen(path, "rb");
+        q->owns_file = (q->seg_file != NULL);
+    }
+    if (q->seg_file == NULL) {
+        ESP_LOGE(TAG, "Cannot open segment %lu", (unsigned long) seg->seq);
+        q->seg_i = -1;
+        return ESP_FAIL;
+    }
+
+    // Column map: identity when the segment has the current schema.
+    q->seg_identity = (seg->kind == TSDB_SEG_NORMAL && seg->schema_gen == db->schema.gen &&
+                       seg->np == db->schema.count);
+    if (q->seg_identity) {
+        for (uint8_t r = 0; r < q->num_params_to_fetch; r++) {
+            uint8_t c = q->param_indices[r];
+            q->col_map[r] = (c < seg->np) ? (int8_t) c : -1;
+        }
+        return ESP_OK;
+    }
+
+    char (*names)[TSDB_NAME_LEN] = calloc(seg->np, TSDB_NAME_LEN);
+    int8_t *full = malloc(TSDB_MAX_PARAMS);
+    if (names == NULL || full == NULL) {
+        free(names); free(full);
+        q_leave(q);
+        return ESP_ERR_NO_MEM;
+    }
+    if (q->seg_legacy) {
+        for (uint8_t j = 0; j < seg->np; j++) tsdb_legacy_column_name(db->legacy, j, names[j]);
+    } else if (tsdb_seg_read_schema(db, seg, q->seg_file, names, NULL, NULL) != ESP_OK) {
+        free(names); free(full);
+        q_leave(q);
+        return ESP_FAIL;
+    }
+    tsdb_map_columns(&db->schema, seg->np, names, full);
+    for (uint8_t r = 0; r < q->num_params_to_fetch; r++) {
+        uint8_t c = q->param_indices[r];
+        q->col_map[r] = (c < db->schema.count) ? full[c] : -1;
+        if (q->seg_legacy && q->col_map[r] >= (int8_t) db->legacy->header.num_params) {
+            q->needs_extras = true;
+        }
+    }
+    free(names); free(full);
+    return ESP_OK;
+}
+
+static esp_err_t q_enter_pos(tsdb_query_t *q, uint32_t pos) {
+    if (q->seg_i >= 0 && (int64_t) pos >= q->seg_start &&
+        (int64_t) pos < q->seg_start + q->seg_records) {
+        return ESP_OK;
+    }
+    int i = seg_for_pos(q->db, pos);
+    if (i < 0) return ESP_ERR_NOT_FOUND;
+    return q_enter(q, i);
+}
+
+// Locate physical record `phys` of the current segment: block + offset.
+static inline void q_locate(const tsdb_query_t *q, uint32_t phys, uint32_t *block, uint16_t *off) {
+    if (q->seg_legacy) {
+        tsdb_legacy_locate(q->db->legacy, q->seg_rank + phys, block, off);
+    } else {
+        *block = phys / q->seg_rpb;
+        *off = (uint16_t)(phys % q->seg_rpb);
+    }
+}
+
+static esp_err_t q_load(tsdb_query_t *q, uint32_t block) {
+    if (q->block_loaded && q->cur_block == block) return ESP_OK;
+    esp_err_t ret;
+    if (q->seg_legacy) {
+        ret = tsdb_legacy_read_block(q->db->legacy, block, q->block_buffer);
+    } else {
+        ret = tsdb_seg_read_block(q->seg_file, q->seg_data_offset, block, q->block_buffer);
+    }
+    q->block_loaded = (ret == ESP_OK);
+    q->cur_block = ret == ESP_OK ? block : UINT32_MAX;
+    return ret;
+}
+
+// Timestamp at logical position pos (block read as needed).
+static esp_err_t q_ts_at(tsdb_query_t *q, uint32_t pos, uint32_t *ts) {
+    esp_err_t ret = q_enter_pos(q, pos);
+    if (ret != ESP_OK) return ret;
+    uint32_t block; uint16_t off;
+    q_locate(q, (uint32_t)(pos - q->seg_start), &block, &off);
+    ret = q_load(q, block);
+    if (ret != ESP_OK) return ret;
+    *ts = TSDB_BLOCK_TS((uint8_t *) q->block_buffer, off);
+    return ESP_OK;
+}
+
+// Longest run of consecutive logical positions from pos that share a block.
+static uint32_t q_run(const tsdb_query_t *q, uint32_t pos) {
+    uint32_t phys = (uint32_t)(pos - q->seg_start);
+    uint32_t run;
+    if (q->seg_legacy) {
+        run = tsdb_legacy_run(q->db->legacy, q->seg_rank + phys);
+    } else {
+        run = q->seg_rpb - (phys % q->seg_rpb);
+    }
+    uint32_t left = q->seg_records - phys;
+    if (run > left) run = left;
+    uint32_t left_total = q->total - pos;
+    return run < left_total ? run : left_total;
+}
+
+static void q_emit(tsdb_query_t *q, uint32_t phys, uint16_t off, int16_t *values) {
+    const uint8_t *raw = (const uint8_t *) q->block_buffer;
+    int16_t extras[TSDB_MAX_EXTRA_PARAMS];
+    uint8_t legacy_np = 0;
+    if (q->needs_extras) {
+        legacy_np = q->db->legacy->header.num_params;
+        tsdb_legacy_read_extras(q->db->legacy, q->seg_rank + phys, extras);
+    }
+    for (uint8_t r = 0; r < q->num_params_to_fetch; r++) {
+        int8_t c = q->col_map[r];
+        if (c < 0) {
+            values[r] = 0;
+        } else if (q->needs_extras && c >= (int8_t) legacy_np) {
+            values[r] = extras[c - legacy_np];
+        } else {
+            values[r] = TSDB_BLOCK_PARAM(raw, q->seg_rpb, c, off);
+        }
+    }
+}
+
+// ============================================================================
+// SEEK
 // ============================================================================
 
 /**
- * @brief Binary-search the ring for the first retained record with
- *        ts >= query->start_time, in logical (time-ascending) order.
- *
- * The ring walk from oldest_record_idx is time-ascending by construction, so
- * logical positions are binary-searchable even after the ring wraps (unlike
- * the sparse index, whose entries are slot-ordered post-wrap). This replaces
- * an O(n) scan-to-window with O(log n) block reads — on a year-full database
- * a "last 24h" chart query drops from ~3400 block reads to ~17.
- *
- * Relies on the same timestamp monotonicity the iterator's early-exit
- * (ts > end_time) already assumes.
- *
- * @return Logical position k in [0, available] of the first record in range;
- *         0 (= start from the oldest, plain full walk) on any probe anomaly.
+ * @brief First logical position with ts >= target (== total if none).
+ *        ESP_FAIL on a probe anomaly (unreadable block / zero timestamp).
  */
-static uint32_t tsdb_seek_start(tsdb_query_t *query, uint32_t available,
-                                uint32_t first_slot, bool unlimited) {
-    uint16_t rpb = query->header.records_per_block;
-    uint32_t lo = 0, hi = available;   // invariant: ts(lo-1) < start_time <= ts(hi)
+static esp_err_t seek_pos(tsdb_query_t *q, uint32_t target, uint32_t *pos) {
+    tsdb_t *db = q->db;
+    if (q->total == 0) { *pos = 0; return ESP_OK; }
 
+    // Segment whose last record is the first >= target.
+    int lo_i = 0, hi_i = db->nsegs;          // segments are time-ordered
+    while (lo_i < hi_i) {
+        int mid = lo_i + (hi_i - lo_i) / 2;
+        if (db->segs[mid].last_ts < target) lo_i = mid + 1; else hi_i = mid;
+    }
+    if (lo_i == db->nsegs) { *pos = q->total; return ESP_OK; }
+
+    int64_t start = seg_logical_start(db, lo_i);
+    uint32_t lo = start < 0 ? 0 : (uint32_t) start;
+    uint32_t hi = (uint32_t)(start + db->segs[lo_i].records);
+    if (hi > q->total) hi = q->total;
+    // invariant: ts(lo-1) < target <= ts(hi)
     while (lo < hi) {
         uint32_t mid = lo + (hi - lo) / 2;
-        uint32_t slot = unlimited ? mid :
-                        ((first_slot + mid) % query->header.max_records);
-
-        if (tsdb_read_block(query->db, slot / rpb, query->block_buffer) != ESP_OK) {
-            return 0;   // truncation/corruption — fall back to the full walk
-        }
-        uint32_t ts = TSDB_BLOCK_TS((uint8_t *)query->block_buffer, slot % rpb);
-        if (ts == 0) {
-            return 0;   // unexpected hole — fall back to the full walk
-        }
-
-        if (ts < query->start_time) {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
+        uint32_t ts;
+        if (q_ts_at(q, mid, &ts) != ESP_OK || ts == 0) return ESP_FAIL;
+        if (ts < target) lo = mid + 1; else hi = mid;
     }
-    return lo;
+    *pos = lo;
+    return ESP_OK;
 }
 
-esp_err_t tsdb_query_init_h(tsdb_t *db,
-                            tsdb_query_t *query,
-                            uint32_t start_time,
-                            uint32_t end_time,
-                            const uint8_t *param_indices,
+static esp_err_t window_positions(tsdb_query_t *q, uint32_t *first, uint32_t *last_plus_one) {
+    if (q->total == 0) { *first = *last_plus_one = 0; return ESP_OK; }
+    uint32_t a = 0, b = q->total;
+    if (seek_pos(q, q->start_time, &a) != ESP_OK) return ESP_FAIL;
+    if (q->end_time != UINT32_MAX && seek_pos(q, q->end_time + 1, &b) != ESP_OK) return ESP_FAIL;
+    if (b < a) b = a;
+    *first = a;
+    *last_plus_one = b;
+    return ESP_OK;
+}
+
+// ============================================================================
+// QUERY API
+// ============================================================================
+
+esp_err_t tsdb_query_init_h(tsdb_t *db, tsdb_query_t *query, uint32_t start_time,
+                            uint32_t end_time, const uint8_t *param_indices,
                             uint8_t num_params_to_fetch) {
-    if (db == NULL || !db->is_open || query == NULL) {
-        ESP_LOGE(TAG, "Invalid state or NULL query");
-        return ESP_ERR_INVALID_STATE;
-    }
+    if (db == NULL || !db->is_open || query == NULL) return ESP_ERR_INVALID_STATE;
+    if (db->closing) return ESP_ERR_INVALID_STATE;
 
-    // Fail fast during a schema migration or close instead of stalling on
-    // the mutex.
-    if (db->migrating || db->closing) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    // Take the handle lock for the entire query lifecycle. Released by
-    // tsdb_query_close(). CRITICAL: callers MUST call tsdb_query_close()
-    // even on early-exit / error paths or the lock leaks. The mutex is
-    // recursive so the same task can also do writes.
+    // The handle lock is held for the whole query lifetime; released by
+    // tsdb_query_close(). Callers MUST close even on early exits.
     TSDB_LOCK_OPEN_OR_RETURN(db, 5000, ESP_ERR_TIMEOUT);
 
     if (start_time > end_time) {
-        ESP_LOGE(TAG, "Invalid time range: start > end");
         tsdb_unlock(db);
         return ESP_ERR_INVALID_ARG;
     }
 
-    memset(query, 0, sizeof(tsdb_query_t));
-
-    // Bind handle to the query iterator. tsdb_query_next() / _close() use
-    // this to access the underlying file + overflow state without a separate
-    // handle parameter (preserves the v2 API shape).
+    memset(query, 0, sizeof(*query));
     query->db = db;
-
-    // Copy header
-    memcpy(&query->header, &db->header, sizeof(tsdb_header_t));
-
-    // Set query parameters
     query->start_time = start_time;
     query->end_time = end_time;
-    query->file = db->file;
+    query->stride = 1;
+    query->seg_i = -1;
+    query->cur_block = UINT32_MAX;
 
-    // Setup parameter indices
     if (param_indices == NULL) {
-        // Fetch all parameters (base + extra)
-        uint8_t total = query->header.num_params + db->extra_param_count;
-        query->num_params_to_fetch = total;
-        for (uint8_t i = 0; i < total; i++) {
-            query->param_indices[i] = i;
-        }
+        query->num_params_to_fetch = db->schema.count;
+        for (uint8_t i = 0; i < db->schema.count; i++) query->param_indices[i] = i;
     } else {
-        query->num_params_to_fetch = num_params_to_fetch;
         if (num_params_to_fetch > TSDB_MAX_PARAMS) {
-            ESP_LOGE(TAG, "Too many parameters requested: %d", num_params_to_fetch);
             tsdb_unlock(db);
             return ESP_ERR_INVALID_ARG;
         }
+        query->num_params_to_fetch = num_params_to_fetch;
         memcpy(query->param_indices, param_indices, num_params_to_fetch);
     }
 
-    // Try to use query buffer from pool
-    query->block_buffer = (tsdb_block_t*)tsdb_get_buffer_ptr(&db->pool,
-                                                              db->query_buffer_offset,
-                                                              sizeof(tsdb_block_t));
-
+    query->block_buffer = (tsdb_block_t *) tsdb_get_buffer_ptr(&db->pool, db->query_buffer_offset,
+                                                               TSDB_BLOCK_SIZE);
     if (query->block_buffer == NULL) {
-        // Paged mode and spans pages - allocate separately
-        query->block_buffer = heap_caps_malloc(sizeof(tsdb_block_t), MALLOC_CAP_8BIT);
+        query->block_buffer = heap_caps_malloc(TSDB_BLOCK_SIZE, MALLOC_CAP_8BIT);
         if (query->block_buffer == NULL) {
-            ESP_LOGE(TAG, "Failed to allocate query block buffer");
             tsdb_unlock(db);
             return ESP_ERR_NO_MEM;
         }
         query->owns_buffer = true;
-        ESP_LOGD(TAG, "Allocated separate query buffer at %p", query->block_buffer);
-    } else {
-        query->owns_buffer = false;
-        ESP_LOGD(TAG, "Using query buffer from pool at %p", query->block_buffer);
     }
 
-    // Walk the ring in logical (time-ascending) order. Records are written at
-    // slot = total_records % max_records, and on eviction oldest_record_idx
-    // advances, so reading slots oldest_record_idx, +1, +2, ... (mod
-    // max_records) yields strictly ascending timestamps.
-    //
-    // We do NOT use the sparse index to seek to start_time: once the ring has
-    // wrapped, index entries are ordered by physical slot (the slot they were
-    // last written at), not by timestamp, so a binary search on them is
-    // invalid and lands in the wrong place. A logical walk with an early-exit
-    // once ts > end_time is correct for every range and is bounded by
-    // `available` record reads; the binary seek below then jumps the walk's
-    // starting point to the window in O(log n) block reads.
-    bool unlimited = (query->header.max_records == 0);
-    uint32_t available_records = unlimited ? query->header.total_records :
-                                 ((query->header.total_records < query->header.max_records) ?
-                                  query->header.total_records : query->header.max_records);
+    // Unflushed batch records live only in the write cache; make them visible.
+    if (db->cache_dirty) tsdb_write_cache_flush(db);
 
-    uint16_t rpb = query->header.records_per_block;
-    uint32_t first_slot = unlimited ? 0 : query->header.oldest_record_idx;
+    query->total = tsdb_retained(db);
+    query->pos = 0;
+    db->open_queries++;
 
-    query->current_record_idx = first_slot;       // current absolute ring slot
-    query->end_record_idx = available_records;     // total records to scan
-    query->records_scanned = 0;                    // ring slots consumed so far
-    query->current_block_num = rpb ? (first_slot / rpb) : 0;
-    query->offset_in_block = rpb ? (first_slot % rpb) : 0;
-    query->block_loaded = false;
-
-    // O(log n) start seek: jump the cursor to the first record with
-    // ts >= start_time instead of linearly scanning from the oldest.
-    // (records_scanned advances by the skipped count so query_next's
-    // absolute-record-index math for overflow lookups stays correct.)
-    if (available_records > 0 && rpb > 0 &&
-        start_time > query->header.oldest_timestamp) {
-        uint32_t k = tsdb_seek_start(query, available_records, first_slot, unlimited);
-        if (k > 0) {
-            uint32_t slot = unlimited ? k :
-                            ((first_slot + k) % query->header.max_records);
-            query->records_scanned = k;
-            query->current_record_idx = slot;
-            query->current_block_num = slot / rpb;
-            query->offset_in_block = slot % rpb;
-        }
-    }
-
-    ESP_LOGD(TAG, "Query init: time=[%lu, %lu], params=%d, scan %lu records from slot %lu",
-             (unsigned long)start_time, (unsigned long)end_time,
-             query->num_params_to_fetch,
-             (unsigned long)available_records, (unsigned long)first_slot);
-
-    return ESP_OK;
-}
-
-esp_err_t tsdb_query_next(tsdb_query_t *query,
-                          uint32_t *timestamp,
-                          int16_t *values) {
-    if (query == NULL || query->db == NULL || timestamp == NULL || values == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    bool unlimited = (query->header.max_records == 0);
-    uint32_t available = query->end_record_idx;   // total records to scan (fixed)
-    uint16_t qrpb = query->header.records_per_block;
-
-    // Walk the ring one slot at a time in logical (time-ascending) order,
-    // wrapping the physical slot/block modulo max_records. Stop once we've
-    // visited every retained record or passed end_time.
-    while (query->records_scanned < available) {
-        if (!query->block_loaded) {
-            if (tsdb_read_block(query->db, query->current_block_num,
-                                query->block_buffer) != ESP_OK) {
-                // Every slot inside the ring has a backing block; a read
-                // failure here means truncation/corruption -- stop cleanly.
-                ESP_LOGD(TAG, "Block %lu unreadable mid-ring",
-                         (unsigned long)query->current_block_num);
-                return ESP_ERR_NOT_FOUND;
-            }
-            query->block_loaded = true;
-        }
-
-        uint8_t *qraw = (uint8_t *)query->block_buffer;
-        uint16_t cur_off = query->offset_in_block;
-        uint32_t ts = TSDB_BLOCK_TS(qraw, cur_off);
-
-        // Absolute record index (in total_records space) of the slot we are
-        // about to read; the k-th oldest retained record maps to
-        // (total_records - available) + k. Needed for overflow lookups.
-        uint32_t abs_record_idx = (query->header.total_records - available) +
-                                  query->records_scanned;
-
-        // Advance the ring cursor to the next slot (wrap modulo max_records).
-        uint32_t next_slot = unlimited ? (query->current_record_idx + 1) :
-                             ((query->current_record_idx + 1) % query->header.max_records);
-        uint32_t next_block = qrpb ? (next_slot / qrpb) : 0;
-        if (next_block != query->current_block_num) {
-            query->current_block_num = next_block;
-            query->block_loaded = false;
-        }
-        query->offset_in_block = qrpb ? (next_slot % qrpb) : 0;
-        query->current_record_idx = next_slot;
-        query->records_scanned++;
-
-        if (ts == 0)
-            continue;                       // uninitialized slot
-        if (ts > query->end_time)
-            return ESP_ERR_NOT_FOUND;       // ascending order -> no later matches
-        if (ts < query->start_time)
-            continue;                       // before the window
-
-        // In range -> emit this record.
-        *timestamp = ts;
-        for (uint8_t i = 0; i < query->num_params_to_fetch; i++) {
-            uint8_t param_idx = query->param_indices[i];
-            if (param_idx < query->header.num_params) {
-                values[i] = TSDB_BLOCK_PARAM(qraw, qrpb, param_idx, cur_off);
-            } else if (query->db->extra_param_count > 0 &&
-                       param_idx < (query->header.num_params + query->db->extra_param_count) &&
-                       abs_record_idx >= query->db->first_overflow_record_idx) {
-                uint32_t overflow_idx = abs_record_idx - query->db->first_overflow_record_idx;
-                uint8_t extra_idx = param_idx - query->header.num_params;
-                uint32_t ovf_offset = query->db->overflow_data_offset +
-                                     (overflow_idx * query->db->overflow_record_size) +
-                                     (extra_idx * sizeof(int16_t));
-
-                long saved_pos = ftell(query->file);
-                fseek(query->file, ovf_offset, SEEK_SET);
-                int16_t extra_val = 0;
-                if (fread(&extra_val, sizeof(int16_t), 1, query->file) == 1) {
-                    values[i] = extra_val;
-                } else {
-                    values[i] = 0;
-                }
-                fseek(query->file, saved_pos, SEEK_SET);
-            } else {
-                values[i] = 0;  // Pre-overflow or invalid index
-            }
-        }
-
-        ESP_LOGD(TAG, "Found record: ts=%lu", (unsigned long)ts);
+    // Whole-window early-outs: segs[0].first_ts is a lower bound on the
+    // oldest retained timestamp, the newest segment's last_ts is exact.
+    if (query->total > 0 &&
+        (start_time > db->segs[db->nsegs - 1].last_ts || end_time < db->segs[0].first_ts)) {
+        query->total = 0;
         return ESP_OK;
     }
 
+    if (query->total > 0 && start_time > db->segs[0].first_ts) {
+        uint32_t k = 0;
+        if (seek_pos(query, start_time, &k) != ESP_OK) k = 0;
+        query->pos = k;
+    }
+    return ESP_OK;
+}
+
+esp_err_t tsdb_query_set_stride(tsdb_query_t *query, uint32_t stride) {
+    if (query == NULL || query->db == NULL) return ESP_ERR_INVALID_ARG;
+    query->stride = stride == 0 ? 1 : stride;
+    return ESP_OK;
+}
+
+esp_err_t tsdb_query_next(tsdb_query_t *query, uint32_t *timestamp, int16_t *values) {
+    if (query == NULL || query->db == NULL || timestamp == NULL || values == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    while (query->pos < query->total) {
+        if (q_enter_pos(query, query->pos) != ESP_OK) return ESP_ERR_NOT_FOUND;
+        uint32_t phys = (uint32_t)(query->pos - query->seg_start);
+        uint32_t block; uint16_t off;
+        q_locate(query, phys, &block, &off);
+        if (q_load(query, block) != ESP_OK) return ESP_ERR_NOT_FOUND;
+
+        uint32_t ts = TSDB_BLOCK_TS((uint8_t *) query->block_buffer, off);
+        if (ts == 0 || ts < query->start_time) { query->pos++; continue; }
+        if (ts > query->end_time) { query->pos = query->total; return ESP_ERR_NOT_FOUND; }
+
+        *timestamp = ts;
+        q_emit(query, phys, off, values);
+        uint32_t next = query->pos + query->stride;
+        query->pos = (next < query->pos || next > query->total) ? query->total : next;
+        return ESP_OK;
+    }
     return ESP_ERR_NOT_FOUND;
 }
 
 void tsdb_query_close(tsdb_query_t *query) {
-    if (query == NULL) {
-        return;
-    }
-
-    // Capture the handle before we wipe the struct -- tsdb_unlock() needs it.
+    if (query == NULL) return;
     tsdb_t *db = query->db;
-
-    // Free buffer if we allocated it separately
-    if (query->owns_buffer && query->block_buffer != NULL) {
-        free(query->block_buffer);
-        query->block_buffer = NULL;
-        ESP_LOGD(TAG, "Freed separate query buffer");
-    }
-
-    memset(query, 0, sizeof(tsdb_query_t));
-
-    // Release the handle lock taken by tsdb_query_init_h(). The mutex is
-    // recursive so the same task can also do writes.
-    if (db != NULL) {
-        tsdb_unlock(db);
-    }
+    if (db && db->open_queries > 0) db->open_queries--;
+    q_leave(query);
+    if (query->owns_buffer && query->block_buffer) free(query->block_buffer);
+    memset(query, 0, sizeof(*query));
+    if (db) tsdb_unlock(db);
 }
 
-esp_err_t tsdb_query_count_h(tsdb_t *db,
-                             uint32_t start_time,
-                             uint32_t end_time,
-                             uint32_t *count) {
-    if (db == NULL || !db->is_open || count == NULL) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
+esp_err_t tsdb_query_count_h(tsdb_t *db, uint32_t start_time, uint32_t end_time, uint32_t *count) {
+    if (db == NULL || !db->is_open || count == NULL) return ESP_ERR_INVALID_STATE;
     *count = 0;
-
-    // Initialize query
-    tsdb_query_t query;
-    esp_err_t ret = tsdb_query_init_h(db, &query, start_time, end_time, NULL, 0);
-    if (ret != ESP_OK) {
-        return ret;
+    tsdb_query_t q;
+    uint8_t one[1] = {0};
+    esp_err_t ret = tsdb_query_init_h(db, &q, start_time, end_time, one, 1);
+    if (ret != ESP_OK) return ret;
+    uint32_t a, b;
+    if (window_positions(&q, &a, &b) == ESP_OK) {
+        *count = b - a;
+    } else {
+        uint32_t ts; int16_t v;
+        q.pos = 0;
+        while (tsdb_query_next(&q, &ts, &v) == ESP_OK) (*count)++;
     }
-
-    // Count records
-    uint32_t ts;
-    int16_t values[TSDB_MAX_PARAMS];
-
-    while (tsdb_query_next(&query, &ts, values) == ESP_OK) {
-        (*count)++;
-    }
-
-    tsdb_query_close(&query);
-
-    ESP_LOGI(TAG, "Counted %lu records in range [%lu, %lu]",
-             (unsigned long)*count, (unsigned long)start_time, (unsigned long)end_time);
-
+    tsdb_query_close(&q);
     return ESP_OK;
 }
 
 // ============================================================================
-// AGGREGATION OPERATIONS
+// AGGREGATION
 // ============================================================================
 
-esp_err_t tsdb_aggregate_h(tsdb_t *db,
-                           uint32_t start_time,
-                           uint32_t end_time,
-                           uint8_t param_index,
-                           tsdb_agg_type_t agg_type,
-                           int32_t *result) {
-    if (db == NULL || !db->is_open || result == NULL) {
-        return ESP_ERR_INVALID_STATE;
-    }
+typedef struct {
+    int64_t sum;
+    int32_t min_val, max_val;
+    int16_t first_val, last_val;
+} agg_acc_t;
 
-    if (param_index >= (db->header.num_params + db->extra_param_count)) {
-        ESP_LOGE(TAG, "Invalid parameter index: %d", param_index);
-        return ESP_ERR_INVALID_ARG;
+static inline void acc_init(agg_acc_t *a) {
+    a->sum = 0; a->min_val = INT32_MAX; a->max_val = INT32_MIN; a->first_val = a->last_val = 0;
+}
+static inline void acc_push(agg_acc_t *a, int16_t v, bool first) {
+    if (first) a->first_val = v;
+    a->last_val = v;
+    a->sum += v;
+    if (v < a->min_val) a->min_val = v;
+    if (v > a->max_val) a->max_val = v;
+}
+static int32_t acc_result(const agg_acc_t *a, tsdb_agg_type_t t, uint32_t count) {
+    switch (t) {
+        case TSDB_AGG_SUM:   return (int32_t) a->sum;
+        case TSDB_AGG_AVG:   return (int32_t)(a->sum / (int64_t) count);
+        case TSDB_AGG_MIN:   return a->min_val;
+        case TSDB_AGG_MAX:   return a->max_val;
+        case TSDB_AGG_COUNT: return (int32_t) count;
+        case TSDB_AGG_FIRST: return a->first_val;
+        case TSDB_AGG_LAST:  return a->last_val;
+        default:             return 0;
     }
+}
 
-    // Initialize query for single parameter
+/**
+ * @brief Block-level scan: one bounds check per record and one 16-bit load
+ *        per accumulated column, straight off each loaded block. Falls back
+ *        to per-record emission for segments that need legacy extras.
+ */
+static uint32_t agg_scan(tsdb_query_t *q, uint8_t ncols, agg_acc_t *acc) {
+    uint32_t count = 0;
+    int16_t vals[TSDB_MAX_PARAMS];
+    while (q->pos < q->total) {
+        if (q_enter_pos(q, q->pos) != ESP_OK) break;
+        uint32_t phys = (uint32_t)(q->pos - q->seg_start);
+        uint32_t block; uint16_t off;
+        q_locate(q, phys, &block, &off);
+        if (q_load(q, block) != ESP_OK) break;
+        const uint8_t *raw = (const uint8_t *) q->block_buffer;
+        uint32_t run = q_run(q, q->pos);
+        if (run == 0) { q->pos++; continue; }
+
+        for (uint32_t i = 0; i < run; i++) {
+            uint32_t ts = TSDB_BLOCK_TS(raw, off + i);
+            if (ts == 0 || ts < q->start_time) continue;
+            if (ts > q->end_time) { q->pos = q->total; return count; }
+            if (q->needs_extras) {
+                q_emit(q, phys + i, (uint16_t)(off + i), vals);
+                for (uint8_t c = 0; c < ncols; c++) acc_push(&acc[c], vals[c], count == 0);
+            } else {
+                for (uint8_t c = 0; c < ncols; c++) {
+                    int8_t col = q->col_map[c];
+                    int16_t v = col < 0 ? 0 : TSDB_BLOCK_PARAM(raw, q->seg_rpb, col, off + i);
+                    acc_push(&acc[c], v, count == 0);
+                }
+            }
+            count++;
+        }
+        q->pos += run;
+    }
+    return count;
+}
+
+esp_err_t tsdb_aggregate_h(tsdb_t *db, uint32_t start_time, uint32_t end_time,
+                           uint8_t param_index, tsdb_agg_type_t agg_type, int32_t *result) {
+    if (db == NULL || !db->is_open || result == NULL) return ESP_ERR_INVALID_STATE;
+    if (param_index >= db->schema.count) return ESP_ERR_INVALID_ARG;
+    if (agg_type < TSDB_AGG_SUM || agg_type > TSDB_AGG_LAST) return ESP_ERR_INVALID_ARG;
+
     uint8_t params[] = {param_index};
-    tsdb_query_t query;
-    esp_err_t ret = tsdb_query_init_h(db, &query, start_time, end_time, params, 1);
-    if (ret != ESP_OK) {
-        return ret;
-    }
+    tsdb_query_t q;
+    esp_err_t ret = tsdb_query_init_h(db, &q, start_time, end_time, params, 1);
+    if (ret != ESP_OK) return ret;
 
-    // Accumulators
-    int64_t sum = 0;
-    int32_t min_val = INT32_MAX;
-    int32_t max_val = INT32_MIN;
+    agg_acc_t acc;
+    acc_init(&acc);
     uint32_t count = 0;
-    int16_t first_val = 0;
-    int16_t last_val = 0;
 
-    // Single-pass aggregation
-    uint32_t ts;
-    int16_t value;
-
-    while (tsdb_query_next(&query, &ts, &value) == ESP_OK) {
-        if (count == 0) {
-            first_val = value;
+    if (agg_type == TSDB_AGG_COUNT || agg_type == TSDB_AGG_FIRST || agg_type == TSDB_AGG_LAST) {
+        uint32_t a, b;
+        if (window_positions(&q, &a, &b) == ESP_OK) {
+            count = b - a;
+            if (count > 0 && agg_type != TSDB_AGG_COUNT) {
+                uint32_t ts; int16_t v;
+                q.pos = (agg_type == TSDB_AGG_FIRST) ? a : b - 1;
+                if (tsdb_query_next(&q, &ts, &v) == ESP_OK) acc_push(&acc, v, true);
+                else count = 0;
+            }
+            goto done;
         }
-        last_val = value;
-
-        sum += value;
-        count++;
-
-        if (value < min_val) min_val = value;
-        if (value > max_val) max_val = value;
+        q.pos = 0;   // anomaly: scan
     }
+    count = agg_scan(&q, 1, &acc);
 
-    tsdb_query_close(&query);
-
-    // Calculate result based on aggregation type
-    if (count == 0) {
-        *result = 0;
-        ESP_LOGW(TAG, "No records found in range");
-        return ESP_OK;
-    }
-
-    switch (agg_type) {
-        case TSDB_AGG_SUM:
-            *result = (int32_t)sum;
-            break;
-        case TSDB_AGG_AVG:
-            *result = (int32_t)(sum / count);
-            break;
-        case TSDB_AGG_MIN:
-            *result = min_val;
-            break;
-        case TSDB_AGG_MAX:
-            *result = max_val;
-            break;
-        case TSDB_AGG_COUNT:
-            *result = count;
-            break;
-        case TSDB_AGG_FIRST:
-            *result = first_val;
-            break;
-        case TSDB_AGG_LAST:
-            *result = last_val;
-            break;
-        default:
-            ESP_LOGE(TAG, "Unknown aggregation type: %d", agg_type);
-            return ESP_ERR_INVALID_ARG;
-    }
-
-    ESP_LOGI(TAG, "Aggregation complete: type=%d, result=%ld, count=%lu",
-             agg_type, (long)*result, (unsigned long)count);
-
+done:
+    tsdb_query_close(&q);
+    if (count == 0) { *result = 0; return ESP_OK; }
+    *result = acc_result(&acc, agg_type, count);
     return ESP_OK;
 }
 
-esp_err_t tsdb_aggregate_multi_h(tsdb_t *db,
-                                  uint32_t start_time,
-                                  uint32_t end_time,
-                                  tsdb_agg_request_t *requests,
-                                  uint8_t num_requests,
-                                  uint32_t *record_count) {
-    if (db == NULL || !db->is_open || requests == NULL || num_requests == 0) {
-        return ESP_ERR_INVALID_STATE;
-    }
+esp_err_t tsdb_aggregate_multi_h(tsdb_t *db, uint32_t start_time, uint32_t end_time,
+                                 tsdb_agg_request_t *requests, uint8_t num_requests,
+                                 uint32_t *record_count) {
+    if (db == NULL || !db->is_open || requests == NULL || num_requests == 0) return ESP_ERR_INVALID_STATE;
+    if (num_requests > TSDB_MAX_PARAMS) return ESP_ERR_INVALID_ARG;
 
-    // Collect unique param indices needed
-    uint8_t unique_params[TSDB_MAX_PARAMS];
-    uint8_t num_unique = 0;
+    uint8_t unique[TSDB_MAX_PARAMS], nu = 0, req_to[TSDB_MAX_PARAMS];
     for (uint8_t i = 0; i < num_requests; i++) {
-        if (requests[i].param_index >= (db->header.num_params + db->extra_param_count)) {
-            ESP_LOGE(TAG, "Invalid parameter index: %d", requests[i].param_index);
-            return ESP_ERR_INVALID_ARG;
-        }
-        // Check if already in unique list
-        bool found = false;
-        for (uint8_t j = 0; j < num_unique; j++) {
-            if (unique_params[j] == requests[i].param_index) {
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            unique_params[num_unique++] = requests[i].param_index;
-        }
+        if (requests[i].param_index >= db->schema.count) return ESP_ERR_INVALID_ARG;
+        uint8_t j;
+        for (j = 0; j < nu; j++) if (unique[j] == requests[i].param_index) break;
+        if (j == nu) unique[nu++] = requests[i].param_index;
+        req_to[i] = j;
     }
 
-    // Open single query for all needed params
-    tsdb_query_t query;
-    esp_err_t ret = tsdb_query_init_h(db, &query, start_time, end_time, unique_params, num_unique);
-    if (ret != ESP_OK) {
-        return ret;
-    }
+    agg_acc_t *acc = malloc(sizeof(agg_acc_t) * nu);   // up to 64 × ~24 B: heap, not stack
+    if (acc == NULL) return ESP_ERR_NO_MEM;
 
-    // Per-request accumulators
-    typedef struct {
-        int64_t sum;
-        int32_t min_val;
-        int32_t max_val;
-        int16_t first_val;
-        int16_t last_val;
-    } agg_acc_t;
+    tsdb_query_t q;
+    esp_err_t ret = tsdb_query_init_h(db, &q, start_time, end_time, unique, nu);
+    if (ret != ESP_OK) { free(acc); return ret; }
 
-    agg_acc_t acc[TSDB_MAX_PARAMS];
+    for (uint8_t i = 0; i < nu; i++) acc_init(&acc[i]);
+    uint32_t count = agg_scan(&q, nu, acc);
+    tsdb_query_close(&q);
+
     for (uint8_t i = 0; i < num_requests; i++) {
-        acc[i].sum = 0;
-        acc[i].min_val = INT32_MAX;
-        acc[i].max_val = INT32_MIN;
-        acc[i].first_val = 0;
-        acc[i].last_val = 0;
+        requests[i].result = count == 0 ? 0 : acc_result(&acc[req_to[i]], requests[i].agg_type, count);
     }
-
-    // Build a mapping: for each request, which index in the query values array has its param?
-    uint8_t req_to_query_idx[TSDB_MAX_PARAMS];
-    for (uint8_t i = 0; i < num_requests; i++) {
-        for (uint8_t j = 0; j < num_unique; j++) {
-            if (unique_params[j] == requests[i].param_index) {
-                req_to_query_idx[i] = j;
-                break;
-            }
-        }
-    }
-
-    // Single pass
-    uint32_t ts;
-    int16_t values[TSDB_MAX_PARAMS];
-    uint32_t count = 0;
-
-    while (tsdb_query_next(&query, &ts, values) == ESP_OK) {
-        for (uint8_t i = 0; i < num_requests; i++) {
-            int16_t val = values[req_to_query_idx[i]];
-            if (count == 0) {
-                acc[i].first_val = val;
-            }
-            acc[i].last_val = val;
-            acc[i].sum += val;
-            if (val < acc[i].min_val) acc[i].min_val = val;
-            if (val > acc[i].max_val) acc[i].max_val = val;
-        }
-        count++;
-    }
-
-    tsdb_query_close(&query);
-
-    // Compute results
-    for (uint8_t i = 0; i < num_requests; i++) {
-        if (count == 0) {
-            requests[i].result = 0;
-            continue;
-        }
-        switch (requests[i].agg_type) {
-            case TSDB_AGG_SUM:   requests[i].result = (int32_t)acc[i].sum; break;
-            case TSDB_AGG_AVG:   requests[i].result = (int32_t)(acc[i].sum / count); break;
-            case TSDB_AGG_MIN:   requests[i].result = acc[i].min_val; break;
-            case TSDB_AGG_MAX:   requests[i].result = acc[i].max_val; break;
-            case TSDB_AGG_COUNT: requests[i].result = (int32_t)count; break;
-            case TSDB_AGG_FIRST: requests[i].result = acc[i].first_val; break;
-            case TSDB_AGG_LAST:  requests[i].result = acc[i].last_val; break;
-            default:             requests[i].result = 0; break;
-        }
-    }
-
-    if (record_count) {
-        *record_count = count;
-    }
-
-    ESP_LOGI(TAG, "Multi-aggregate complete: %d requests, %lu records scanned",
-             num_requests, (unsigned long)count);
-
+    free(acc);
+    if (record_count) *record_count = count;
     return ESP_OK;
 }
 
@@ -554,35 +531,18 @@ esp_err_t tsdb_aggregate_multi_h(tsdb_t *db,
 // LEGACY GLOBAL API
 // ============================================================================
 
-esp_err_t tsdb_query_init(tsdb_query_t *query,
-                          uint32_t start_time,
-                          uint32_t end_time,
-                          const uint8_t *param_indices,
-                          uint8_t num_params_to_fetch) {
-    return tsdb_query_init_h(g_default_handle, query, start_time, end_time,
-                             param_indices, num_params_to_fetch);
+esp_err_t tsdb_query_init(tsdb_query_t *query, uint32_t start_time, uint32_t end_time,
+                          const uint8_t *param_indices, uint8_t num_params_to_fetch) {
+    return tsdb_query_init_h(g_default_handle, query, start_time, end_time, param_indices, num_params_to_fetch);
 }
-
-esp_err_t tsdb_query_count(uint32_t start_time,
-                           uint32_t end_time,
-                           uint32_t *count) {
+esp_err_t tsdb_query_count(uint32_t start_time, uint32_t end_time, uint32_t *count) {
     return tsdb_query_count_h(g_default_handle, start_time, end_time, count);
 }
-
-esp_err_t tsdb_aggregate(uint32_t start_time,
-                         uint32_t end_time,
-                         uint8_t param_index,
-                         tsdb_agg_type_t agg_type,
-                         int32_t *result) {
-    return tsdb_aggregate_h(g_default_handle, start_time, end_time,
-                            param_index, agg_type, result);
+esp_err_t tsdb_aggregate(uint32_t start_time, uint32_t end_time, uint8_t param_index,
+                         tsdb_agg_type_t agg_type, int32_t *result) {
+    return tsdb_aggregate_h(g_default_handle, start_time, end_time, param_index, agg_type, result);
 }
-
-esp_err_t tsdb_aggregate_multi(uint32_t start_time,
-                                uint32_t end_time,
-                                tsdb_agg_request_t *requests,
-                                uint8_t num_requests,
-                                uint32_t *record_count) {
-    return tsdb_aggregate_multi_h(g_default_handle, start_time, end_time,
-                                   requests, num_requests, record_count);
+esp_err_t tsdb_aggregate_multi(uint32_t start_time, uint32_t end_time, tsdb_agg_request_t *requests,
+                               uint8_t num_requests, uint32_t *record_count) {
+    return tsdb_aggregate_multi_h(g_default_handle, start_time, end_time, requests, num_requests, record_count);
 }

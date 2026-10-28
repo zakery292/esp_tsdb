@@ -23,10 +23,13 @@ extern "C" {
 // ============================================================================
 
 #define TSDB_MAX_PARAMS 64          // Maximum parameters supported
-#define TSDB_MAGIC 0x45545344       // "ETSD" (ESP Time-Series DB)
-#define TSDB_VERSION 3              // File format version (<=16 base params)
-#define TSDB_VERSION_WIDE 4         // V4: 17-64 base params (extended names region)
+#define TSDB_MAGIC 0x45545344       // "ETSD" (ESP Time-Series DB) — pre-3.0 single file
+#define TSDB_VERSION 3              // Pre-3.0 file format version (<=16 base params)
+#define TSDB_VERSION_WIDE 4         // Pre-3.0 V4: 17-64 base params (extended names region)
 #define TSDB_BLOCK_SIZE 1024        // Block size in bytes
+#define TSDB_NAME_LEN 20            // Column name storage (19 chars + NUL) in v3 segments
+#define TSDB_SEG_MAGIC 0x47455354   // "TSEG" — v3 segment file
+#define TSDB_SEG_VERSION 1
 
 // V4 wide-schema layout: base param names 16..63 live in an extension region
 // between the fixed 584-byte header and the index (which starts at 2048).
@@ -69,6 +72,28 @@ typedef enum {
 } tsdb_alloc_strategy_t;
 
 /**
+ * @brief Schema policy at open. Kept for source compatibility with 2.5.
+ *
+ * Since 3.0 nothing is ever rewritten: every segment carries its own column
+ * list and columns are matched BY NAME at read time. So both values behave
+ * the same — the config's `param_names` IS the schema, old data maps onto it
+ * by name (reorders honoured, missing names read 0, dropped names are simply
+ * not visible), and a changed list just starts a new segment on the next
+ * write. The only remaining refusal is a count mismatch when `param_names`
+ * is NULL, because positional mapping is then ambiguous.
+ *
+ * A RENAMED column cannot be told apart from drop+add by name matching —
+ * call tsdb_rename_param() before changing the name in the config and the
+ * history follows the column.
+ */
+typedef enum {
+    TSDB_SCHEMA_STRICT = 0,
+    TSDB_SCHEMA_MIGRATE = 1,
+} tsdb_schema_policy_t;
+
+struct tsdb_migrate_opts_s;
+
+/**
  * @brief Database configuration
  */
 typedef struct {
@@ -79,8 +104,8 @@ typedef struct {
     const char **param_names;       // Parameter names (optional, can be NULL)
 
     // Capacity
-    uint32_t max_records;           // Maximum records before LRU eviction
-    uint32_t index_stride;          // Records between index entries (default: 380)
+    uint32_t max_records;           // Maximum records before LRU eviction (0 = unlimited)
+    uint32_t index_stride;          // Unused since 3.0 (kept for source compatibility)
 
     // Memory allocation
     size_t buffer_pool_size;        // Buffer pool size in bytes (e.g., 10KB or 256KB)
@@ -100,10 +125,29 @@ typedef struct {
     // determined, so a failed probe never triggers a spurious cap.
     uint64_t (*free_space_cb)(void);
     uint32_t min_free_bytes;
+
+    // See tsdb_schema_policy_t — both values reconcile by name since 3.0.
+    tsdb_schema_policy_t schema_policy;
+    // Unused since 3.0 (no rewrite ever happens); kept for source compatibility.
+    const struct tsdb_migrate_opts_s *migrate_opts;
+
+    // v3: data blocks per segment file, as bytes (rounded down to whole 1 KB
+    // blocks). 0 = auto: the capacity split into ~32 segments, at least 6
+    // and at most ~256 blocks each, rounded so a segment file (header +
+    // data) is 4n - 1 KB and fills n 4 KB flash blocks exactly. Smaller
+    // segments evict in finer steps and cost one more file; larger ones mean
+    // fewer files. Capacity is exact either way (eviction is logical at the
+    // head, physical per segment); on disk the database stays within
+    // max_records plus one segment, plus a header block per segment.
+    uint32_t segment_bytes;
 } tsdb_config_t;
 
 /**
  * @brief Helper macro to calculate max records for a storage size
+ *
+ * v3 note: records are packed into 1 KB blocks at (1016 / (4 + 2*num_params))
+ * per block, and each segment carries a 1 KB header, so the on-disk footprint
+ * at capacity is a few percent above records * record_size. Leave headroom.
  *
  * @param storage_bytes Total file size budget
  * @param num_params Number of parameters per record
@@ -158,21 +202,50 @@ esp_err_t tsdb_write(uint32_t timestamp, const int16_t *values);
 /**
  * @brief Write multiple records in batch (more efficient)
  *
+ * Takes the handle lock once and keeps the current block in RAM so
+ * consecutive records that land in the same block cost ONE block write
+ * instead of one per record. A crash mid-batch loses at most the records of
+ * the block that had not been flushed yet; what reached disk is consistent.
+ *
+ * Timestamps must be ascending (same rule as tsdb_write).
+ *
  * @param timestamps Array of timestamps
  * @param values 2D array [count][num_params]
  * @param count Number of records
- * @return ESP_OK on success
+ * @return ESP_OK on success; on error, records before the failing one are
+ *         persisted.
  */
 esp_err_t tsdb_write_batch(const uint32_t *timestamps,
                             const int16_t **values,
                             uint32_t count);
+
+/**
+ * @brief One bounded step of background maintenance (v3.0+).
+ *
+ * A pre-3.0 database found at open is adopted as it is (nothing heavy runs in
+ * tsdb_open) and then moved into the 3.0 segment format piece by piece,
+ * without losing or duplicating a record across power cuts and with about
+ * one segment of extra space. Each call does one unit of that work under the
+ * handle lock: a few blocks copied, one truncate, one file removal, or a
+ * slice of a header reconstruction — bounded so a reader waiting on the lock
+ * is not stalled. Every tsdb_write() also does one step (after its own lock
+ * hold), so the work completes without this call; calling it in a loop from
+ * the writer task, with a short delay between calls, completes it in minutes.
+ *
+ * @param more Set to true while maintenance work remains (may be NULL).
+ * @return ESP_OK, ESP_ERR_INVALID_STATE (not open, or a query is open on
+ *         this task), ESP_ERR_TIMEOUT, or the I/O error of the step (retried
+ *         by the next call).
+ */
+esp_err_t tsdb_maintain(bool *more);
 
 // ============================================================================
 // INTERNAL STRUCTURES (exposed for stack allocation)
 // ============================================================================
 
 /**
- * @brief Header structure (512 bytes, stored at file offset 0)
+ * @brief Pre-3.0 single-file header (584 bytes at file offset 0). Kept so
+ *        existing databases are adopted read-only by 3.0.
  */
 typedef struct {
     uint32_t magic;                 // Validation magic number (TSDB_MAGIC)
@@ -273,26 +346,39 @@ typedef struct {
  */
 struct tsdb_query_s {
     tsdb_t *db;                     // Database handle this query iterates over
-    FILE *file;
-    tsdb_header_t header;
 
     // Query parameters
     uint32_t start_time;
     uint32_t end_time;
     uint8_t param_indices[TSDB_MAX_PARAMS];
     uint8_t num_params_to_fetch;
+    uint32_t stride;                // every stride-th in-range record (1 = all)
 
-    // Iterator state
-    uint32_t current_record_idx;
-    uint32_t end_record_idx;
-    uint32_t records_scanned;       // ring slots consumed so far this query
-    uint32_t current_block_num;
-    uint16_t offset_in_block;
+    // Logical cursor: position in [0, total) over all retained records,
+    // oldest first.
+    uint32_t pos;
+    uint32_t total;
 
-    // Block buffer (points into global buffer pool or local storage)
+    // Current segment (internal)
+    int seg_i;                      // index into the handle's segment table, -1 = none
+    int64_t seg_start;              // logical position of the segment's physical record 0
+    uint32_t seg_records;
+    uint32_t seg_data_offset;
+    uint16_t seg_rpb;
+    uint8_t seg_np;
+    bool seg_legacy;                // segment is a piece of the adopted pre-3.0 file
+    uint32_t seg_rank;              // ... and the legacy rank of its physical record 0
+    bool seg_identity;              // column map is the identity
+    FILE *seg_file;
+    bool owns_file;
+    int8_t col_map[TSDB_MAX_PARAMS];   // requested column i -> segment column, -1 = absent
+    bool needs_extras;              // legacy overflow extras requested
+
+    // Block buffer (points into the handle's buffer pool or heap)
     tsdb_block_t *block_buffer;
+    uint32_t cur_block;
     bool block_loaded;
-    bool owns_buffer;               // true if allocated separately
+    bool owns_buffer;
 };
 
 typedef struct tsdb_query_s tsdb_query_t;
@@ -327,7 +413,26 @@ esp_err_t tsdb_query_next(tsdb_query_t *query,
                           int16_t *values);
 
 /**
+ * @brief Return only every stride-th in-range record from the query (v2.5+).
+ *
+ * For charts: a year of 5-minute samples is ~105k records, but a plot only
+ * needs a few hundred points. With stride = 200 the iterator reads only the
+ * blocks that hold the sampled records — roughly one block read per point
+ * once stride >= records_per_block — instead of every block in the window.
+ * The first returned record is the first in-range one; subsequent records
+ * are stride positions apart. Call after tsdb_query_init(); 0 or 1 = all.
+ *
+ * @param query Initialised query
+ * @param stride Record step (1 = every record)
+ * @return ESP_OK, ESP_ERR_INVALID_ARG if query is not initialised
+ */
+esp_err_t tsdb_query_set_stride(tsdb_query_t *query, uint32_t stride);
+
+/**
  * @brief Get count of records in time range without iterating
+ *
+ * O(log n): two binary seeks bound the window, no records are read.
+ * (Falls back to a scan only if a probe hits a zero-timestamp hole.)
  *
  * @param start_time Start timestamp
  * @param end_time End timestamp
@@ -364,6 +469,9 @@ typedef enum {
 
 /**
  * @brief Perform aggregation over time range
+ *
+ * COUNT, FIRST and LAST are O(log n) (binary seeks, at most one record
+ * read). SUM/AVG/MIN/MAX scan the window block by block.
  *
  * @param start_time Start timestamp
  * @param end_time End timestamp
@@ -422,6 +530,7 @@ typedef struct {
     uint8_t extra_params;           // Extra overflow parameters
     size_t buffer_pool_size;        // Allocated buffer size
     bool using_paged_allocation;    // true if using paged buffers
+    uint16_t segment_count;         // v3: segment files (incl. an adopted legacy file)
 } tsdb_stats_t;
 
 /**
@@ -433,7 +542,10 @@ typedef struct {
 esp_err_t tsdb_get_stats(tsdb_stats_t *stats);
 
 /**
- * @brief Clear all data (keeps structure, resets to empty)
+ * @brief Clear all data (keeps schema and capacity, resets to empty)
+ *
+ * Every segment file (and an adopted legacy file) is unlinked; the space goes
+ * back to the filesystem. Flat cost.
  *
  * @return ESP_OK on success
  */
@@ -446,29 +558,62 @@ esp_err_t tsdb_clear(void);
  */
 esp_err_t tsdb_delete(void);
 
+/**
+ * @brief Remove every file of a database that is NOT open (path-level)
+ *
+ * Unlinks the legacy 2.x file and its sidecars, an orphaned .mig, and every
+ * segment file belonging to @p filepath. Use this where no handle exists yet
+ * (e.g. discarding a database for a different schema before the first open).
+ * Removing a database that is open elsewhere is undefined.
+ *
+ * @param filepath Database path as given in tsdb_config_t.filepath
+ * @return ESP_OK (also when nothing existed), ESP_ERR_INVALID_ARG on NULL
+ */
+esp_err_t tsdb_remove(const char *filepath);
+
+/**
+ * @brief On-disk size of a database without opening it (path-level)
+ *
+ * Sums the legacy file, its sidecars (incl. 2.4.4's <path>.d/ slots) and
+ * every segment file at @p filepath.
+ * Lets a caller that sizes the capacity from free space add the database's
+ * own bytes back in before tsdb_open(); 3.0 applies the configured
+ * max_records at every open.
+ *
+ * @param filepath Database path
+ * @param bytes    Out: total bytes (0 when no files exist)
+ * @return ESP_OK, ESP_ERR_INVALID_ARG on NULL
+ */
+esp_err_t tsdb_disk_usage(const char *filepath, uint64_t *bytes);
+
 // ============================================================================
 // OVERFLOW PARAMETER API
 // ============================================================================
 
 /**
- * @brief Add extra parameters via overflow region
+ * @brief Add extra parameters at runtime
+ *
+ * Since 3.0 extras are ordinary columns appended to the schema: the next
+ * write starts a new segment with the wider column list, and earlier records
+ * read 0 for them. Writes then expect base + extra values. The extras
+ * persist in the segment headers, so they survive a reboot without the config
+ * knowing about them. Instant; no region, no rewrite.
  *
  * @param param_names Array of parameter name strings
  * @param count Number of extra parameters (1-48)
- * @return ESP_OK on success
+ * @return ESP_OK on success, ESP_ERR_INVALID_STATE if extras already exist
  */
 esp_err_t tsdb_add_extra_params(const char **param_names, uint8_t count);
 
 /**
- * @brief Migrate overflow region to new parameter layout
+ * @brief Replace the runtime extra columns
  *
- * Handles adding, removing, and reordering overflow columns.
- * Matching columns (by name) are copied, new columns get zeros,
- * dropped columns are discarded. Crash-safe: new data written
- * first, header updated last.
+ * Since 3.0: instant schema change — the next write starts a new segment.
+ * Columns kept by name keep their history; new names read 0 for older
+ * records; dropped names are no longer visible.
  *
  * @param new_names Array of new param name strings (NULL if new_count==0)
- * @param new_count Number of new extra parameters (0 = remove overflow)
+ * @param new_count Number of new extra parameters (0 = remove all extras)
  * @return ESP_OK on success
  */
 esp_err_t tsdb_migrate_overflow(const char **new_names, uint8_t new_count);
@@ -491,7 +636,7 @@ typedef void (*tsdb_migrate_progress_cb)(uint32_t done, uint32_t total, void *ct
 /**
  * @brief Options for tsdb_migrate_schema().
  */
-typedef struct {
+typedef struct tsdb_migrate_opts_s {
     /**
      * Filesystem free space in bytes, as known by the caller (e.g. from
      * esp_littlefs_info()). The migration writes a full new copy of the
@@ -522,63 +667,41 @@ typedef struct {
 } tsdb_migrate_opts_t;
 
 /**
- * @brief Change the base column set — MySQL-style ALTER TABLE.
+ * @brief Change the column set — MySQL-style ALTER TABLE.
  *
- * Rewrites the database into the new block geometry as a streaming copy
- * (constant ~2KB memory regardless of size), matching columns BY NAME against
- * the old base columns AND any overflow extras. Old overflow extras named in
- * new_names become first-class base columns (the overflow region is folded
- * away — the migrated file never has one). Columns absent from new_names are
- * dropped; brand-new names are backfilled with 0 for all existing records.
+ * Since 3.0 this is an instant, in-RAM schema change: the next write starts
+ * a new segment with the new column list, and existing segments are read
+ * through a by-name column map. Columns present in both keep their data,
+ * names absent from new_names are no longer visible, brand-new names read 0
+ * for existing records, reorders are honoured. Any runtime extras are folded
+ * into the new list (name them to keep them). Writes after this call expect
+ * new_count values. Nothing is rewritten, so `opts` is ignored and no
+ * progress callback fires.
  *
- * Runs under the handle lock with a `migrating` flag set: concurrent
- * tsdb_write()/tsdb_query_init() calls fail fast with ESP_ERR_INVALID_STATE
- * for the duration (seconds to ~a minute) instead of stalling. Callers on a
- * periodic write cadence can simply retry next cycle.
- *
- * Crash-safe: the copy goes to `<filepath>.mig` and the original is never
- * modified; the swap is recovered automatically on the next tsdb_open() if
- * interrupted.
- *
- * ESP32 task placement: on littlefs/SPI-flash the CALLING task performs
- * flash-bus ops and must have an internal-RAM stack; SD-card databases can be
- * migrated from PSRAM-stacked tasks.
- *
- * @param new_names New base column names, in order (1-16)
- * @param new_count Number of new base columns
- * @param opts Space budget / trim policy; NULL = no space check, no trim
- * @return ESP_OK on success (also when the schema already matches);
- *         ESP_ERR_NO_MEM if it doesn't fit the space budget (or allocation
- *         failed); ESP_ERR_TIMEOUT if the handle lock couldn't be taken.
+ * @param new_names New column names, in order (1-64)
+ * @param new_count Number of new columns
+ * @param opts Ignored since 3.0 (kept for source compatibility)
+ * @return ESP_OK on success (also when the schema already matches)
  */
 esp_err_t tsdb_migrate_schema(const char **new_names, uint8_t new_count,
                               const tsdb_migrate_opts_t *opts);
 
 /**
- * @brief Change the ring capacity (max_records) of a live database. v2.3+
+ * @brief Change the capacity (max_records) of a live database.
  *
- * Two paths, chosen automatically:
- * - FAST (header-only, milliseconds): the database has never wrapped, the new
- *   capacity covers every existing record, and no overflow region exists.
- *   Growing an actively-filling database is almost always this path.
- * - REWRITE: the ring has wrapped, the capacity is shrinking below the
- *   retained record count (newest records win), or overflow extras exist
- *   (they get folded into base columns) — a same-schema streaming rewrite
- *   through the migration engine: same opts semantics (space budget,
- *   allow_trim, progress callback), same `migrating` fail-fast behaviour,
- *   same crash-safe .mig swap.
+ * Since 3.0 this is instant: growing just raises the limit; shrinking below
+ * the retained count evicts the oldest records (logically at once, the files
+ * are unlinked as whole segments fall out of the window). Also clears any
+ * capacity cap latched by ENOSPC or the free-space guard.
  *
- * Storage reality check: growing only helps when the FILESYSTEM has room for
- * the file to grow into. On SD-card storage that is usually true — grow
- * freely. If your database is capped by a small flash partition (e.g. it was
- * already sized to fill it), a bigger max_records cannot conjure space: the
- * grow will just hit ENOSPC later and adaptive capacity will cap it again.
+ * Storage reality check: growing only helps when the FILESYSTEM has room.
+ * On a flash partition the database was sized to fill, a bigger max_records
+ * just meets ENOSPC later, at which point the oldest segment is evicted and
+ * the capacity re-capped.
  *
- * @param new_max_records New ring capacity; 0 = unlimited (no eviction).
- * @param opts Space budget / trim / progress — used by the rewrite path;
- *             may be NULL. Ignored on the fast path.
- * @return ESP_OK (also when the capacity already matches); error codes as
- *         tsdb_migrate_schema for the rewrite path.
+ * @param new_max_records New capacity; 0 = unlimited (no eviction).
+ * @param opts Ignored since 3.0 (kept for source compatibility)
+ * @return ESP_OK
  */
 esp_err_t tsdb_resize(uint32_t new_max_records, const tsdb_migrate_opts_t *opts);
 
@@ -596,6 +719,25 @@ const char* tsdb_get_param_name(uint8_t index);
  * @brief Check if overflow region is active
  */
 bool tsdb_has_overflow(void);
+
+/**
+ * @brief Rename a column in place (v2.5+). No data is touched: the old name
+ *        is kept as an alias so earlier segments still map to the column.
+ *        Call this BEFORE changing the name in your config so the history
+ *        follows the column (a config change alone looks like drop + add).
+ *
+ * @param index Column index (0 .. total params - 1)
+ * @param new_name New name (19 chars max)
+ * @return ESP_OK, ESP_ERR_INVALID_ARG on bad index/name
+ */
+esp_err_t tsdb_rename_param(uint8_t index, const char *new_name);
+
+/**
+ * @brief Find a column by name (base, then overflow extras). v2.5+
+ *
+ * @return Column index, or -1 if not found.
+ */
+int tsdb_find_param(const char *name);
 
 // ============================================================================
 // BENCHMARK
@@ -695,31 +837,24 @@ tsdb_t *tsdb_open(const tsdb_config_t *config);
 esp_err_t tsdb_close_h(tsdb_t *db);
 
 /**
- * @brief Force a directory-entry commit by close+reopen of the underlying FILE*.
+ * @brief Force a directory-entry commit by close+reopen of the active segment.
  *
- * On esp_littlefs (joltwallet/littlefs), files held open with fopen("r+b")
- * across many writes never trigger a directory commit even with fflush+fsync
- * after each write — only fclose actually publishes the dir entry to disk.
- * Without this, every reboot finds the file "missing" and tsdb_open recreates
- * it from scratch, losing all history.
- *
- * tsdb_sync_h takes the per-handle mutex, fcloses db->file, reopens it with
- * "r+b", and re-validates the on-disk header against the in-memory copy. The
- * handle and all internal state survive — callers may continue using db after
- * this returns successfully. Cost is one filesystem round-trip (~30-50 ms on
- * LittleFS); cheap enough to call after every tsdb_write_h on snapshot
- * cadences (5-min) or every N writes on faster cadences.
+ * Every write already fsyncs the active segment. On esp_littlefs the 2.4.0
+ * power-pull test showed fsync alone is durable for an open file, but if you
+ * want belt and braces before a planned reboot, this closes and reopens the
+ * active segment file (one filesystem round-trip, ~30-50 ms). The handle and
+ * all state survive.
  *
  * Returns ESP_ERR_INVALID_STATE if db is null or not open, ESP_FAIL if the
- * close+reopen cycle leaves the file in an inconsistent state (rare; in that
- * case the handle's is_open is set false and callers should treat the DB as
- * closed).
+ * reopen fails (the handle is then closed).
  */
 esp_err_t tsdb_sync_h(tsdb_t *db);
 
 bool tsdb_is_initialized_h(const tsdb_t *db);
 
 esp_err_t tsdb_write_h(tsdb_t *db, uint32_t timestamp, const int16_t *values);
+/** @brief Handle variant of tsdb_maintain(). */
+esp_err_t tsdb_maintain_h(tsdb_t *db, bool *more);
 
 esp_err_t tsdb_write_batch_h(tsdb_t *db,
                              const uint32_t *timestamps,
@@ -777,6 +912,10 @@ uint8_t tsdb_get_total_params_h(const tsdb_t *db);
 const char *tsdb_get_param_name_h(const tsdb_t *db, uint8_t index);
 
 bool tsdb_has_overflow_h(const tsdb_t *db);
+
+esp_err_t tsdb_rename_param_h(tsdb_t *db, uint8_t index, const char *new_name);
+
+int tsdb_find_param_h(tsdb_t *db, const char *name);
 
 #ifdef __cplusplus
 }

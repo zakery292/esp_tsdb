@@ -1,356 +1,345 @@
 /**
  * @file tsdb_write.c
- * @brief Write operations with LRU eviction and ring buffer
+ * @brief Append path: active segment management, write cache, eviction.
  */
 
 #include "tsdb_internal.h"
 #include "esp_log.h"
-#include <string.h>
+#include "freertos/task.h"
 #include <unistd.h>
 #include <errno.h>
 
 static const char *TAG = "TSDB_WRITE";
 
-// ============================================================================
-// BLOCK I/O
-// ============================================================================
+// ---------------------------------------------------------------------------
+// Write cache
+// ---------------------------------------------------------------------------
 
-/**
- * @brief Read a data block from file
- */
-esp_err_t tsdb_read_block(tsdb_t *db, uint32_t block_num, tsdb_block_t *block) {
-    if (db == NULL || db->file == NULL || block == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    uint32_t block_offset = tsdb_calc_block_offset(&db->header, block_num);
-
-    fseek(db->file, block_offset, SEEK_SET);
-    size_t read = fread(block, TSDB_BLOCK_SIZE, 1, db->file);
-
-    if (read != 1) {
-        ESP_LOGD(TAG, "Block %lu not found or uninitialized", (unsigned long)block_num);
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    return ESP_OK;
+static tsdb_block_t *write_cache_ptr(tsdb_t *db) {
+    return (tsdb_block_t *) tsdb_get_buffer_ptr(&db->pool, db->write_cache_offset, TSDB_BLOCK_SIZE);
 }
 
+void tsdb_reopen_active(tsdb_t *db) {
+    tsdb_write_cache_invalidate(db);
+    if (db->active == NULL || db->nsegs == 0) return;
+    fclose(db->active);
+    char path[160];
+    tsdb_seg_path(db, db->segs[db->nsegs - 1].seq, path, sizeof(path));
+    db->active = fopen(path, "r+b");
+    if (db->active == NULL) {
+        ESP_LOGE(TAG, "Reopen of %s after a failed write failed — next write starts a new segment", path);
+    }
+}
+
+esp_err_t tsdb_write_cache_flush(tsdb_t *db) {
+    if (db == NULL || !db->cache_dirty) return ESP_OK;
+    tsdb_block_t *blk = write_cache_ptr(db);
+    if (blk == NULL || db->cached_block_num == UINT32_MAX || db->active == NULL || db->nsegs == 0) {
+        db->cache_dirty = false;
+        return ESP_OK;
+    }
+    const tsdb_seg_t *a = &db->segs[db->nsegs - 1];
+    esp_err_t ret = tsdb_seg_write_block(db->active, a->data_offset, db->cached_block_num, blk);
+    db->cache_dirty = false;
+    if (ret != ESP_OK) {
+        tsdb_reopen_active(db);
+    } else {
+        // The dirty block is the tail block: everything counted is on disk.
+        db->flushed_seq = a->seq;
+        db->flushed_records = a->records;
+        db->flushed_last_ts = a->last_ts;
+    }
+    return ret;
+}
+
+// ---------------------------------------------------------------------------
+// Space management
+// ---------------------------------------------------------------------------
+
 /**
- * @brief Write a data block to file
+ * @brief Free-space / ENOSPC response: unlink the oldest segment, then latch
+ *        the capacity at "what is on disk now plus the room the file set is
+ *        about to use" (`room` records), so logical eviction keeps the file
+ *        set from growing past this point. Only ever lowered; tsdb_resize()
+ *        or a reopen restores the config value.
  *
- * Returns ESP_ERR_NO_MEM specifically when the filesystem is full (ENOSPC),
- * so the caller can adapt capacity and retry via LRU eviction.
+ * @return false when nothing can be evicted (only the active segment left).
  */
-esp_err_t tsdb_write_block(tsdb_t *db, uint32_t block_num, const tsdb_block_t *block) {
-    if (db == NULL || db->file == NULL || block == NULL) {
-        return ESP_ERR_INVALID_ARG;
+static bool make_room(tsdb_t *db, uint32_t room, const char *why) {
+    // A conversion round in progress holds up to a segment of space for
+    // copies the 2.x file still has: give that back first (it backs off),
+    // before anything is evicted.
+    if (tsdb_conv_yield_space(db)) return true;
+    uint32_t before = db->total_physical;
+    if (db->nsegs > 0 && db->segs[0].kind == TSDB_SEG_LEGACY) {
+        ESP_LOGE(TAG, "%s: removing the adopted pre-3.0 database file to make room", why);
+    }
+    if (!tsdb_evict_oldest(db, true)) {
+        ESP_LOGW(TAG, "%s and nothing left to evict", why);
+        return false;
+    }
+    // Cap at the footprint we had BEFORE evicting: in steady-state turnover
+    // that is "what is on disk plus one segment"; after evicting a large
+    // legacy file it keeps the whole former capacity instead of one segment.
+    (void) room;
+    uint32_t cap = before;
+    if (db->max_records == 0 || cap < db->max_records) {
+        db->max_records = cap;
+        ESP_LOGW(TAG, "%s: capacity capped at %lu records", why, (unsigned long) cap);
+    }
+    db->capacity_adapted = true;
+    tsdb_apply_capacity(db);
+    return true;
+}
+
+static bool below_reserve(tsdb_t *db) {
+    if (db->free_space_cb == NULL || db->min_free_bytes == 0) return false;
+    uint64_t free_now = db->free_space_cb();
+    if (free_now >= db->min_free_bytes) return false;
+    ESP_LOGW(TAG, "Free space %llu below reserve %lu", (unsigned long long) free_now,
+             (unsigned long) db->min_free_bytes);
+    return true;
+}
+
+/**
+ * @brief Ensure db->active is a segment with the current schema and room for
+ *        one more record, creating a new one if needed.
+ */
+static esp_err_t ensure_active(tsdb_t *db, uint32_t ts) {
+    const tsdb_seg_t *a = db->nsegs ? &db->segs[db->nsegs - 1] : NULL;
+    bool usable = db->active != NULL && a != NULL && a->kind == TSDB_SEG_NORMAL &&
+                  a->schema_gen == db->schema.gen &&
+                  a->records < a->blocks_cap * (uint32_t) a->rpb;
+    if (usable) return ESP_OK;
+
+    if (db->cache_dirty) {
+        esp_err_t fr = tsdb_write_cache_flush(db);
+        if (fr != ESP_OK) return fr;
+    }
+    tsdb_write_cache_invalidate(db);
+    if (db->active) { fclose(db->active); db->active = NULL; }
+
+    uint16_t rpb = (TSDB_BLOCK_SIZE - 8) / (4 + 2u * db->schema.count);
+    uint32_t room = db->seg_blocks * (uint32_t) rpb;
+
+    // Proactive guard: a new segment is a new file. Below the reserve, turn
+    // the file set over (evict one, create one) instead of growing. If there
+    // is nothing to evict yet, go ahead — the guard is advisory, ENOSPC below
+    // is the hard stop.
+    if (below_reserve(db)) {
+        make_room(db, room, "Free-space reserve breached");
     }
 
-    uint32_t block_offset = tsdb_calc_block_offset(&db->header, block_num);
+    for (int attempt = 0; attempt < 64; attempt++) {
+        esp_err_t ret = tsdb_seg_create(db, ts);
+        if (ret != ESP_ERR_NO_MEM) return ret;
+        if (!make_room(db, room, "Filesystem full creating a segment")) return ESP_ERR_NO_MEM;
+    }
+    return ESP_ERR_NO_MEM;
+}
 
-    fseek(db->file, block_offset, SEEK_SET);
-    errno = 0;
-    size_t written = fwrite(block, TSDB_BLOCK_SIZE, 1, db->file);
-    int write_errno = errno;
-    fflush(db->file);
-    fsync(fileno(db->file));
+// ---------------------------------------------------------------------------
+// Append one record (lock held)
+// ---------------------------------------------------------------------------
 
-    if (written != 1) {
-        if (write_errno == ENOSPC) {
-            ESP_LOGW(TAG, "Block %lu write: filesystem full (ENOSPC)",
-                     (unsigned long)block_num);
-            clearerr(db->file);
-            return ESP_ERR_NO_MEM;
+static esp_err_t tsdb_write_locked(tsdb_t *db, uint32_t timestamp, const int16_t *values,
+                                   bool defer_flush) {
+    esp_err_t ret = ensure_active(db, timestamp);
+    if (ret != ESP_OK) return ret;
+
+    tsdb_seg_t *a = &db->segs[db->nsegs - 1];
+    uint16_t rpb = a->rpb;
+    uint32_t block_num = a->records / rpb;
+    uint16_t off = (uint16_t)(a->records % rpb);
+    bool new_block = (off == 0);
+
+    // Proactive free-space guard at block boundaries (the file grows here),
+    // only until the capacity is latched: after that the active segment's
+    // remaining room is already inside the cap, and the file set turns over
+    // at segment granularity (checked on creation).
+    if (new_block && a->records > 0 && !db->capacity_adapted && below_reserve(db)) {
+        uint32_t room = a->blocks_cap * (uint32_t) rpb - a->records;
+        make_room(db, room, "Free-space reserve breached");
+        a = &db->segs[db->nsegs - 1];               // table may have shifted
+    }
+
+    tsdb_block_t temp_block;
+    tsdb_block_t *block = write_cache_ptr(db);
+    bool cacheable = (block != NULL);
+    if (!cacheable) block = &temp_block;
+    uint8_t *raw = (uint8_t *) block;
+
+    bool hit = cacheable && db->cached_block_num == block_num;
+    if (!hit) {
+        if (cacheable && db->cache_dirty) {
+            esp_err_t fr = tsdb_write_cache_flush(db);
+            if (fr != ESP_OK) return fr;
         }
-        ESP_LOGE(TAG, "Failed to write block %lu (errno=%d)",
-                 (unsigned long)block_num, write_errno);
-        return ESP_FAIL;
+        if (new_block || tsdb_seg_read_block(db->active, a->data_offset, block_num, block) != ESP_OK ||
+            TSDB_BLOCK_MAGIC(raw) != TSDB_BLOCK_MAGIC_VALUE) {
+            memset(block, 0, TSDB_BLOCK_SIZE);
+            TSDB_BLOCK_MAGIC(raw) = TSDB_BLOCK_MAGIC_VALUE;
+            TSDB_BLOCK_COUNT(raw) = 0;
+        }
+        if (cacheable) db->cached_block_num = block_num;
     }
 
-    ESP_LOGD(TAG, "Wrote block %lu at offset %lu",
-             (unsigned long)block_num, (unsigned long)block_offset);
+    TSDB_BLOCK_TS(raw, off) = timestamp;
+    for (uint8_t i = 0; i < a->np; i++) {
+        TSDB_BLOCK_PARAM(raw, rpb, i, off) = values[i];
+    }
+    TSDB_BLOCK_COUNT(raw) = off + 1;
 
+    // Flush policy: single writes always; batch writes defer within a block,
+    // but a NEW block (the write that grows the file) goes out immediately so
+    // ENOSPC is handled here, once, instead of surfacing from a later flush.
+    bool flush_now = !defer_flush || !cacheable || new_block;
+    if (flush_now) {
+        for (int attempt = 0; attempt < 64; attempt++) {
+            ret = tsdb_seg_write_block(db->active, a->data_offset, block_num, block);
+            if (ret == ESP_OK) break;
+            // Never write through a handle that failed (littlefs: an errored
+            // file is not safe to use); the reopened one has the last synced
+            // state, and the tail block's slot in it is unchanged.
+            tsdb_reopen_active(db);
+            if (db->active == NULL) break;
+            if (ret != ESP_ERR_NO_MEM) break;
+            // Filesystem full: free the oldest segment and retry.
+            if (db->nsegs <= 1 ||
+                !make_room(db, a->blocks_cap * (uint32_t) rpb - a->records,
+                           "Filesystem full appending a block")) {
+                ret = ESP_ERR_NO_MEM;
+                break;
+            }
+            a = &db->segs[db->nsegs - 1];
+        }
+        if (ret != ESP_OK) {
+            tsdb_write_cache_invalidate(db);
+            // Undo the in-RAM record so the block image matches the file.
+            TSDB_BLOCK_COUNT(raw) = off;
+            return ret;
+        }
+        if (cacheable) db->cached_block_num = block_num;
+        db->cache_dirty = false;
+    } else {
+        db->cache_dirty = true;
+    }
+
+    a->records++;
+    a->last_ts = timestamp;
+    if (a->records == 1) a->first_ts = timestamp;
+    db->total_physical++;
+    tsdb_apply_capacity(db);
+    tsdb_conv_space_event(db, false);
     return ESP_OK;
 }
 
-// ============================================================================
-// WRITE OPERATIONS
-// ============================================================================
+// ---------------------------------------------------------------------------
+// Public
+// ---------------------------------------------------------------------------
+
+// While a pre-3.0 file is being converted (or awaits a retried adoption),
+// every write also does one bounded step of it, so the conversion completes
+// without the application calling tsdb_maintain(). The step takes the lock
+// separately: a reader that queued behind the write gets it first (a mutex
+// handed back does not preempt an equal-priority waiter by itself, hence the
+// yield).
+static void maintenance_after_write(tsdb_t *db) {
+    taskYIELD();
+    esp_err_t r = tsdb_maintain_h(db, NULL);
+    if (r != ESP_OK && r != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "Maintenance step after a write: %d (retried at the next one)", r);
+    }
+}
 
 esp_err_t tsdb_write_h(tsdb_t *db, uint32_t timestamp, const int16_t *values) {
     if (db == NULL || !db->is_open) {
         ESP_LOGE(TAG, "Not initialized");
         return ESP_ERR_INVALID_STATE;
     }
+    if (values == NULL) return ESP_ERR_INVALID_ARG;
+    if (db->closing) return ESP_ERR_INVALID_STATE;
 
-    if (values == NULL) {
-        ESP_LOGE(TAG, "NULL values pointer");
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    // Fail fast during a schema migration or close instead of stalling on the
-    // mutex for the full lock timeout. Caller may retry on its next cadence.
-    if (db->migrating || db->closing) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    // Take the handle lock for the whole write. The mutex is recursive, so a
-    // task already holding it (e.g. during a query) can still write. Taken
-    // ONCE here -- the retry_write path below does not re-take it.
-    // OPEN variant: a closer may have won the mutex while we were blocked —
-    // the handle is parked (not freed) in that case, so we must re-check.
     TSDB_LOCK_OPEN_OR_RETURN(db, 5000, ESP_ERR_TIMEOUT);
-
-    // PROACTIVE capacity cap (free-space guard, see esp_tsdb.h): if the file
-    // is still in its growth phase and the NEXT record starts a new block —
-    // the only point the data file grows — check the filesystem reserve and
-    // switch to ring/LRU reuse BEFORE breaching it. Waiting for the hard
-    // ENOSPC below means the filesystem is already at zero free, where
-    // copy-on-write filesystems (littlefs) fail every OTHER file's writes
-    // too (fault ring, settings audit, energy json on the dongle).
-    if (db->free_space_cb && db->min_free_bytes > 0 &&
-        !db->capacity_adapted && db->header.max_records > 0 &&
-        db->header.total_records > 0 &&
-        db->header.total_records < db->header.max_records &&
-        (db->header.total_records % db->header.records_per_block) == 0) {
-        uint64_t free_now = db->free_space_cb();
-        if (free_now < db->min_free_bytes) {
-            uint32_t old_max = db->header.max_records;
-            db->header.max_records = db->header.total_records;
-            db->capacity_adapted = true;
-            ESP_LOGW(TAG, "Free space %llu below reserve %lu: capping %lu -> %lu records (LRU from now on)",
-                     (unsigned long long)free_now,
-                     (unsigned long)db->min_free_bytes,
-                     (unsigned long)old_max,
-                     (unsigned long)db->header.max_records);
-            // Persisting the cap matters across reboots: a stale on-disk max
-            // resumes growth into the reserve on the next open. At the reserve
-            // boundary littlefs COW can fail even this in-place 512B rewrite,
-            // so retry once and shout if it still fails (the in-memory cap
-            // holds for this power cycle regardless).
-            if (tsdb_write_header(db->file, &db->header) != ESP_OK &&
-                tsdb_write_header(db->file, &db->header) != ESP_OK) {
-                ESP_LOGE(TAG, "Capacity-cap header persist FAILED — cap is "
-                              "in-memory only until the next successful header write");
-            }
-        }
-    }
-
-retry_write:
-    {}  // label target — allow re-entry after adaptive shrink
-
-    // Calculate record index (ring buffer or unlimited)
-    bool unlimited = (db->header.max_records == 0);
-    uint32_t record_idx = unlimited ? db->header.total_records :
-                          (db->header.total_records % db->header.max_records);
-
-    // Determine if this overwrites old data (LRU eviction) — never in unlimited mode
-    bool is_eviction = (!unlimited && db->header.total_records >= db->header.max_records);
-
-    if (is_eviction) {
-        db->header.total_evictions++;
-        db->header.oldest_record_idx = (db->header.oldest_record_idx + 1) %
-                                           db->header.max_records;
-        ESP_LOGD(TAG, "LRU eviction: oldest_idx=%lu",
-                 (unsigned long)db->header.oldest_record_idx);
-    }
-
-    // Calculate block number and offset within block
-    uint32_t block_num = record_idx / db->header.records_per_block;
-    uint16_t offset_in_block = record_idx % db->header.records_per_block;
-
-    ESP_LOGD(TAG, "Writing record %lu: block=%lu, offset=%d",
-             (unsigned long)db->header.total_records,
-             (unsigned long)block_num, offset_in_block);
-
-    // Get pointer to write buffer in pool
-    tsdb_block_t *block = (tsdb_block_t*)tsdb_get_buffer_ptr(&db->pool,
-                                                              db->write_cache_offset,
-                                                              sizeof(tsdb_block_t));
-
-    tsdb_block_t temp_block;
-    if (block == NULL) {
-        // Paged mode and spans pages, use temp buffer
-        block = &temp_block;
-    }
-
-    // Read existing block
-    esp_err_t ret;
-    ret = tsdb_read_block(db, block_num, block);
-
-    // Initialize block if new or read failed
-    uint8_t *raw_blk = (uint8_t *)block;
-    if (ret != ESP_OK || TSDB_BLOCK_MAGIC(raw_blk) != 0x424C4B54) {
-        ESP_LOGD(TAG, "Initializing new block %lu", (unsigned long)block_num);
-        memset(block, 0, TSDB_BLOCK_SIZE);
-        TSDB_BLOCK_MAGIC(raw_blk) = 0x424C4B54;  // "BLKT"
-        TSDB_BLOCK_COUNT(raw_blk) = 0;
-    }
-
-    // Write data in columnar format (runtime offsets for correct disk layout)
-    uint16_t rpb = db->header.records_per_block;
-    uint8_t *raw = (uint8_t *)block;
-    TSDB_BLOCK_TS(raw, offset_in_block) = timestamp;
-    for (uint8_t i = 0; i < db->header.num_params; i++) {
-        TSDB_BLOCK_PARAM(raw, rpb, i, offset_in_block) = values[i];
-    }
-
-    // Update block record count
-    if (offset_in_block >= TSDB_BLOCK_COUNT(raw)) {
-        TSDB_BLOCK_COUNT(raw) = offset_in_block + 1;
-    }
-
-    // Write block back to file
-    ret = tsdb_write_block(db, block_num, block);
-    if (ret == ESP_ERR_NO_MEM && !is_eviction && !db->capacity_adapted &&
-        db->header.total_records > 0) {
-        // Filesystem full while still growing. Cap max_records to what we've
-        // already written so future writes reuse existing blocks via LRU
-        // instead of allocating new ones. Header rewrite is in-place (512 bytes)
-        // so it doesn't need new space.
-        uint32_t old_max = db->header.max_records;
-        db->header.max_records = db->header.total_records;
-        db->capacity_adapted = true;
-        ESP_LOGW(TAG, "Adaptive capacity: %lu -> %lu records (LRU from now on)",
-                 (unsigned long)old_max,
-                 (unsigned long)db->header.max_records);
-        // Persist the new cap. If this fails we still retry - the in-memory
-        // header is authoritative for the retry path. The lock is still held
-        // (recursive mutex, taken once above); the retry does not re-take it.
-        // Header persist failure here is likely (we JUST hit ENOSPC) — retry
-        // once and log loudly; a stale on-disk max resumes growth next boot.
-        if (tsdb_write_header(db->file, &db->header) != ESP_OK &&
-            tsdb_write_header(db->file, &db->header) != ESP_OK) {
-            ESP_LOGE(TAG, "ENOSPC-cap header persist FAILED — cap is "
-                          "in-memory only until the next successful header write");
-        }
-        goto retry_write;
-    }
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to write block");
-        tsdb_unlock(db);
-        return ret;
-    }
-
-    // Write overflow data if active
-    if (db->extra_param_count > 0 &&
-        db->header.total_records >= db->first_overflow_record_idx) {
-        uint32_t overflow_idx = db->header.total_records - db->first_overflow_record_idx;
-        uint32_t ovf_offset = db->overflow_data_offset +
-                              (overflow_idx * db->overflow_record_size);
-
-        fseek(db->file, ovf_offset, SEEK_SET);
-        size_t ovf_written = fwrite(&values[db->header.num_params],
-                                     sizeof(int16_t),
-                                     db->extra_param_count,
-                                     db->file);
-        if (ovf_written != db->extra_param_count) {
-            ESP_LOGE(TAG, "Failed to write overflow data");
-            // Don't fail the whole write -- base data is already written
-        }
-    }
-
-    // Update header
-    db->header.total_records++;
-    db->header.total_writes++;
-    db->header.newest_record_idx = record_idx;
-    db->header.newest_timestamp = timestamp;
-
-    // Update oldest timestamp if needed
-    if (is_eviction) {
-        // Read oldest timestamp from file
-        uint32_t oldest_block = db->header.oldest_record_idx / db->header.records_per_block;
-        uint16_t oldest_offset = db->header.oldest_record_idx % db->header.records_per_block;
-
-        tsdb_block_t *oldest_block_data = (tsdb_block_t*)tsdb_get_buffer_ptr(&db->pool,
-                                                                              db->read_buffer_offset,
-                                                                              sizeof(tsdb_block_t));
-        tsdb_block_t temp_oldest;
-        if (oldest_block_data == NULL) {
-            oldest_block_data = &temp_oldest;
-        }
-
-        esp_err_t _evr;
-        _evr = tsdb_read_block(db, oldest_block, oldest_block_data);
-        if (_evr == ESP_OK) {
-            db->header.oldest_timestamp = TSDB_BLOCK_TS((uint8_t *)oldest_block_data, oldest_offset);
-        }
-    } else if (db->header.total_records == 1) {
-        db->header.oldest_timestamp = timestamp;
-    }
-
-    // Sparse index: mark it stale instead of writing the entry. The index
-    // sits in the first littlefs block of the file, and littlefs rewrites a
-    // file from the first modified block to EOF — so one 8-byte entry cost a
-    // whole-file copy every index_stride records (89 block erases at 370 KB,
-    // growing with the file; host_test/test_lfs_cost.c). Nothing reads the
-    // index since 2.1.0; tsdb_fold_header() rebuilds it on close/sync, as part
-    // of the header write that already rewrites that block. Bounds-guarded as
-    // before: after a tsdb_resize() grow, record_idx can exceed the capacity
-    // the index was sized for.
-    if (record_idx % db->header.index_stride == 0 &&
-        (record_idx / db->header.index_stride) < db->header.index_entries) {
-        db->index_stale = true;
-    }
-
-    // Persist the header to the SIDECAR, not to offset 0 of this file.
-    // Rewriting offset 0 costs 3.7-5.1 s because littlefs copy-on-writes
-    // everything from the modified offset to EOF. The sidecar is measured at
-    // 46-56 ms for the same header on a 268 KB database, and stays durable on
-    // every record. close/sync fold the header back in, so a cleanly closed
-    // file remains self-contained. See TSDB_SIDECAR_MAGIC.
-    tsdb_sidecar_write(db);
-    db->in_file_header_stale = true;
-
-
-    ESP_LOGD(TAG, "Write complete: total_records=%lu, newest_ts=%lu",
-             (unsigned long)db->header.total_records,
-             (unsigned long)db->header.newest_timestamp);
-
+    if (tsdb_refuse_if_query_open(db, __func__)) return ESP_ERR_INVALID_STATE;
+    esp_err_t ret = tsdb_write_locked(db, timestamp, values, false);
+    bool maintain = tsdb_conv_pending(db);
     tsdb_unlock(db);
-    return ESP_OK;
+    if (maintain) maintenance_after_write(db);
+    return ret;
 }
 
-esp_err_t tsdb_write_batch_h(tsdb_t *db,
-                              const uint32_t *timestamps,
-                              const int16_t **values,
-                              uint32_t count) {
-    if (db == NULL || !db->is_open) {
-        return ESP_ERR_INVALID_STATE;
-    }
+esp_err_t tsdb_write_batch_h(tsdb_t *db, const uint32_t *timestamps,
+                             const int16_t **values, uint32_t count) {
+    if (db == NULL || !db->is_open) return ESP_ERR_INVALID_STATE;
+    if (timestamps == NULL || values == NULL || count == 0) return ESP_ERR_INVALID_ARG;
+    if (db->closing) return ESP_ERR_INVALID_STATE;
 
-    if (timestamps == NULL || values == NULL || count == 0) {
-        return ESP_ERR_INVALID_ARG;
-    }
+    TSDB_LOCK_OPEN_OR_RETURN(db, 5000, ESP_ERR_TIMEOUT);
+    if (tsdb_refuse_if_query_open(db, __func__)) return ESP_ERR_INVALID_STATE;
 
-    ESP_LOGI(TAG, "Batch writing %lu records", (unsigned long)count);
+    esp_err_t ret = ESP_OK;
+    uint32_t done = 0;
+    // Last point at which everything counted in the active segment was on
+    // disk (the write cache clean).
+    uint32_t committed_seq = db->nsegs ? db->segs[db->nsegs - 1].seq : UINT32_MAX;
+    uint32_t committed_records = db->nsegs ? db->segs[db->nsegs - 1].records : 0;
+    uint32_t committed_last_ts = db->nsegs ? db->segs[db->nsegs - 1].last_ts : 0;
+    db->flushed_seq = UINT32_MAX;
 
-    // Write records one by one. tsdb_write_h takes the mutex per call.
-    // TODO: Optimize by batching block writes under a single lock acquire.
     for (uint32_t i = 0; i < count; i++) {
-        esp_err_t ret = tsdb_write_h(db, timestamps[i], values[i]);
+        if (values[i] == NULL) { ret = ESP_ERR_INVALID_ARG; break; }
+        ret = tsdb_write_locked(db, timestamps[i], values[i], true);
         if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to write record %lu in batch", (unsigned long)i);
-            return ret;
+            ESP_LOGE(TAG, "Batch: record %lu failed", (unsigned long) i);
+            break;
+        }
+        done++;
+        if (!db->cache_dirty) {
+            committed_seq = db->segs[db->nsegs - 1].seq;
+            committed_records = db->segs[db->nsegs - 1].records;
+            committed_last_ts = db->segs[db->nsegs - 1].last_ts;
         }
     }
 
-    ESP_LOGI(TAG, "Batch write complete: %lu records", (unsigned long)count);
+    if (db->cache_dirty) {
+        esp_err_t fr = tsdb_write_cache_flush(db);
+        if (ret == ESP_OK) ret = fr;
+    }
+    // A deferred block can also have been flushed by the failing record
+    // itself (moving to a new segment flushes the full one before creating
+    // the next, and the creation failed): those records are on disk.
+    if (db->flushed_seq == committed_seq && db->flushed_records > committed_records) {
+        committed_records = db->flushed_records;
+        committed_last_ts = db->flushed_last_ts;
+    }
+    if (ret != ESP_OK && db->nsegs > 0 && db->segs[db->nsegs - 1].seq == committed_seq &&
+        db->segs[db->nsegs - 1].records > committed_records) {
+        // A deferred block that failed to flush (here or mid-batch, when the
+        // batch moved to the next block) took its records with it: forget
+        // them, so the table only counts what reached disk. Records of it
+        // that did land are overwritten by the next write.
+        tsdb_seg_t *a = &db->segs[db->nsegs - 1];
+        uint32_t lost = a->records - committed_records;
+        ESP_LOGE(TAG, "Batch: dropping %lu records that did not reach disk", (unsigned long) lost);
+        a->records = committed_records;
+        a->last_ts = committed_last_ts;
+        db->total_physical -= lost;
+        tsdb_write_cache_invalidate(db);
+        tsdb_apply_capacity(db);
+    }
 
-    return ESP_OK;
+    bool maintain = tsdb_conv_pending(db);
+    tsdb_unlock(db);
+    if (maintain) maintenance_after_write(db);
+    if (ret == ESP_OK) ESP_LOGI(TAG, "Batch write complete: %lu records", (unsigned long) done);
+    return ret;
 }
-
-// ============================================================================
-// LEGACY GLOBAL API
-// ============================================================================
 
 esp_err_t tsdb_write(uint32_t timestamp, const int16_t *values) {
     return tsdb_write_h(g_default_handle, timestamp, values);
 }
 
-esp_err_t tsdb_write_batch(const uint32_t *timestamps,
-                            const int16_t **values,
-                            uint32_t count) {
+esp_err_t tsdb_write_batch(const uint32_t *timestamps, const int16_t **values, uint32_t count) {
     return tsdb_write_batch_h(g_default_handle, timestamps, values, count);
 }

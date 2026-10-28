@@ -1,10 +1,13 @@
 // Host regression for the free-space guard (tsdb_config_t.free_space_cb /
 // min_free_bytes) and the close/reopen handle-recycle lifecycle.
 //
-// The guard: before the data file grows by a new block, the engine calls
-// free_space_cb(); below min_free_bytes it caps max_records at the current
-// count and rings from then on — BEFORE hard ENOSPC, so other files on the
-// filesystem keep their free-block reserve.
+// The guard (3.0): before a segment file grows by a block, or a new segment
+// is created, the engine calls free_space_cb(); below min_free_bytes it
+// evicts the oldest segment and latches max_records at what is on disk plus
+// one segment, so the file set turns over instead of growing — BEFORE hard
+// ENOSPC, so other files on the filesystem keep their free-block reserve.
+// The latch is in RAM: a reopen restores the config value and the guard
+// simply fires again if space is still short.
 //
 // The recycler: LIFECYCLE SEMANTICS ONLY. The host shims are single-threaded
 // (semaphores are no-op stubs), so the concurrency this design exists for —
@@ -16,6 +19,7 @@
 //
 // Build with ./build_freecap.sh
 #include "esp_tsdb.h"
+#include "testutil.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -39,13 +43,16 @@ static uint64_t fake_free_space(void) { g_probe_calls++; return g_fake_free; }
 static tsdb_config_t base_cfg(void) {
     tsdb_config_t c = {0};
     c.filepath = DB_PATH;
-    c.num_params = 1;                 // record_size 6 -> 681 records/block
+    c.num_params = 1;                 // record_size 6 -> 169 records/block
     c.max_records = 5000;
     c.index_stride = 100;
     c.buffer_pool_size = 16 * 1024;
     c.alloc_strategy = TSDB_ALLOC_INTERNAL_RAM;
     c.free_space_cb = fake_free_space;
     c.min_free_bytes = 100000;
+    // One data block per segment, so "the file set did not grow" can be
+    // checked to within a block (auto sizing has a 6-block floor).
+    c.segment_bytes = 1024;
     return c;
 }
 
@@ -61,7 +68,7 @@ int main(void) {
     uint32_t ts = T0;
 
     printf("Part 1: guard caps capacity at a block boundary\n");
-    remove(DB_PATH);
+    tsdb_test_wipe(DB_PATH);
     tsdb_config_t c = base_cfg();
     if (tsdb_init(&c) != ESP_OK) { printf("init FAIL\n"); return 2; }
 
@@ -83,25 +90,35 @@ int main(void) {
     }
     tsdb_get_stats(&st);
     CHECK(capped_at >= 0, "capacity capped within one block of low space");
-    CHECK(st.max_records == st.total_records, "cap == record count at cap time");
+    CHECK(st.max_records >= st.total_records && st.max_records < 5000, "cap covers what is on disk");
     uint32_t cap = st.max_records;
+    uint32_t retained_at_cap = st.total_records;
+    long bytes_at_cap = tsdb_test_bytes(DB_PATH);
 
     write_n(700, &ts);                 // keep writing well past the cap
     tsdb_get_stats(&st);
     CHECK(st.max_records == cap, "cap sticky across further writes");
-    CHECK(st.total_records == cap, "ring stays at capacity");
-    CHECK(st.total_evictions >= 700, "writes proceed as LRU evictions");
+    CHECK(st.total_records <= cap && st.total_records + 200 >= retained_at_cap,
+          "window turns over at capacity");
+    CHECK(st.total_evictions >= 700, "writes proceed as evictions");
+    CHECK(tsdb_test_bytes(DB_PATH) <= bytes_at_cap + 2048, "file set did not grow");
 
-    // Cap must survive close/reopen (persisted in the header).
+    // The latch is in RAM: a reopen goes back to the config and the guard
+    // fires again on the next growth.
     tsdb_close();
     c = base_cfg();
     if (tsdb_init(&c) != ESP_OK) { printf("reopen FAIL\n"); return 2; }
     tsdb_get_stats(&st);
-    CHECK(st.max_records == cap, "cap persisted across reopen");
+    CHECK(st.max_records == 5000, "reopen restores config capacity");
+    long bytes_reopen = tsdb_test_bytes(DB_PATH);
+    write_n(400, &ts);
+    tsdb_get_stats(&st);
+    CHECK(st.max_records < 5000 && tsdb_test_bytes(DB_PATH) <= bytes_reopen + 2048,
+          "guard re-latches after reopen, no growth");
 
     printf("Part 2: failed probe (UINT64_MAX) never caps\n");
     tsdb_close();
-    remove(DB_PATH);
+    tsdb_test_wipe(DB_PATH);
     c = base_cfg();
     if (tsdb_init(&c) != ESP_OK) { printf("init2 FAIL\n"); return 2; }
     g_fake_free = UINT64_MAX;          // \"unknown\" — must not cap
@@ -125,7 +142,7 @@ int main(void) {
     }
     CHECK(1, "5 close/reopen cycles completed (recycler reuse, no crash)");
 
-    remove(DB_PATH);
+    tsdb_test_wipe(DB_PATH);
     printf("%s (%d failures)\n", g_fail ? "FAILED" : "ALL PASS", g_fail);
     return g_fail ? 1 : 0;
 }

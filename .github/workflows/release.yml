@@ -66,6 +66,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           args=(--title "${GITHUB_REF_NAME}")
+          # A tag with a pre-release suffix (v3.0.0-beta.1) must not become
+          # "Latest" on GitHub; consumers tracking the stable line keep v2.x.
+          case "${GITHUB_REF_NAME}" in *-*) args+=(--prerelease);; esac
           if [ -s release_notes.md ]; then
             args+=(--notes-file release_notes.md)
           else

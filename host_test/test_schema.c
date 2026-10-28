@@ -1,10 +1,12 @@
-// Host regression for tsdb_migrate_schema_h (v2.2): full base-column rewrite.
-// Covers: column survival by name, dropped column, new zero-backfilled column,
-// overflow extras folded into base columns, wrapped-ring source, identical-
-// schema no-op, refusal on a too-small space budget, trim-to-fit keeping the
-// newest records, post-migration writes, and .mig crash-recovery (stale
-// removal + orphan adoption). Build with ./build_schema.sh.
+// Host regression for tsdb_migrate_schema_h. Since 3.0 the change is instant
+// (new segment, by-name column map) — no rewrite, no space budget, no .mig —
+// but every observable from the 2.2 suite still holds: column survival by
+// name, dropped column, new zero-backfilled column, extras folded into the
+// base list, wrapped source, identical-schema no-op, post-migration writes,
+// stray .mig leftovers tolerated, V4-wide legacy files. Build with
+// ./build_schema.sh.
 #include "esp_tsdb.h"
+#include "testutil.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -46,8 +48,8 @@ static int qcount(tsdb_t *db, uint32_t s, uint32_t e, int16_t *row0, int ncols) 
 }
 
 int main(void) {
-    remove(PATH);  remove(PATH ".mig");
-    remove(PATH2); remove(PATH2 ".mig");
+    tsdb_test_wipe(PATH);
+    tsdb_test_wipe(PATH2);
 
     // ========================================================================
     // Part 1 — correctness: wrapped ring + overflow folding
@@ -87,9 +89,7 @@ int main(void) {
     popts.progress = on_progress; popts.progress_every = 10;
     CHECK(tsdb_migrate_schema_h(db, new_names, 4, &popts) == ESP_OK,
           "migrate returns ESP_OK");
-    CHECK(prog.calls >= 3 && prog.first == 0 && prog.last == 60 &&
-          prog.total == 60 && prog.monotonic,
-          "progress: 0..total, monotonic");
+    CHECK(prog.calls == 0, "no progress callback (nothing is rewritten)");
 
     tsdb_stats_t st = {0};
     tsdb_get_stats_h(db, &st);
@@ -122,11 +122,10 @@ int main(void) {
     tsdb_close_h(db);
 
     // ========================================================================
-    // Part 2 — space budget: refusal and trim-to-fit (newest records win)
-    // Source: 2 params, 400 records, no wrap. Migrating to 3 params
-    // (rpb=101, index entries (400/10)+1=41 -> fixed cost 1024+328=1352).
+    // Part 2 — 3.0: no rewrite, so no space budget and nothing is ever
+    // trimmed; a too-small budget is simply ignored and every record stays.
     // ========================================================================
-    printf("PART 2: space budget + trim-to-fit\n");
+    printf("PART 2: no space budget in 3.0\n");
     const char *two[] = {"soc", "vbat"};
     tsdb_config_t c2 = {0};
     c2.filepath = PATH2; c2.num_params = 2; c2.max_records = 400; c2.index_stride = 10;
@@ -142,33 +141,22 @@ int main(void) {
     const char *three[] = {"soc", "vbat", "extra"};
     tsdb_migrate_opts_t opts = {0};
 
-    // 400 records at rpb=101 -> 4 blocks -> needs 1352 + 4096 = 5448 bytes.
-    opts.free_space_bytes = 3000;   // 2850 after reserve: too small, no trim
+    opts.free_space_bytes = 3000;
     opts.allow_trim = false;
-    CHECK(tsdb_migrate_schema_h(d2, three, 3, &opts) == ESP_ERR_NO_MEM,
-          "refuses when budget too small");
-    tsdb_get_stats_h(d2, &st);
-    CHECK(st.total_records == 400 && st.num_params == 2,
-          "refusal left source untouched");
-
-    // Same budget with allow_trim: fits (2850-1352)/1024 = 1 block = 101
-    // newest records (299..399).
-    opts.allow_trim = true;
     CHECK(tsdb_migrate_schema_h(d2, three, 3, &opts) == ESP_OK,
-          "trim-to-fit migrates");
+          "migrates regardless of budget");
     tsdb_get_stats_h(d2, &st);
-    CHECK(st.total_records == 101, "kept newest 101 records");
-    CHECK(st.max_records == 101, "ring capped to proven capacity");
+    CHECK(st.total_records == 400 && st.num_params == 3, "all 400 records kept, 3 columns");
     int16_t row3[3] = {0};
     n = qcount(d2, 0, 999999u, row3, 3);
-    CHECK(n == 101 && row3[0] == 299 && row3[1] == 1299 && row3[2] == 0,
-          "oldest survivor is record 299, remapped");
+    CHECK(n == 400 && row3[0] == 0 && row3[1] == 1000 && row3[2] == 0,
+          "oldest record remapped, new column 0");
     tsdb_close_h(d2);
 
     // ========================================================================
-    // Part 3 — .mig crash recovery
+    // Part 3 — stray 2.x .mig leftovers next to a 3.0 database are harmless
     // ========================================================================
-    printf("PART 3: crash recovery\n");
+    printf("PART 3: stray .mig leftovers\n");
     tsdb_config_t c3 = {0};
     c3.filepath = PATH; c3.num_params = 4; c3.max_records = 60; c3.index_stride = 10;
     c3.buffer_pool_size = 16 * 1024; c3.alloc_strategy = TSDB_ALLOC_INTERNAL_RAM;
@@ -186,13 +174,10 @@ int main(void) {
     CHECK(st.total_records == 60, "data survived reopen");
     tsdb_close_h(db);
 
-    // Orphaned complete .mig with main missing (crash in the swap window)
-    // -> adopted.
-    rename(PATH, PATH ".mig");
     db = tsdb_open(&c3);
-    CHECK(db != NULL, "reopen adopts orphaned .mig");
+    CHECK(db != NULL, "reopen");
     tsdb_get_stats_h(db, &st);
-    CHECK(st.total_records == 60, "adopted data intact");
+    CHECK(st.total_records == 60, "data intact");
 
     // ========================================================================
     // Part 4 — V4 wide schema: >16 columns (extended names region)
@@ -254,7 +239,7 @@ int main(void) {
     }
 
     // Fresh-create a wide DB directly (no migration).
-    remove(PATH2); remove(PATH2 ".mig");
+    tsdb_test_wipe(PATH2);
     tsdb_config_t c5 = c4;
     c5.filepath = PATH2; c5.num_params = 20; c5.max_records = 100;
     db = tsdb_open(&c5);
