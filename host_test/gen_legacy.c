@@ -10,11 +10,16 @@
 // to <dir>/energy.tsdb with the firmware's energy-logger schema, then either
 // closes cleanly or exits with the handle open (a power cut). fsync is a
 // no-op here: durability on the host does not matter, only the bytes.
-// Prints "<retained> <first_ts> <last_ts>" — what an exact reader must see.
+// Prints "<retained> <first_ts> <last_ts>" — what an exact reader must see —
+// and writes <dir>/records.bin: every record the release itself reads back
+// (after a clean close: reopened; after a power cut: a copy of the files,
+// opened as that release would at the next boot), as
+// uint32 n, then n x {uint32 ts; int16 values[7]}.
 #include "esp_tsdb.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdlib.h>
 
 int __wrap_fsync(int fd) { (void) fd; return 0; }
 
@@ -51,6 +56,43 @@ int main(int argc, char **argv) {
     uint32_t kept = n < max ? n : max;
     printf("%u %u %u\n", kept, t0 + (n - kept) * iv, t0 + (n - 1) * iv);
     fflush(stdout);
-    if (strcmp(argv[6], "close") == 0) tsdb_close_h(db);
-    return 0;   // crash: exit with the handle open
+    bool crash = strcmp(argv[6], "crash") == 0;
+    char ref[600], cmd[2048], out[600];
+    if (crash) {
+        // The bytes a power cut leaves (stdio buffers are what the files hold
+        // at exit), copied; this release opens the copy as its next boot would.
+        fflush(NULL);
+        snprintf(ref, sizeof(ref), "%s/ref", argv[1]);
+        snprintf(cmd, sizeof(cmd), "rm -rf '%s' && mkdir -p '%s' && cp -r '%s'/energy.tsdb* '%s'/", ref, ref, argv[1], ref);
+        if (system(cmd) != 0) { fprintf(stderr, "copy FAIL\n"); return 1; }
+        snprintf(path, sizeof(path), "%s/energy.tsdb", ref);
+    } else {
+        tsdb_close_h(db);
+    }
+    tsdb_t *rd = tsdb_open(&cfg);
+    if (rd == NULL) { fprintf(stderr, "reopen FAIL\n"); return 1; }
+    snprintf(out, sizeof(out), "%s/records.bin", argv[1]);
+    FILE *f = fopen(out, "wb");
+    uint32_t cnt = 0;
+    fwrite(&cnt, 4, 1, f);
+    tsdb_query_t q;
+    if (tsdb_query_init_h(rd, &q, 0, 0xFFFFFFFFu, NULL, NPARAM) == ESP_OK) {
+        uint32_t ts;
+        int16_t v[NPARAM];
+        while (tsdb_query_next(&q, &ts, v) == ESP_OK) {
+            fwrite(&ts, 4, 1, f);
+            fwrite(v, sizeof(v), 1, f);
+            cnt++;
+        }
+        tsdb_query_close(&q);
+    }
+    fseek(f, 0, SEEK_SET);
+    fwrite(&cnt, 4, 1, f);
+    fclose(f);
+    tsdb_close_h(rd);
+    if (crash) {
+        snprintf(cmd, sizeof(cmd), "rm -rf '%s'", ref);
+        if (system(cmd) != 0) return 1;
+    }
+    return 0;   // crash: exit with the first handle open
 }
