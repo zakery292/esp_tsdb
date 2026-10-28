@@ -66,6 +66,10 @@ esp_err_t tsdb_write_cache_flush(tsdb_t *db) {
  * @return false when nothing can be evicted (only the active segment left).
  */
 static bool make_room(tsdb_t *db, uint32_t room, const char *why) {
+    // A conversion round in progress holds up to a segment of space for
+    // copies the 2.x file still has: give that back first (it backs off),
+    // before anything is evicted.
+    if (tsdb_conv_yield_space(db)) return true;
     uint32_t before = db->total_physical;
     if (db->nsegs > 0 && db->segs[0].kind == TSDB_SEG_LEGACY) {
         ESP_LOGE(TAG, "%s: removing the adopted pre-3.0 database file to make room", why);
@@ -226,6 +230,7 @@ static esp_err_t tsdb_write_locked(tsdb_t *db, uint32_t timestamp, const int16_t
     if (a->records == 1) a->first_ts = timestamp;
     db->total_physical++;
     tsdb_apply_capacity(db);
+    tsdb_conv_space_event(db, false);
     return ESP_OK;
 }
 

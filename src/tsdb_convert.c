@@ -66,6 +66,13 @@ static const char *TAG = "TSDB_CONV";
 #ifndef TSDB_CONV_STEP_BLOCKS
 #define TSDB_CONV_STEP_BLOCKS 4
 #endif
+// Out of space copying even the smallest round: writes to wait before
+// trying again (unless a file is evicted first).
+#ifndef TSDB_CONV_BACKOFF_WRITES
+#define TSDB_CONV_BACKOFF_WRITES 16
+#endif
+// Smallest round, in 2.x blocks (with the header, one 4 KB flash block).
+#define TSDB_CONV_MIN_CHUNK 2
 // Blocks scanned per header-reconstruction step.
 #ifndef TSDB_CONV_SCAN_BLOCKS
 #define TSDB_CONV_SCAN_BLOCKS 96
@@ -74,6 +81,8 @@ static const char *TAG = "TSDB_CONV";
 // ---------------------------------------------------------------------------
 // Table helpers
 // ---------------------------------------------------------------------------
+
+static uint32_t chunk_blocks_of(const tsdb_t *db, const tsdb_legacy_t *l);
 
 static void remove_legacy_entries(tsdb_t *db) {
     uint16_t w = 0;
@@ -100,17 +109,24 @@ static esp_err_t table_reserve(tsdb_t *db, uint16_t extra) {
     return ESP_OK;
 }
 
-static void piece_fill(tsdb_t *db, tsdb_seg_t *e, uint32_t a, uint32_t b, void *buf) {
+// false if a time bound could not be read (the table seek needs real ones).
+static bool piece_fill(tsdb_t *db, tsdb_seg_t *e, uint32_t a, uint32_t b, void *buf) {
     tsdb_legacy_t *l = db->legacy;
     memset(e, 0, sizeof(*e));
     e->kind = TSDB_SEG_LEGACY;
     e->rank = a;
     e->records = b - a;
-    e->first_ts = tsdb_legacy_ts_at(l, a, buf);
-    e->last_ts = tsdb_legacy_ts_at(l, b - 1, buf);
+    uint32_t blk; uint16_t off;
+    tsdb_legacy_locate(l, a, &blk, &off);
+    if (tsdb_legacy_read_block(l, blk, buf) != ESP_OK) return false;
+    e->first_ts = TSDB_BLOCK_TS(buf, off);
+    tsdb_legacy_locate(l, b - 1, &blk, &off);
+    if (tsdb_legacy_read_block(l, blk, buf) != ESP_OK) return false;
+    e->last_ts = TSDB_BLOCK_TS(buf, off);
     e->rpb = l->header.records_per_block;
     e->np = tsdb_legacy_columns(l);
     e->lifetime_base = tsdb_legacy_lifetime_end(l) - l->available + a;
+    return true;
 }
 
 // [a, b) minus every CONV entry of the table -> out (appended, up to max).
@@ -141,12 +157,13 @@ esp_err_t tsdb_conv_adopt(tsdb_t *db) {
     void *heap;
     void *buf = tsdb_scratch_block(db, &heap);
     if (buf == NULL) return ESP_ERR_NO_MEM;
-    for (uint8_t i = 0; i < n; i++) {
-        tsdb_seg_t e;
-        piece_fill(db, &e, pieces[i][0], pieces[i][1], buf);
-        tsdb_seg_table_push(db, &e);            // reserved: cannot fail
-    }
+    tsdb_seg_t *ent = malloc((size_t) n * sizeof(tsdb_seg_t));
+    bool ok = ent != NULL;
+    for (uint8_t i = 0; ok && i < n; i++) ok = piece_fill(db, &ent[i], pieces[i][0], pieces[i][1], buf);
+    for (uint8_t i = 0; ok && i < n; i++) tsdb_seg_table_push(db, &ent[i]);   // reserved: cannot fail
+    free(ent);
     free(heap);
+    if (!ok) return ESP_FAIL;
     ESP_LOGI(TAG, "2.x file %s: %u live interval(s) still in it (%lu bytes)", l->path, n, (unsigned long) l->length);
     return ESP_OK;
 }
@@ -176,6 +193,25 @@ void tsdb_conv_abort_chunk(tsdb_t *db) {
     c->written = 0;
 }
 
+bool tsdb_conv_yield_space(tsdb_t *db) {
+    tsdb_legacy_t *l = db->legacy;
+    if (l == NULL || (l->conv.out == NULL && l->conv.cur == 0)) return false;
+    ESP_LOGW(TAG, "Filesystem full: discarding the conversion round in progress");
+    tsdb_conv_abort_chunk(db);
+    l->conv.phase = TSDB_CONV_PLAN;
+    uint32_t cur = chunk_blocks_of(db, l);
+    if (cur > TSDB_CONV_MIN_CHUNK) l->conv.chunk_cap = cur / 2 > TSDB_CONV_MIN_CHUNK ? cur / 2 : TSDB_CONV_MIN_CHUNK;
+    l->conv.backoff = TSDB_CONV_BACKOFF_WRITES;
+    return true;
+}
+
+void tsdb_conv_space_event(tsdb_t *db, bool freed) {
+    tsdb_legacy_t *l = db->legacy;
+    if (l == NULL || l->conv.backoff == 0) return;
+    if (freed) l->conv.backoff = 0;
+    else l->conv.backoff--;
+}
+
 void tsdb_conv_drop_legacy(tsdb_t *db) {
     tsdb_legacy_t *l = db->legacy;
     if (l == NULL) return;
@@ -196,10 +232,18 @@ static uint32_t out_rpb(const tsdb_legacy_t *l) {
     return (TSDB_BLOCK_SIZE - 8) / (4 + 2u * tsdb_legacy_columns(l));
 }
 
+// 2.x blocks per round: a segment's worth, or less after running out of space.
+static uint32_t chunk_blocks_of(const tsdb_t *db, const tsdb_legacy_t *l) {
+    uint32_t b = db->seg_blocks * out_rpb(l) / l->header.records_per_block;
+    if (b == 0) b = 1;
+    if (l->conv.chunk_cap && l->conv.chunk_cap < b) b = l->conv.chunk_cap;
+    return b;
+}
+
 // The length the file is cut to next.
 static uint32_t plan_target(const tsdb_t *db, const tsdb_legacy_t *l) {
     uint32_t L = l->length;
-    uint32_t chunk_records = db->seg_blocks * out_rpb(l);
+    uint32_t chunk_records = chunk_blocks_of(db, l) * l->header.records_per_block;
     if (l->extra_count > 0 && L > l->overflow_data_offset) {
         // Overflow region (extras of the newest records, in record order).
         uint32_t rs = l->overflow_record_size;
@@ -218,8 +262,7 @@ static uint32_t plan_target(const tsdb_t *db, const tsdb_legacy_t *l) {
     uint32_t ring_end = l->data_offset + ((slots + rpb - 1) / rpb) * TSDB_BLOCK_SIZE;
     if (L > ring_end) return ring_end;                     // nothing but slack past the ring
     uint32_t nb = (L - l->data_offset + TSDB_BLOCK_SIZE - 1) / TSDB_BLOCK_SIZE;
-    uint32_t chunk_blocks = chunk_records / rpb;
-    if (chunk_blocks == 0) chunk_blocks = 1;
+    uint32_t chunk_blocks = chunk_blocks_of(db, l);
     uint32_t keep = nb > chunk_blocks ? nb - chunk_blocks : 0;
     return l->data_offset + keep * TSDB_BLOCK_SIZE;
 }
@@ -415,10 +458,25 @@ out:
     free(ext);
     if (ret != ESP_OK) {
         if (ret == ESP_FAIL && err == ENOSPC) ret = ESP_ERR_NO_MEM;
-        ESP_LOGE(TAG, "Converting ranks %lu..: write failed (%d, errno %d) — retried later",
-                 (unsigned long) a, ret, err);
         tsdb_conv_abort_chunk(db);
         c->phase = TSDB_CONV_PLAN;
+        if (ret == ESP_ERR_NO_MEM) {
+            // Out of space: never the same attempt in a loop. Halve the
+            // round (a smaller one needs less room) down to one flash block,
+            // then wait until space has plausibly changed.
+            uint32_t cur = chunk_blocks_of(db, l);
+            if (cur > TSDB_CONV_MIN_CHUNK) {
+                c->chunk_cap = cur / 2 > TSDB_CONV_MIN_CHUNK ? cur / 2 : TSDB_CONV_MIN_CHUNK;
+                ESP_LOGW(TAG, "Converting: filesystem full — rounds of %lu blocks now", (unsigned long) c->chunk_cap);
+            } else {
+                c->backoff = TSDB_CONV_BACKOFF_WRITES;
+                ESP_LOGW(TAG, "Converting: filesystem full — paused for %d writes or until a file is evicted",
+                         TSDB_CONV_BACKOFF_WRITES);
+            }
+        } else {
+            ESP_LOGE(TAG, "Converting ranks %lu..: write failed (%d, errno %d) — retried later",
+                     (unsigned long) a, ret, err);
+        }
     }
     return ret;
 }
@@ -429,6 +487,7 @@ out:
 
 static int cut_file(const char *path, uint32_t len) {
     if (truncate(path, (off_t) len) == 0) return 0;
+    if (errno == ENOMEM || errno == ENOSPC) return -1;   // transient: the caller retries
     // Filesystems whose VFS has no path truncate: through a handle.
     FILE *w = fopen(path, "r+b");
     if (w == NULL) return -1;
@@ -440,19 +499,59 @@ static int cut_file(const char *path, uint32_t len) {
 static esp_err_t trunc_step(tsdb_t *db, uint8_t *buf) {
     tsdb_legacy_t *l = db->legacy;
     tsdb_conv_t *c = &l->conv;
-    // Room for the converted entries and the clipped pieces, before the cut.
-    if (table_reserve(db, (uint16_t) (c->niv + 4)) != ESP_OK) return ESP_ERR_NO_MEM;
-    tsdb_seg_t *old = malloc((size_t) db->nsegs * sizeof(tsdb_seg_t) + 1);
-    if (old == NULL) return ESP_ERR_NO_MEM;
+
+    // The table after the cut, built completely BEFORE it: LEGACY entries
+    // clipped to what the cut file keeps (their time bounds read now, from
+    // ranks that stay, while the file is whole and open), the converted
+    // segments added, everything in rank order. Sized exactly: each LEGACY
+    // entry yields at most one piece per kept interval. Any failure here
+    // leaves the file and the table as they were; the step is retried.
+    uint32_t keep[2][2];
+    uint8_t nk = c->final_cut ? 0 : tsdb_legacy_present(l, c->target, keep);
+    uint32_t cap = c->niv;
+    for (uint16_t i = 0; i < db->nsegs; i++) cap += db->segs[i].kind == TSDB_SEG_LEGACY ? nk : 1;
+    if (cap == 0) cap = 1;
+    tsdb_seg_t *nt = malloc((size_t) cap * sizeof(tsdb_seg_t));
+    if (nt == NULL) return ESP_ERR_NO_MEM;
+    uint32_t n = 0, total = 0;
+    #define NT_PUSH(e) do { uint32_t j_ = n; uint64_t k_ = tsdb_seg_order(&(e)); \
+        while (j_ > 0 && tsdb_seg_order(&nt[j_ - 1]) > k_) { nt[j_] = nt[j_ - 1]; j_--; } \
+        nt[j_] = (e); n++; total += (e).records; } while (0)
+    for (uint16_t i = 0; i < db->nsegs; i++) {
+        const tsdb_seg_t *e = &db->segs[i];
+        if (e->kind != TSDB_SEG_LEGACY) { NT_PUSH(*e); continue; }
+        for (uint8_t k = 0; k < nk; k++) {
+            uint32_t lo = e->rank > keep[k][0] ? e->rank : keep[k][0];
+            uint32_t hi = e->rank + e->records < keep[k][1] ? e->rank + e->records : keep[k][1];
+            if (lo >= hi) continue;
+            tsdb_seg_t p = *e;
+            if ((lo != e->rank || hi != e->rank + e->records) && !piece_fill(db, &p, lo, hi, buf)) {
+                free(nt);
+                return ESP_FAIL;
+            }
+            NT_PUSH(p);
+        }
+    }
+    for (uint8_t i = 0; i < c->niv; i++) NT_PUSH(c->done[i]);
+    #undef NT_PUSH
 
     if (!c->final_cut) {
         if (l->file) { fclose(l->file); l->file = NULL; }
+        errno = 0;
         int r = cut_file(l->path, c->target);
+        int cut_errno = errno;
+        // Not reopenable now (out of memory): the next step (or a query)
+        // retries; the table stays exact either way.
         l->file = fopen(l->path, "rb");
+        if (r != 0 && (cut_errno == ENOMEM || cut_errno == ENOSPC)) {
+            // Transient: nothing changed on disk; the same cut is retried.
+            free(nt);
+            return ESP_ERR_NO_MEM;
+        }
         if (r != 0) {
             ESP_LOGE(TAG, "Cannot truncate %s (errno %d) — conversion stopped; the file stays readable",
                      l->path, errno);
-            free(old);
+            free(nt);
             tsdb_conv_abort_chunk(db);
             c->stalled = true;
             return ESP_FAIL;
@@ -460,31 +559,17 @@ static esp_err_t trunc_step(tsdb_t *db, uint8_t *buf) {
         l->length = c->target;
     }
 
-    // The table: LEGACY entries clipped to what the file still holds, the
-    // converted segments added. Everything stays in rank order.
-    uint32_t keep[2][2];
-    uint8_t nk = c->final_cut ? 0 : tsdb_legacy_present(l, l->length, keep);
-    uint16_t n_old = db->nsegs;
-    memcpy(old, db->segs, (size_t) n_old * sizeof(tsdb_seg_t));
-    db->nsegs = 0;
-    db->total_physical = 0;
-    for (uint16_t i = 0; i < n_old; i++) {
-        tsdb_seg_t *e = &old[i];
-        if (e->kind != TSDB_SEG_LEGACY) { tsdb_seg_table_push(db, e); continue; }
-        for (uint8_t k = 0; k < nk; k++) {
-            uint32_t lo = e->rank > keep[k][0] ? e->rank : keep[k][0];
-            uint32_t hi = e->rank + e->records < keep[k][1] ? e->rank + e->records : keep[k][1];
-            if (lo >= hi) continue;
-            tsdb_seg_t p = *e;
-            if (lo != e->rank || hi != e->rank + e->records) piece_fill(db, &p, lo, hi, buf);
-            tsdb_seg_table_push(db, &p);
-        }
-    }
-    for (uint8_t i = 0; i < c->niv; i++) tsdb_seg_table_push(db, &c->done[i]);
-    free(old);
+    free(db->segs);
+    db->segs = nt;
+    db->segs_cap = (uint16_t) cap;
+    db->nsegs = (uint16_t) n;
+    db->total_physical = total;
     ESP_LOGI(TAG, "2.x file cut to %lu bytes: %u converted segment(s) added", (unsigned long) l->length, c->niv);
     c->niv = c->cur = 0;
     c->phase = c->final_cut ? TSDB_CONV_FINAL : TSDB_CONV_PLAN;
+    // A cut frees space: grow the rounds back towards a segment's worth.
+    if (c->chunk_cap) c->chunk_cap *= 2;
+    if (c->chunk_cap && c->chunk_cap >= db->seg_blocks * out_rpb(l) / l->header.records_per_block) c->chunk_cap = 0;
     tsdb_apply_capacity(db);
     return ESP_OK;
 }
@@ -549,7 +634,7 @@ esp_err_t tsdb_conv_step(tsdb_t *db) {
     if (db->legacy == NULL) return db->legacy_retry ? retry_adopt(db) : ESP_OK;
     tsdb_legacy_t *l = db->legacy;
     tsdb_conv_t *c = &l->conv;
-    if (c->stalled) return ESP_OK;
+    if (c->stalled || c->backoff) return ESP_OK;
     if (l->file == NULL) {
         l->file = fopen(l->path, "rb");
         if (l->file == NULL) return ESP_FAIL;
@@ -621,7 +706,7 @@ esp_err_t tsdb_maintain_h(tsdb_t *db, bool *more) {
     esp_err_t ret = tsdb_conv_step(db);
     // A retry of a failed adoption is not reported as pending work: it is
     // attempted once per write, not in a loop.
-    if (more) *more = db->legacy != NULL && !db->legacy->conv.stalled;
+    if (more) *more = db->legacy != NULL && !db->legacy->conv.stalled && db->legacy->conv.backoff == 0;
     tsdb_unlock(db);
     return ret;
 }

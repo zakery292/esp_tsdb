@@ -209,6 +209,8 @@ typedef struct {
     uint32_t writes;
     double multiple;
     uint32_t step_writes, crash_stride;   // convert: a record every N steps; power-cut sweep stride (0 = off)
+    uint32_t low_free_kb;                 // convert: only the low-free-space case, with this much free
+    uint32_t low_free_keep;               // ... and require the history kept exactly
 } opts_t;
 
 static uint32_t fw_max_records(uint32_t fs_total) {
@@ -1484,6 +1486,189 @@ static void convert_close_midway(const char *dir, const opts_t *o, const tsdb_co
                     "after finishing (%u bad)", stride > 1 ? "every " : "each ", stride > 1 ? stride : runs, steps, bad);
 }
 
+// Review: a partition with little free space. Copying a chunk then meets
+// ENOSPC; that must not be retried in a loop (each attempt writes most of a
+// segment and unlinks it): the conversion backs off — tsdb_maintain reports
+// no more work — until space has plausibly changed, and loses nothing.
+static void fill_to_free(int64_t free_kb) {
+    bool was = hfs_counting;
+    hfs_counting = false;
+    FILE *f = fopen(HFS_MOUNT "/filler.bin", "wb");
+    static char buf[4096];
+    memset(buf, 'f', sizeof(buf));
+    while (f && hfs_free_bytes() > free_kb * 1024 + 4096 &&
+           fwrite(buf, sizeof(buf), 1, f) == 1 && fflush(f) == 0 && fsync(fileno(f)) == 0) {}
+    if (f) fclose(f);
+    hfs_counting = was;
+}
+
+static void convert_low_space(const char *dir, const opts_t *o, const tsdb_config_t *cfg, int64_t free_kb,
+                              bool must_keep) {
+    setup_legacy(dir, o);
+    fill_to_free(free_kb);
+    int64_t start_free = hfs_free_bytes();
+    tsdb_t *db = tsdb_open(cfg);
+    // A caller that loops on tsdb_maintain ignoring `more`, no writes (the
+    // review's repro: ENOSPC cycles of a segment written and unlinked, with
+    // no progress in between). Out of space may recur between cuts — the
+    // rounds grow back after each — but never more than the halvings down to
+    // the smallest round without a cut, and once backed off nothing is written.
+    uint32_t n0 = 0, e_after = 0, backoff_at = 0, run = 0, max_run = 0, cuts = 0, c0;
+    uint64_t e0 = 0;
+    int64_t len = legacy_len();
+    for (c0 = 0; c0 < 3000 && legacy_len() >= 0; c0++) {
+        bool m;
+        hfs_counters_t b = hfs_ctr;
+        esp_err_t e = tsdb_maintain_h(db, &m);
+        uint64_t de = delta(&b, &hfs_ctr).erases;
+        e0 += de;
+        if (backoff_at) e_after += (uint32_t) de;
+        if (e == ESP_ERR_NO_MEM) { n0++; if (++run > max_run) max_run = run; }
+        int64_t now = legacy_len();
+        if (now != len) { cuts++; run = 0; len = now; }
+        if (!m && !backoff_at && now >= 0) backoff_at = c0 + 1;
+        if (backoff_at && c0 > backoff_at + 200) break;
+    }
+    win_t w0 = check_window(db, 0, 0, cfg->max_records, o->interval);
+    printf("  low space, tsdb_maintain in a loop, no writes: %s after %u calls, %u cuts; %u ENOSPC (at most %u "
+           "without a cut in between); %.2f erases per call; backed off at call %u, %u erases after; history %s\n",
+           legacy_len() < 0 ? "converted" : "not converted", c0, cuts, n0, max_run, c0 ? (double) e0 / c0 : 0.0,
+           backoff_at, e_after, w0.ok ? "exact" : "NOT exact");
+    CHECK(max_run <= 6 && e_after == 0 && w0.ok,
+          "low space, a caller looping on tsdb_maintain: at most 6 ENOSPC attempts without progress (%u), nothing "
+          "written once backed off (%u erases), the history intact", max_run, e_after);
+    // The firmware's writer: a maintenance call every tick while it reports
+    // more work, a record every 10 ticks either way.
+    uint32_t w = 0, calls = 0, nospc = 0, write_fail = 0, idle_calls = 0, idle_erases = 0;
+    uint64_t erases = 0;
+    bool more = true, done = false;
+    for (uint32_t tick = 0; tick < 20000 && !done; tick++) {
+        if (more) {
+            hfs_counters_t b = hfs_ctr;
+            esp_err_t e = tsdb_maintain_h(db, &more);
+            erases += delta(&b, &hfs_ctr).erases;
+            calls++;
+            if (e == ESP_ERR_NO_MEM) nospc++;
+        } else {
+            // Backed off: a caller that keeps calling anyway costs nothing.
+            hfs_counters_t b = hfs_ctr;
+            bool m2;
+            tsdb_maintain_h(db, &m2);
+            idle_erases += (uint32_t) delta(&b, &hfs_ctr).erases;
+            idle_calls++;
+        }
+        if (tick % 10 == 9) {
+            rec_t nr;
+            expected_rec(g_ref_n + w, o->interval, &nr);
+            int16_t nv[NPARAM];
+            memcpy(nv, nr.v, sizeof(nv));
+            if (tsdb_write_h(db, nr.ts, nv) == ESP_OK) w++; else write_fail++;
+            more = true;          // the caller asks again after each record
+        }
+        done = legacy_len() < 0;
+    }
+    win_t win = check_window(db, w, w, cfg->max_records, o->interval);
+    if (done && !win.ok && win.n < g_ref_n / 2) done = false;   // dropped (out-of-space last resort), not converted
+    printf("  low space (%lld KB free at start): %s after %u maintain calls and %u writes; %u ENOSPC; %.2f erases "
+           "per maintain call; %u calls while backed off cost %u erases; history %s (%u records, want %u)\n",
+           (long long) start_free / 1024, done ? "converted" : "NOT converted", calls, w, nospc,
+           calls ? (double) erases / calls : 0.0, idle_calls, idle_erases, win.ok ? "exact" : "NOT exact", win.n,
+           win.want);
+    // A retry needs 16 writes or a file evicted (which takes writes) in
+    // between: without writes, a polling caller costs nothing.
+    CHECK(nospc <= 4 + w && idle_erases == 0,
+          "low space: out of space never retried in a loop: %u ENOSPC attempts over %u writes (<= 4 + writes), "
+          "%u calls while backed off wrote nothing (%u erases)", nospc, w, idle_calls, idle_erases);
+    if (must_keep) {
+        CHECK(done && win.ok && write_fail == 0,
+              "low space: converted, every write succeeds, the history is exact (%u records)", win.n);
+    }
+    tsdb_close_h(db);
+}
+
+// Review: the 2.x file cannot be reopened right after a cut (out of memory),
+// or an allocation of the cut step fails. The table must never get entries
+// with made-up (zero) time bounds — the window seek binary-searches them —
+// and nothing may be lost; the next steps reopen and go on.
+static bool table_sane(tsdb_t *db, uint32_t *bad_i) {
+    for (uint16_t i = 0; i < db->nsegs; i++) {
+        const tsdb_seg_t *e = &db->segs[i];
+        if (e->records && (e->first_ts == 0 || e->last_ts < e->first_ts ||
+                           (i > 0 && db->segs[i - 1].records && e->first_ts < db->segs[i - 1].last_ts))) {
+            *bad_i = i;
+            return false;
+        }
+    }
+    return true;
+}
+
+// Windowed counts against the reference (exercises the segment seek).
+static bool windows_ok(tsdb_t *db, uint32_t cap, uint32_t iv) {
+    uint32_t want_n = g_ref_n < cap ? g_ref_n : cap;
+    uint32_t first = g_ref_n - want_n;
+    for (int k = 1; k < 16; k++) {
+        uint32_t a = first + (uint32_t) ((uint64_t) want_n * k / 17), b = first + (uint32_t) ((uint64_t) want_n * (k + 1) / 17);
+        uint32_t cnt = 0;
+        if (tsdb_query_count_h(db, g_ref[a].ts, g_ref[b].ts, &cnt) != ESP_OK || cnt != b - a + 1) return false;
+    }
+    (void) iv;
+    return true;
+}
+
+static void convert_cut_faults(const char *dir, const opts_t *o, const tsdb_config_t *cfg) {
+    uint32_t cuts = 0, bad_table = 0, bad_window = 0, bad_final = 0;
+    // (a) reopen after every cut fails once
+    setup_legacy(dir, o);
+    tsdb_t *db = tsdb_open(cfg);
+    bool more = true;
+    hfs_fail_open_path = DB_PATH;
+    for (int i = 0; i < 5000 && more; i++) {
+        bool cut_next = db->legacy && db->legacy->conv.phase == TSDB_CONV_TRUNC;
+        if (cut_next) hfs_fail_opens = 1;
+        tsdb_maintain_h(db, &more);
+        hfs_fail_opens = 0;
+        if (!cut_next) continue;
+        cuts++;
+        uint32_t bi;
+        if (!table_sane(db, &bi)) {
+            if (!bad_table) printf("    after cut %u: entry %u has time bounds %u..%u\n", cuts, bi,
+                                   db->segs[bi].first_ts, db->segs[bi].last_ts);
+            bad_table++;
+        }
+        tsdb_maintain_h(db, &more);           // reopens
+        if (!windows_ok(db, cfg->max_records, o->interval)) bad_window++;
+    }
+    win_t w = check_window(db, 0, 0, cfg->max_records, o->interval);
+    if (!w.ok || legacy_len() >= 0) bad_final++;
+    tsdb_close_h(db);
+    CHECK(bad_table == 0 && bad_window == 0 && bad_final == 0,
+          "2.x file not reopenable after each of %u cuts: table time bounds never zero (%u bad), windowed counts "
+          "exact (%u bad), conversion completes exactly (%d)", cuts, bad_table, bad_window, bad_final == 0);
+    // (b) each of the first allocations of each cut step fails in turn
+    uint32_t runs = 0, bad = 0;
+    for (uint32_t k = 1; k <= 3; k++) {
+        setup_legacy(dir, o);
+        db = tsdb_open(cfg);
+        more = true;
+        int64_t injected_at = -1;
+        for (int i = 0; i < 5000 && more; i++) {
+            // Once per cut: the retry of that step then runs unhindered.
+            bool cut_next = db->legacy && db->legacy->conv.phase == TSDB_CONV_TRUNC && legacy_len() != injected_at;
+            if (cut_next) { injected_at = legacy_len(); g_alloc_count = 0; g_alloc_fail_at = k; g_alloc_arm = true; runs++; }
+            tsdb_maintain_h(db, &more);
+            g_alloc_arm = false; g_alloc_fail_at = 0;
+            uint32_t bi;
+            if (cut_next && (!table_sane(db, &bi) || !windows_ok(db, cfg->max_records, o->interval))) bad++;
+            if (!more && db->legacy) more = true;   // an error step: go on
+        }
+        win_t w2 = check_window(db, 0, 0, cfg->max_records, o->interval);
+        if (!w2.ok || legacy_len() >= 0) bad++;
+        tsdb_close_h(db);
+    }
+    CHECK(bad == 0, "allocation k = 1..3 of every cut step failed (%u steps): the table stays consistent and the "
+                    "conversion completes exactly (%u bad)", runs, bad);
+}
+
 static int run_convert(const char *dir, const opts_t *o) {
     expect_t e;
     if (!read_expected(dir, &e) || !load_reference(dir)) { printf("cannot read %s/expected, records.bin\n", dir); return 1; }
@@ -1492,8 +1677,13 @@ static int run_convert(const char *dir, const opts_t *o) {
            g_ref_n ? g_ref[0].ts : 0, g_ref_n ? g_ref[g_ref_n - 1].ts : 0, cfg.max_records);
     CHECK(g_ref_n == e.n && g_ref[0].ts == e.first && g_ref[g_ref_n - 1].ts == e.last,
           "reference list matches the generator (%u %u..%u)", e.n, e.first, e.last);
+    if (o->low_free_kb) {
+        convert_low_space(dir, o, &cfg, o->low_free_kb, o->low_free_keep);
+        return 0;
+    }
     convert_full(dir, o, &e, &cfg, 0);
     convert_full(dir, o, &e, &cfg, o->step_writes);
+    convert_cut_faults(dir, o, &cfg);
     if (o->crash_stride) {
         convert_crash_sweep(dir, o, &cfg, o->step_writes, o->crash_stride);
         convert_close_midway(dir, o, &cfg, o->crash_stride);
@@ -1541,6 +1731,8 @@ int main(int argc, char **argv) {
         OPT("--guard-kb", o.guard_kb, (void) 0);
         OPT("--step-writes", o.step_writes, (void) 0);
         OPT("--crash-stride", o.crash_stride, (void) 0);
+        OPT("--low-free-kb", o.low_free_kb, (void) 0);
+        OPT("--low-free-keep", o.low_free_keep, (void) 0);
 #undef OPT
         if (strcmp(a, "--multiple") == 0) { o.multiple = atof(v); i++; continue; }
         fprintf(stderr, "unknown option %s\n", a);

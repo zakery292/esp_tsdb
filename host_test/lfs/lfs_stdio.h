@@ -101,3 +101,6 @@ extern uint64_t hfs_mut_ops;
 // hfs_fail_create_match fail with EIO (nothing created).
 extern int hfs_fail_creates;
 extern const char *hfs_fail_create_match;
+// The next N fopen() calls (any mode) of exactly this path fail with ENOMEM.
+extern int hfs_fail_opens;
+extern const char *hfs_fail_open_path;

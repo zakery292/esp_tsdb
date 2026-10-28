@@ -71,6 +71,8 @@ static esp_err_t q_enter(tsdb_query_t *q, int i) {
     // it holds the lock, and its own task's writes and maintenance steps are
     // refused until it closes.
     if (q->seg_legacy) {
+        // Closed only if the reopen after a cut failed: try again here.
+        if (db->legacy && db->legacy->file == NULL) db->legacy->file = fopen(db->legacy->path, "rb");
         q->seg_file = db->legacy ? db->legacy->file : NULL;
     } else if (i == db->nsegs - 1 && seg->kind == TSDB_SEG_NORMAL && db->active != NULL) {
         q->seg_file = db->active;

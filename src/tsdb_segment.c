@@ -528,6 +528,7 @@ bool tsdb_evict_oldest(tsdb_t *db, bool whole_legacy) {
         char path[160];
         tsdb_entry_path(db, o, path, sizeof(path));
         unlink(path);
+        tsdb_conv_space_event(db, true);
         ESP_LOGI(TAG, "Evicted %s %lu (%lu records)", o->kind == TSDB_SEG_CONV ? "converted segment" : "segment",
                  (unsigned long) o->seq, (unsigned long) o->records);
     }

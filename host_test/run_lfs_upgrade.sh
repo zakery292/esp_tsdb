@@ -75,6 +75,8 @@ else
   run upgrade "$(gen v2.4.4 $BIG $((2 * BIG)) close)"               # wrapped exactly at slot 0
   run convert "$(gen v2.4.4 $BIG $((2 * BIG)) close)" --crash-stride $STRIDE
   run legacy "$(gen v2.4.4 $BIG $((BIG + 60000)) crash)"
+  run convert "$(gen v2.4.4 $BIG $((BIG + 60000)) crash)" --low-free-kb 60                    # no ENOSPC loop
+  run convert "$(gen v2.4.4 $BIG $((BIG + 60000)) crash)" --low-free-kb 150 --low-free-keep 1 # completes, exact
   run fresh
   for ref in v2.4.3 v2.4.4; do
     for how in close crash; do
@@ -85,6 +87,7 @@ else
   done
   run convert "$(gen v2.4.4 $SMALL 900 crash)" --fs-blocks 32 --crash-stride 1          # partly full
   run convert "$(gen v2.4.4 $SMALL $((2 * SMALL)) close)" --fs-blocks 32 --crash-stride 1 # slot 0
+  run convert "$(gen v2.4.4 $SMALL $((SMALL + 700)) crash)" --fs-blocks 32 --low-free-kb 4 --low-free-keep 1
   run fresh --fs-blocks 32
   run faults
 fi

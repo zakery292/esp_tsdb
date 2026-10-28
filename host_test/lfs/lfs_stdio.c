@@ -21,6 +21,8 @@ jmp_buf *hfs_crash_jmp;
 uint64_t hfs_mut_ops;
 int hfs_fail_creates;
 const char *hfs_fail_create_match = "";
+int hfs_fail_opens;
+const char *hfs_fail_open_path = "";
 
 static void mut_point(void) {
     hfs_mut_ops++;
@@ -344,6 +346,11 @@ FILE *__wrap_fopen(const char *path, const char *mode) {
         default: errno = EINVAL; return NULL;
     }
 
+    if (hfs_fail_opens > 0 && strcmp(path, hfs_fail_open_path) == 0) {
+        hfs_fail_opens--;
+        errno = ENOMEM;
+        return NULL;
+    }
     int slot = -1;
     for (int i = 0; i < HFS_MAX_FILES; i++) if (g_files[i] == NULL) { slot = i; break; }
     if (slot < 0) { errno = EMFILE; return NULL; }

@@ -169,6 +169,8 @@ enum {
 typedef struct {
     uint8_t  phase;
     bool     stalled;                    // cannot proceed (no truncate support): the file stays as it is
+    uint32_t chunk_cap;                  // legacy blocks per round when space is short (0 = a segment's worth)
+    uint32_t backoff;                    // out of space: writes to wait before trying again (0 = go)
     uint32_t target;                     // length the file is cut to (PLAN..TRUNC)
     bool     final_cut;                  // target leaves no records: remove instead of truncating
     uint8_t  niv, cur;                   // rank intervals to copy, the one being written
@@ -424,6 +426,13 @@ static inline bool tsdb_conv_pending(const tsdb_t *db) {
 }
 // Stop a conversion and remove the whole 2.x file (clear, out of space).
 void tsdb_conv_drop_legacy(tsdb_t *db);
+// Out of space elsewhere: give back the space of a round in progress (its
+// copies are discarded; the 2.x file still holds them) and back off. true
+// if there was one.
+bool tsdb_conv_yield_space(tsdb_t *db);
+// Space has plausibly changed (a write, a file evicted): let a backed-off
+// conversion try again sooner.
+void tsdb_conv_space_event(tsdb_t *db, bool freed);
 // Close (and unlink) a converted segment being written.
 void tsdb_conv_abort_chunk(tsdb_t *db);
 // Scratch block for internal reads: the pool's read buffer when contiguous,
