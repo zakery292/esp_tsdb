@@ -140,42 +140,55 @@ set to NULL — positional mapping is then ambiguous. Keep names in the config.
 
 ## Upgrading From 1.x / 2.x
 
-Nothing to do. A single-file database at the configured path is adopted as the
-oldest segment without copying: all of 2.5's recovery logic (sidecar adoption —
-including 2.4.4's `<path>.d/` slots —, header reconstruction, V2→V3 block
-layout, orphaned `.mig`) runs on the first open, after which the file is
-read-only. New records go to segment files next to it. Legacy overflow extras
-are read from the old file's overflow region and carried into the schema as
-runtime extras.
+Nothing is required; one call is recommended. A single-file database at the
+configured path is adopted on the first open, cheaply: 2.5's recovery logic
+(sidecar adoption — including 2.4.4's `<path>.d/` slots —, orphaned `.mig`,
+the V2 block layout, which is now transcoded as it is read) runs, nothing is
+written, and every record is readable at once. New records go to segment
+files next to it.
 
-**When the old file goes.** Its records count toward `max_records` from the
-first open, and the database's on-disk total is held to `max_records` plus one
-segment. The old file is a single file that can only be deleted as a whole, so
-it is evicted — with its sidecars — as soon as keeping it would break that
-bound: once the records written since the upgrade exceed
-`max_records + one segment − (records in the old file)`, or earlier if the
-window has passed all of it. For a **full** 2.x database that is one segment
-after the upgrade: on the OpenEVSE energy logger (7 columns, 2.5 MB, 142,108
-records, 4,592-record segments) every pre-upgrade record is dropped after 4,593
-new ones — 3.2 days at one record a minute, 16 days at one per 5 minutes — and
-the history then rebuilds to full depth as before. A database holding N records
-lasts `142,108 + 4,592 − N` new records (N = 130,000: 16,701). Nothing here
-depends on free space; `host_test/run_lfs_upgrade.sh` checks it on littlefs
-with the firmware's partition. (Earlier betas kept the old file until the window
-had passed it, i.e. beside a full capacity of new segments — twice the budget —
-and on a full partition met ENOSPC first.)
+**Conversion.** The old file is then moved into the segment format, in place,
+without losing a record: each round copies the live records held in the
+file's last ~one segment of blocks into `<path>.cNNNNNNNNNN` segments, closes
+them, and truncates that tail away (littlefs shrinks a file from its end with
+one metadata commit). Extra space at any moment is about one segment. Queries
+see one history throughout, in time order, the not-yet-converted part read
+from the shrinking file. The adopted header is persisted in `<path>.cv` before
+the first cut; a power cut at any point loses nothing and duplicates nothing
+(the host harness cuts power before every mutating operation of the
+conversion). Converted records count toward `max_records` and are evicted
+segment by segment like any others. A header that has to be reconstructed is
+rebuilt by the same steps, once.
+
+The work runs in bounded steps, never in `tsdb_open`: every `tsdb_write()`
+does one after its own lock hold, and `tsdb_maintain()` does one on request.
+On the OpenEVSE energy logger's full 2.5 MB database (16 MB build) that is 689
+steps, ~51 s of flash time in all by the host cost model; a step is typically
+~74 ms (p95 134 ms) and at most ~620 ms (a littlefs compaction landing on its
+commit — plain writes hit the same, up to ~740 ms); free space stays above
+210 KB. With writes alone it completes after ~680 records; to finish in about a minute,
+call it from the writer task while it reports more work, with a short delay
+between calls so readers get the lock:
+
+```c
+bool more = true;
+while (more && tsdb_maintain(&more) == ESP_OK) vTaskDelay(pdMS_TO_TICKS(20));
+```
+
+A full 4 MB-build database (32 KB) converts in ~20 steps and leaves 16–20 KB
+of the 128 KB partition free.
 
 Firmware older than 3.0 does not know about segment files. A rollback after an
-upgrade sees (and keeps using) the original single file if it has not been
-evicted yet, but none of the records written since the upgrade.
+upgrade sees (and keeps using) what is left of the original single file — once
+conversion has started, a truncated, sidecar-less file whose header is stale —
+and none of the records written since the upgrade. Rollback is not supported.
 
 **One upgrade caveat — devices already short of space.** If the free-space
 guard (`free_space_cb` / `min_free_bytes`) is configured and the filesystem is
 *already* below the reserve when 3.0 first writes (typical for a device whose
 2.x ring had been capped by that guard), the first segment cannot be created
 without breaching the reserve, so the engine makes room the only way it can:
-it deletes the adopted 2.x file — the whole history — and logs an ERROR with
-the record count. The same happens on a hard ENOSPC. If that history matters,
+it deletes what is left of the adopted 2.x file and logs an ERROR. The same happens on a hard ENOSPC. If that history matters,
 free space (or raise the reserve only after the upgrade) before deploying 3.0.
 `host_test/test_legacy.c` pins this behaviour.
 
@@ -320,7 +333,10 @@ records plus one header per segment plus up to one partially filled block.
 ...
 <path>.s00000000NN         newest segment (held open for appends)
 <path>                     optional: an adopted 1.x/2.x single-file database
-                           (read-only, oldest of all; deleted once evicted)
+                           (read-only, shrinking from its end as it is converted)
+<path>.cNNNNNNNNNN         segments converted from it (N = record rank in it;
+                           they sort before every .s segment)
+<path>.cv                  conversion marker: the adopted 2.x header
 
 Segment file:
 ┌─────────────────────────────────────────────────┐
@@ -394,7 +410,7 @@ cd host_test
 for s in build.sh build_*.sh; do bash $s; done
 for t in test_wrap test_multi test_schema test_sidecar test_resize test_freecap test_v25 test_legacy test_segments; do ./$t | tail -1; done
 ./run_compat.sh      # databases written by v2.4.3 / v2.4.4 (clean and power cut) opened by this tree
-./run_lfs_upgrade.sh # on real littlefs: upgrades of full 2.x databases, a 2.2x-capacity run, failure reporting
+./run_lfs_upgrade.sh # on real littlefs: upgrades and conversion of 2.x databases (power cuts at every step), a 2.2x-capacity run, failure reporting
 ./test_lfs_cost      # per-write littlefs cost (reads, programs, erases, commits)
 ./make_fixtures.sh   # regenerate the 2.5.0 legacy fixtures (needs git history)
 ```

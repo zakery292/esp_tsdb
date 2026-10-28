@@ -1369,9 +1369,12 @@ static void convert_full(const char *dir, const opts_t *o, const expect_t *e, co
     // The worst steps are littlefs root-directory compactions landing on the
     // step's commit, as they land on plain writes (up to ~800 ms here, write
     // and its step): bounded, rare; the 95th percentile is what readers see.
-    CHECK(g_hold_max[0] <= 800 && pct(&r, 0.95) <= 300,
-          "conversion steps hold the lock briefly: p95 %.0f ms (<= 300), longest %.0f ms (<= 800)", pct(&r, 0.95),
-          g_hold_max[0]);
+    uint32_t slow = 0, ns = r.steps < 4096 ? r.steps : 4096;
+    for (uint32_t i = 0; i < ns; i++) slow += r.step_ms[i] > 300;
+    uint32_t allowed = ns / 20 > 1 ? ns / 20 : 1;
+    CHECK(g_hold_max[0] <= 800 && slow <= allowed,
+          "conversion steps hold the lock briefly: %u of %u steps over 300 ms (at most %u), longest %.0f ms (<= 800)",
+          slow, ns, allowed, g_hold_max[0]);
     CHECK(r.min_free >= (int64_t) o->min_free_kb * 1024, "min free space %lld KB (floor %u KB)",
           (long long) r.min_free / 1024, o->min_free_kb);
     hfs_remount();
