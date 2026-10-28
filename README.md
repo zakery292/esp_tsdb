@@ -168,20 +168,38 @@ steps, ~51 s of flash time in all by the host cost model; a step is typically
 commit — plain writes hit the same, up to ~740 ms); free space stays above
 210 KB. With writes alone it completes after ~680 records; to finish in about a minute,
 call it from the writer task while it reports more work, with a short delay
-between calls so readers get the lock:
+between calls so readers get the lock, and stop on any error (the next
+write's own step retries it):
 
 ```c
 bool more = true;
-while (more && tsdb_maintain(&more) == ESP_OK) vTaskDelay(pdMS_TO_TICKS(20));
+while (more) {
+    if (tsdb_maintain(&more) != ESP_OK) break;   // error: stop; writes retry
+    vTaskDelay(pdMS_TO_TICKS(20));
+}
 ```
+
+Short of space, a round that meets ENOSPC is discarded (the old file still has
+its records) and the next one is half the size, down to one 4 KB flash block;
+after that the conversion pauses — `more` reads false — for 16 writes or
+until a file is evicted, and a write that meets ENOSPC first takes back the
+space of a round in progress. Nothing is retried in a loop. On the 16 MB
+layout the conversion completes with the history intact from ~150 KB of free
+space (the firmware leaves ~360 KB); with less, records go by the existing
+out-of-space policy (oldest first; as a last resort the old file).
 
 A full 4 MB-build database (32 KB) converts in ~20 steps and leaves 16–20 KB
 of the 128 KB partition free.
 
-Firmware older than 3.0 does not know about segment files. A rollback after an
-upgrade sees (and keeps using) what is left of the original single file — once
-conversion has started, a truncated, sidecar-less file whose header is stale —
-and none of the records written since the upgrade. Rollback is not supported.
+**Do not roll back to 2.x once 3.0 has run.** 2.x does not know segment files,
+and once the conversion has started the old file is truncated and its sidecars
+are gone while its header still describes the whole ring. Measured with
+v2.4.4 on a partly converted file: after a clean close its first write
+zero-fills the file back out to its full size — on a full unit that fills the
+filesystem (0 KB free, and every other file's writes fail); after an unclean
+shutdown it restarts the ring at slot 0 and rewrites the rest of the file on
+every write. If you must roll back, delete `<path>*` (the file, its `.c*` /
+`.s*` segments and `.cv`) first, losing the history.
 
 **One upgrade caveat — devices already short of space.** If the free-space
 guard (`free_space_cb` / `min_free_bytes`) is configured and the filesystem is
