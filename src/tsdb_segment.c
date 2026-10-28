@@ -21,6 +21,15 @@ void tsdb_seg_path(const tsdb_t *db, uint32_t seq, char *out, size_t out_len) {
     snprintf(out, out_len, "%s.s%010lu", db->filepath, (unsigned long) seq);
 }
 
+void tsdb_conv_path(const tsdb_t *db, uint32_t rank, char *out, size_t out_len) {
+    snprintf(out, out_len, "%s.c%010lu", db->filepath, (unsigned long) rank);
+}
+
+void tsdb_entry_path(const tsdb_t *db, const tsdb_seg_t *seg, char *out, size_t out_len) {
+    if (seg->kind == TSDB_SEG_CONV) tsdb_conv_path(db, seg->rank, out, out_len);
+    else tsdb_seg_path(db, seg->seq, out, out_len);
+}
+
 // Split "/littlefs/solar.tsdb" into dir "/littlefs" and base "solar.tsdb".
 static void split_path(const char *path, char *dir, size_t dir_len,
                        char *base, size_t base_len) {
@@ -98,16 +107,17 @@ esp_err_t tsdb_seg_table_push(tsdb_t *db, const tsdb_seg_t *seg) {
         db->segs = n;
         db->segs_cap = ncap;
     }
-    // Keep ascending by seq (scan order is arbitrary; creation appends).
+    // Keep in time order (scan order is arbitrary; creation appends).
     uint16_t i = db->nsegs;
-    while (i > 0 && db->segs[i - 1].seq > seg->seq) {
+    uint64_t key = tsdb_seg_order(seg);
+    while (i > 0 && tsdb_seg_order(&db->segs[i - 1]) > key) {
         db->segs[i] = db->segs[i - 1];
         i--;
     }
     db->segs[i] = *seg;
     db->nsegs++;
     db->total_physical += seg->records;
-    if (seg->seq >= db->next_seq) db->next_seq = seg->seq + 1;
+    if (seg->kind == TSDB_SEG_NORMAL && seg->seq >= db->next_seq) db->next_seq = seg->seq + 1;
     return ESP_OK;
 }
 
@@ -143,28 +153,43 @@ static uint16_t valid_records_in_block(const uint8_t *blk, uint16_t rpb) {
 // Scan
 // ---------------------------------------------------------------------------
 
-static bool parse_seq(const char *name, const char *base, uint32_t *seq) {
+// "<base>.sNNNNNNNNNN" (a segment, N >= 1) or "<base>.cNNNNNNNNNN" (records
+// converted from the 2.x file, N = legacy rank, may be 0).
+static bool parse_name(const char *name, const char *base, uint8_t *kind, uint32_t *seq) {
     size_t bl = strlen(base);
     if (strncmp(name, base, bl) != 0) return false;
     const char *p = name + bl;
-    if (p[0] != '.' || p[1] != 's') return false;
+    if (p[0] != '.' || (p[1] != 's' && p[1] != 'c')) return false;
+    *kind = p[1] == 's' ? TSDB_SEG_NORMAL : TSDB_SEG_CONV;
     p += 2;
     if (*p == '\0') return false;
-    unsigned long v = 0;
+    unsigned long long v = 0;
     for (; *p; p++) {
         if (*p < '0' || *p > '9') return false;
         v = v * 10 + (unsigned)(*p - '0');
+        if (v > 0xFFFFFFFFull) return false;
     }
-    if (v == 0 || v > 0xFFFFFFFFul) return false;
+    if (v == 0 && *kind == TSDB_SEG_NORMAL) return false;
     *seq = (uint32_t) v;
     return true;
 }
 
+// Records in a converted segment's tail block: its count field. Converted
+// records are copied as they were, so their timestamps need not satisfy
+// valid_records_in_block (a 2.x clock step back, a zero timestamp); the file
+// is synced only at whole blocks, so the count is the block's own.
+static uint16_t conv_records_in_block(const uint8_t *blk, uint16_t rpb) {
+    if (TSDB_BLOCK_MAGIC(blk) != TSDB_BLOCK_MAGIC_VALUE) return 0;
+    uint16_t count = TSDB_BLOCK_COUNT(blk);
+    return count <= rpb ? count : 0;
+}
+
 // Open one segment file, validate, and fill *seg. Returns ESP_OK, or
 // ESP_ERR_INVALID_RESPONSE when the file should be removed (empty/corrupt).
-static esp_err_t inspect_segment(tsdb_t *db, uint32_t seq, tsdb_seg_t *seg, uint8_t *blk) {
+static esp_err_t inspect_segment(tsdb_t *db, uint8_t kind, uint32_t seq, tsdb_seg_t *seg, uint8_t *blk) {
     char path[160];
-    tsdb_seg_path(db, seq, path, sizeof(path));
+    if (kind == TSDB_SEG_CONV) tsdb_conv_path(db, seq, path, sizeof(path));
+    else tsdb_seg_path(db, seq, path, sizeof(path));
     FILE *f = fopen(path, "rb");
     if (f == NULL) return ESP_ERR_NOT_FOUND;
 
@@ -194,14 +219,15 @@ static esp_err_t inspect_segment(tsdb_t *db, uint32_t seq, tsdb_seg_t *seg, uint
     uint32_t records = 0, last_ts = 0, first_ts = 0;
     while (blocks > 0) {
         if (tsdb_seg_read_block(f, h.data_offset, blocks - 1, blk) != ESP_OK) { blocks--; continue; }
-        uint16_t n = valid_records_in_block(blk, h.records_per_block);
+        uint16_t n = kind == TSDB_SEG_CONV ? conv_records_in_block(blk, h.records_per_block)
+                                           : valid_records_in_block(blk, h.records_per_block);
         if (n == 0) { blocks--; continue; }
         records = (blocks - 1) * h.records_per_block + n;
         last_ts = TSDB_BLOCK_TS(blk, n - 1);
         break;
     }
     if (records == 0) {
-        if ((size - h.data_offset) / TSDB_BLOCK_SIZE > 0) {
+        if (kind == TSDB_SEG_CONV || (size - h.data_offset) / TSDB_BLOCK_SIZE > 0) {
             ESP_LOGW(TAG, "Segment %s: no valid records — removing", path);
             goto out;
         }
@@ -218,7 +244,9 @@ static esp_err_t inspect_segment(tsdb_t *db, uint32_t seq, tsdb_seg_t *seg, uint
     }
 
     memset(seg, 0, sizeof(*seg));
+    seg->kind = kind;
     seg->seq = seq;
+    seg->rank = kind == TSDB_SEG_CONV ? seq : 0;
     seg->records = records;
     seg->first_ts = first_ts;
     seg->last_ts = last_ts;
@@ -251,17 +279,19 @@ esp_err_t tsdb_seg_scan(tsdb_t *db) {
     struct dirent *e;
     while ((e = readdir(d)) != NULL) {
         uint32_t seq;
-        if (!parse_seq(e->d_name, base, &seq)) continue;
+        uint8_t kind;
+        if (!parse_name(e->d_name, base, &kind, &seq)) continue;
         tsdb_seg_t seg;
-        esp_err_t r = inspect_segment(db, seq, &seg, blk);
+        esp_err_t r = inspect_segment(db, kind, seq, &seg, blk);
         if (r == ESP_OK) {
             ret = tsdb_seg_table_push(db, &seg);
             if (ret != ESP_OK) break;
         } else if (r == ESP_ERR_INVALID_RESPONSE) {
             char path[160];
-            tsdb_seg_path(db, seq, path, sizeof(path));
+            if (kind == TSDB_SEG_CONV) tsdb_conv_path(db, seq, path, sizeof(path));
+            else tsdb_seg_path(db, seq, path, sizeof(path));
             unlink(path);
-            if (seq >= db->next_seq) db->next_seq = seq + 1;   // never reuse a seq
+            if (kind == TSDB_SEG_NORMAL && seq >= db->next_seq) db->next_seq = seq + 1;   // never reuse a seq
         }
     }
     closedir(d);
@@ -269,7 +299,7 @@ esp_err_t tsdb_seg_scan(tsdb_t *db) {
 
     // An empty segment is only meaningful as the newest one.
     for (uint16_t i = 0; ret == ESP_OK && db->nsegs > 0 && i + 1 < db->nsegs; ) {
-        if (db->segs[i].seq != 0 && db->segs[i].records == 0) {
+        if (db->segs[i].kind == TSDB_SEG_NORMAL && db->segs[i].records == 0) {
             char path[160];
             tsdb_seg_path(db, db->segs[i].seq, path, sizeof(path));
             unlink(path);
@@ -282,10 +312,10 @@ esp_err_t tsdb_seg_scan(tsdb_t *db) {
 
     // Exact first timestamp for the oldest segment (its created_ts may be a
     // predecessor's last_ts when it was created by a schema change).
-    if (ret == ESP_OK && db->nsegs > 0 && db->segs[0].seq != 0 && db->segs[0].records > 0) {
+    if (ret == ESP_OK && db->nsegs > 0 && db->segs[0].kind != TSDB_SEG_LEGACY && db->segs[0].records > 0) {
         tsdb_seg_t *o = &db->segs[0];
         char path[160];
-        tsdb_seg_path(db, o->seq, path, sizeof(path));
+        tsdb_entry_path(db, o, path, sizeof(path));
         FILE *f = fopen(path, "rb");
         uint8_t *b = malloc(TSDB_BLOCK_SIZE);
         if (f && b && tsdb_seg_read_block(f, o->data_offset, 0, b) == ESP_OK &&
@@ -308,7 +338,7 @@ esp_err_t tsdb_seg_read_schema(tsdb_t *db, const tsdb_seg_t *seg, FILE *f,
     bool own = false;
     if (f == NULL) {
         char path[160];
-        tsdb_seg_path(db, seg->seq, path, sizeof(path));
+        tsdb_entry_path(db, seg, path, sizeof(path));
         f = fopen(path, "rb");
         if (f == NULL) return ESP_FAIL;
         own = true;
@@ -444,6 +474,7 @@ esp_err_t tsdb_seg_create(tsdb_t *db, uint32_t first_ts) {
 
     tsdb_seg_t seg;
     memset(&seg, 0, sizeof(seg));
+    seg.kind = TSDB_SEG_NORMAL;
     seg.seq = h.seq;
     seg.records = 0;
     seg.first_ts = first_ts;
@@ -473,26 +504,31 @@ esp_err_t tsdb_seg_create(tsdb_t *db, uint32_t first_ts) {
 // Eviction
 // ---------------------------------------------------------------------------
 
-bool tsdb_evict_oldest(tsdb_t *db) {
+bool tsdb_evict_oldest(tsdb_t *db, bool whole_legacy) {
     if (db->nsegs == 0) return false;
     tsdb_seg_t *o = &db->segs[0];
-    if (o->seq != 0 && db->nsegs == 1) {
+    if (o->kind == TSDB_SEG_NORMAL && db->nsegs == 1) {
         return false;                       // the newest data segment is never unlinked
     }
-    if (o->seq == 0) {
-        if (db->legacy) {
-            char path[128];
-            strncpy(path, db->legacy->path, sizeof(path));
-            tsdb_legacy_close(db->legacy);
-            db->legacy = NULL;
-            tsdb_legacy_remove(path);
-            ESP_LOGI(TAG, "Evicted legacy database file (%lu records)", (unsigned long) o->records);
+    if (o->kind == TSDB_SEG_LEGACY) {
+        if (whole_legacy) {
+            // Out of space: the 2.x file is the one big thing that can go.
+            uint32_t n = 0;
+            for (uint16_t i = 0; i < db->nsegs; i++) if (db->segs[i].kind == TSDB_SEG_LEGACY) n += db->segs[i].records;
+            ESP_LOGW(TAG, "Removing the adopted pre-3.0 file to make room (%lu records)", (unsigned long) n);
+            tsdb_conv_drop_legacy(db);
+            if (db->head_skip > db->total_physical) db->head_skip = db->total_physical;
+            return true;
         }
+        // A piece of it: no file of its own. The conversion skips these ranks
+        // and removes the file once no live piece is left.
+        ESP_LOGI(TAG, "Window passed legacy records %lu..%lu", (unsigned long) o->rank,
+                 (unsigned long) (o->rank + o->records - 1));
     } else {
         char path[160];
-        tsdb_seg_path(db, o->seq, path, sizeof(path));
+        tsdb_entry_path(db, o, path, sizeof(path));
         unlink(path);
-        ESP_LOGI(TAG, "Evicted segment %lu (%lu records)",
+        ESP_LOGI(TAG, "Evicted %s %lu (%lu records)", o->kind == TSDB_SEG_CONV ? "converted segment" : "segment",
                  (unsigned long) o->seq, (unsigned long) o->records);
     }
     tsdb_seg_table_pop_front(db);
@@ -515,25 +551,12 @@ void tsdb_apply_capacity(tsdb_t *db) {
         db->head_skip = (db->total_physical > db->max_records) ?
                         (db->total_physical - db->max_records) : 0;
         if (db->nsegs == 0) break;
-        // The oldest unit goes once the window has passed all of it — and an
-        // adopted pre-3.0 file also once what is on disk exceeds the window
-        // by more than one segment. A segment can never break that bound
-        // (it is at most one segment), but the legacy file holds up to a
-        // whole former capacity in one file that can only be unlinked as a
-        // unit: kept until the window passes it, it would sit beside a full
-        // capacity's worth of new segments — twice the budget the caller
-        // sized max_records for, which is how an upgraded unit filled its
-        // filesystem. Its records count toward the capacity throughout.
-        bool passed = db->head_skip >= db->segs[0].records;
-        bool legacy_over = db->segs[0].seq == 0 && db->head_skip > seg_room(db);
-        if (!passed && !legacy_over) break;
-        if (legacy_over && !passed) {
-            ESP_LOGW(TAG, "Capacity: on-disk total exceeds max_records by more than one segment — "
-                          "evicting the adopted pre-3.0 file (%lu of its %lu records still in the window)",
-                     (unsigned long) (db->segs[0].records - db->head_skip),
-                     (unsigned long) db->segs[0].records);
-        }
-        if (!tsdb_evict_oldest(db)) {
+        // The oldest unit goes once the window has passed all of it. Records
+        // converted from a 2.x file are ordinary segments, evicted one by one
+        // like any other; the part still in that file is dropped piece by
+        // piece (tsdb_evict_oldest).
+        if (db->head_skip < db->segs[0].records) break;
+        if (!tsdb_evict_oldest(db, false)) {
             // Only the active segment left and it exceeds the capacity
             // (capacity shrunk below one segment): keep skipping logically.
             break;
@@ -544,14 +567,12 @@ void tsdb_apply_capacity(tsdb_t *db) {
 void tsdb_remove_all_files(tsdb_t *db) {
     if (db->active) { fclose(db->active); db->active = NULL; }
     tsdb_write_cache_invalidate(db);
+    if (db->legacy) tsdb_conv_drop_legacy(db);
     while (db->nsegs > 0) {
         tsdb_seg_t *o = &db->segs[0];
-        if (o->seq == 0) {
-            if (db->legacy) { tsdb_legacy_close(db->legacy); db->legacy = NULL; }
-            tsdb_legacy_remove(db->filepath);
-        } else {
+        if (o->kind != TSDB_SEG_LEGACY) {
             char path[160];
-            tsdb_seg_path(db, o->seq, path, sizeof(path));
+            tsdb_entry_path(db, o, path, sizeof(path));
             unlink(path);
         }
         tsdb_seg_table_pop_front(db);
@@ -579,7 +600,8 @@ static bool find_one_segment(const char *dir, const char *base, char *out, size_
     struct dirent *e;
     while ((e = readdir(d)) != NULL) {
         uint32_t seq;
-        if (parse_seq(e->d_name, base, &seq)) {
+        uint8_t kind;
+        if (parse_name(e->d_name, base, &kind, &seq)) {
             int n = snprintf(out, out_len, "%s/%s", dir, e->d_name);
             if (n < 0 || (size_t) n >= out_len) continue;   // name does not fit: skip it
             found = true;
@@ -618,7 +640,7 @@ esp_err_t tsdb_disk_usage(const char *filepath, uint64_t *bytes) {
     split_path(filepath, s->dir, sizeof(s->dir), s->base, sizeof(s->base));
     uint64_t total = 0;
     struct stat st;
-    static const char *const legacy_suffix[] = { "", ".h0", ".h1", ".d/h0", ".d/h1", ".mig" };
+    static const char *const legacy_suffix[] = { "", ".h0", ".h1", ".d/h0", ".d/h1", ".mig", ".cv" };
     for (size_t i = 0; i < sizeof(legacy_suffix) / sizeof(legacy_suffix[0]); i++) {
         snprintf(s->p, sizeof(s->p), "%s%s", filepath, legacy_suffix[i]);
         if (stat(s->p, &st) == 0) total += (uint64_t) st.st_size;
@@ -628,7 +650,8 @@ esp_err_t tsdb_disk_usage(const char *filepath, uint64_t *bytes) {
         struct dirent *e;
         while ((e = readdir(d)) != NULL) {
             uint32_t seq;
-            if (!parse_seq(e->d_name, s->base, &seq)) continue;
+            uint8_t kind;
+            if (!parse_name(e->d_name, s->base, &kind, &seq)) continue;
             int n = snprintf(s->p, sizeof(s->p), "%s/%s", s->dir, e->d_name);
             if (n < 0 || (size_t) n >= sizeof(s->p)) continue;
             if (stat(s->p, &st) == 0) total += (uint64_t) st.st_size;

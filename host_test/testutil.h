@@ -11,7 +11,9 @@ static inline void tsdb_test_wipe(const char *path) {
     snprintf(b, sizeof b, "%s.h0", path); remove(b);
     snprintf(b, sizeof b, "%s.h1", path); remove(b);
     snprintf(b, sizeof b, "%s.mig", path); remove(b);
+    snprintf(b, sizeof b, "%s.cv", path); remove(b);
     for (int i = 1; i < 2000; i++) { snprintf(b, sizeof b, "%s.s%010d", path, i); if (remove(b) != 0 && i > 200) break; }
+    for (int i = 0; i < 2000; i++) { snprintf(b, sizeof b, "%s.c%010d", path, i); remove(b); }
 }
 
 static inline int tsdb_test_exists(const char *path) {

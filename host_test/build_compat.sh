@@ -7,7 +7,7 @@ cd "$(dirname "$0")"
 REFS=${COMPAT_REFS:-"v2.4.3 v2.4.4"}
 gcc -g -O0 -Wall -Wno-unused -I shims -I ../include -I ../src test_compat.c \
   ../src/tsdb_core.c ../src/tsdb_write.c ../src/tsdb_query.c ../src/tsdb_buffer.c \
-  ../src/tsdb_legacy.c ../src/tsdb_segment.c -o test_compat_new
+  ../src/tsdb_legacy.c ../src/tsdb_segment.c ../src/tsdb_convert.c -o test_compat_new
 for REF in $REFS; do
   OLD=.compat_old/$REF
   rm -rf "$OLD" && mkdir -p "$OLD"

@@ -219,6 +219,26 @@ esp_err_t tsdb_write_batch(const uint32_t *timestamps,
                             const int16_t **values,
                             uint32_t count);
 
+/**
+ * @brief One bounded step of background maintenance (v3.0+).
+ *
+ * A pre-3.0 database found at open is adopted as it is (nothing heavy runs in
+ * tsdb_open) and then moved into the 3.0 segment format piece by piece,
+ * without losing or duplicating a record across power cuts and with about
+ * one segment of extra space. Each call does one unit of that work under the
+ * handle lock: a few blocks copied, one truncate, one file removal, or a
+ * slice of a header reconstruction — bounded so a reader waiting on the lock
+ * is not stalled. Every tsdb_write() also does one step (after its own lock
+ * hold), so the work completes without this call; calling it in a loop from
+ * the writer task, with a short delay between calls, completes it in minutes.
+ *
+ * @param more Set to true while maintenance work remains (may be NULL).
+ * @return ESP_OK, ESP_ERR_INVALID_STATE (not open, or a query is open on
+ *         this task), ESP_ERR_TIMEOUT, or the I/O error of the step (retried
+ *         by the next call).
+ */
+esp_err_t tsdb_maintain(bool *more);
+
 // ============================================================================
 // INTERNAL STRUCTURES (exposed for stack allocation)
 // ============================================================================
@@ -346,7 +366,8 @@ struct tsdb_query_s {
     uint32_t seg_data_offset;
     uint16_t seg_rpb;
     uint8_t seg_np;
-    bool seg_legacy;                // segment is the adopted pre-3.0 file
+    bool seg_legacy;                // segment is a piece of the adopted pre-3.0 file
+    uint32_t seg_rank;              // ... and the legacy rank of its physical record 0
     bool seg_identity;              // column map is the identity
     FILE *seg_file;
     bool owns_file;
@@ -832,6 +853,8 @@ esp_err_t tsdb_sync_h(tsdb_t *db);
 bool tsdb_is_initialized_h(const tsdb_t *db);
 
 esp_err_t tsdb_write_h(tsdb_t *db, uint32_t timestamp, const int16_t *values);
+/** @brief Handle variant of tsdb_maintain(). */
+esp_err_t tsdb_maintain_h(tsdb_t *db, bool *more);
 
 esp_err_t tsdb_write_batch_h(tsdb_t *db,
                              const uint32_t *timestamps,

@@ -116,11 +116,19 @@ typedef struct {
 
 #define TSDB_SEG_HEADER_SIZE 64
 
+// Kinds of segment-table entry. Entries are kept in time order by
+// tsdb_seg_order(): everything that came from the adopted pre-3.0 file sorts
+// by its legacy rank (0 = its oldest retained record), before every 3.0
+// segment, which sorts by seq.
+#define TSDB_SEG_NORMAL 0   // <path>.sNNNNNNNNNN, seq 1..
+#define TSDB_SEG_LEGACY 1   // a rank interval still held by the 2.x file
+#define TSDB_SEG_CONV   2   // <path>.cNNNNNNNNNN: records converted from it, N = rank
+
 /**
- * @brief In-RAM segment table entry. seq 0 = the adopted legacy file.
+ * @brief In-RAM segment table entry.
  */
 typedef struct {
-    uint32_t seq;
+    uint32_t seq;               // NORMAL: file sequence; CONV: = rank; LEGACY: 0
     uint32_t records;           // valid physical records
     uint32_t first_ts;          // timestamp of physical record 0
     uint32_t last_ts;           // timestamp of the newest record
@@ -128,49 +136,119 @@ typedef struct {
     uint32_t data_offset;
     uint32_t schema_gen;
     uint32_t lifetime_base;
+    uint32_t rank;              // LEGACY / CONV: legacy rank of physical record 0
     uint16_t rpb;
     uint8_t  np;
+    uint8_t  kind;              // TSDB_SEG_*
 } tsdb_seg_t;
 
+static inline uint64_t tsdb_seg_order(const tsdb_seg_t *s) {
+    return s->kind == TSDB_SEG_NORMAL ? (1ull << 32) + s->seq : (uint64_t) s->rank;
+}
+
 // ============================================================================
-// LEGACY (pre-3.0 single file) — tsdb_legacy.c
+// LEGACY (pre-3.0 single file) — tsdb_legacy.c, conversion — tsdb_convert.c
 // ============================================================================
 
+// Conversion of the adopted file into segments (tsdb_convert.c). Littlefs can
+// only shrink a file from its end, cheaply: each round copies the live
+// records held in the file's physical tail into new segments, syncs them,
+// then truncates the tail away — one segment of extra space at most.
+enum {
+    TSDB_CONV_SCAN = 0,     // header unreadable: reconstructing it from the blocks
+    TSDB_CONV_START,        // persist the adopted header (<path>.cv)
+    TSDB_CONV_SIDECARS,     // then drop the 2.x sidecars (redundant from here on)
+    TSDB_CONV_PLAN,         // pick the next tail cut and the ranks to copy before it
+    TSDB_CONV_COPY,         // writing the converted segment(s)
+    TSDB_CONV_TRUNC,        // cut the tail
+    TSDB_CONV_FINAL,        // nothing live left: remove the file and its marker
+};
+
+#define TSDB_CONV_MAX_IV 8
+
 typedef struct {
-    FILE *file;
+    uint8_t  phase;
+    bool     stalled;                    // cannot proceed (no truncate support): the file stays as it is
+    uint32_t target;                     // length the file is cut to (PLAN..TRUNC)
+    bool     final_cut;                  // target leaves no records: remove instead of truncating
+    uint8_t  niv, cur;                   // rank intervals to copy, the one being written
+    uint32_t iv[TSDB_CONV_MAX_IV][2];    // [first rank, end rank)
+    tsdb_seg_t done[TSDB_CONV_MAX_IV];   // entries of the completed ones
+    FILE    *out;                        // converted segment being written
+    uint32_t written;                    // records of iv[cur] on disk
+    uint32_t out_rpb, out_data_offset;
+    // Deferred header reconstruction (SCAN)
+    uint32_t scan_next, scan_blocks;
+    uint32_t scan_oldest_ts, scan_newest_ts, scan_oldest_idx, scan_newest_idx, scan_total;
+} tsdb_conv_t;
+
+typedef struct {
+    FILE *file;                 // read-only; NULL only transiently around a truncate
     char path[128];
-    tsdb_header_t header;       // as adopted (sidecar-aware, reconstructed if needed)
+    tsdb_header_t header;       // as adopted (marker, sidecars, reconstruction)
     bool unlimited;
-    uint32_t available;         // retained records
-    uint32_t first_slot;        // ring slot of the oldest retained record
+    uint32_t available;         // retained records (ranks 0..available-1)
+    uint32_t first_slot;        // ring slot of rank 0
     // Overflow extras (sequential region past the ring)
     uint8_t  extra_count;
     uint32_t overflow_data_offset;
     uint32_t first_overflow_record_idx;
     uint16_t overflow_record_size;
+    char   (*extra_names)[TSDB_NAME_LEN];   // overflow column names (cached: the region is cut early)
+    // Layout
+    bool     v2_layout;         // pre-2.0.1 block layout: transcoded on every read
+    uint8_t *v2_tmp;            // its scratch block
+    uint32_t data_offset;       // first ring block
+    uint32_t length;            // physical length now (shrinks as it is converted)
+    bool     marker;            // the adopted header is persisted in <path>.cv
+    bool     needs_scan;        // header unreadable and not yet reconstructed
+    bool     reconstructed;     // header rebuilt from the blocks (names from the config)
+    tsdb_conv_t conv;
 } tsdb_legacy_t;
 
-// Opens <path> if it is a pre-3.0 database, read-only. ESP_ERR_NOT_FOUND if
-// absent; ESP_ERR_INVALID_RESPONSE if present but unusable (it is then
-// removed so the next open is clean); any other error (I/O failure while
-// converting a V2 file, out of memory) leaves every file exactly as it was —
-// the caller runs without it and retries later. Performs the pre-3.0 recovery steps (sidecar adoption
-// incl. 2.4.4's <path>.d/ slots, header reconstruction, V2->V3 block layout
-// migration, .mig adoption).
+// Opens <path> if it is a pre-3.0 database, read-only and cheaply (nothing in
+// it is read beyond its header, sidecars and conversion marker; a header
+// that must be reconstructed is left for the conversion steps).
+// ESP_ERR_NOT_FOUND if absent (orphaned sidecars / marker are removed);
+// ESP_ERR_INVALID_RESPONSE if present but unusable (it is then removed so the
+// next open is clean); any other error (out of memory, a file present but
+// unreadable now) leaves every file exactly as it was — the caller runs
+// without it and retries later.
 esp_err_t tsdb_legacy_open(const char *path, const tsdb_config_t *config, tsdb_legacy_t **out);
 void tsdb_legacy_close(tsdb_legacy_t *l);
-// Unlinks the file, its sidecars (<path>.h0/.h1, <path>.d/) and any .mig leftover.
+// Removes the file, its sidecars (<path>.h0/.h1, <path>.d/), any .mig
+// leftover and the conversion marker, in an order a power cut cannot turn
+// into orphans or a stale adoption.
 void tsdb_legacy_remove(const char *path);
 uint8_t tsdb_legacy_columns(const tsdb_legacy_t *l);
 // Column name (base, V4 extended or overflow) into out[TSDB_NAME_LEN].
 void tsdb_legacy_column_name(tsdb_legacy_t *l, uint8_t idx, char *out);
-// Physical record k (0 = oldest retained) -> block number and offset in block.
-void tsdb_legacy_locate(const tsdb_legacy_t *l, uint32_t k, uint32_t *block, uint16_t *off);
-uint32_t tsdb_legacy_block_offset(const tsdb_legacy_t *l, uint32_t block);
-// Longest run of consecutive physical records starting at k that share a block.
-uint32_t tsdb_legacy_run(const tsdb_legacy_t *l, uint32_t k);
-// Overflow extras for physical record k (zeros when none / pre-overflow).
-void tsdb_legacy_read_extras(tsdb_legacy_t *l, uint32_t k, int16_t *out);
+// Rank r (0 = oldest retained) -> ring block and offset in that block.
+void tsdb_legacy_locate(const tsdb_legacy_t *l, uint32_t r, uint32_t *block, uint16_t *off);
+// Ring block into buf, in the 3.x block layout (V2 blocks are transcoded).
+esp_err_t tsdb_legacy_read_block(tsdb_legacy_t *l, uint32_t block, void *buf);
+// Longest run of consecutive ranks starting at r that share a block.
+uint32_t tsdb_legacy_run(const tsdb_legacy_t *l, uint32_t r);
+// Overflow extras for rank r (zeros when none / pre-overflow).
+void tsdb_legacy_read_extras(tsdb_legacy_t *l, uint32_t r, int16_t *out);
+// Overflow extras for n consecutive ranks from r, row-major [n][extra_count].
+void tsdb_legacy_read_extras_n(tsdb_legacy_t *l, uint32_t r, uint32_t n, int16_t *out);
+// Timestamp of rank r (one block read into buf).
+uint32_t tsdb_legacy_ts_at(tsdb_legacy_t *l, uint32_t r, void *buf);
+// The rank intervals every byte of which lies below `len` (at most two):
+// what the file still holds once cut to that length.
+uint8_t tsdb_legacy_present(const tsdb_legacy_t *l, uint32_t len, uint32_t iv[2][2]);
+// Total writes the 2.x database had made before 3.0 (lifetime numbering).
+uint32_t tsdb_legacy_lifetime_end(const tsdb_legacy_t *l);
+// Persist the adopted header (and overflow names) in <path>.cv.
+esp_err_t tsdb_legacy_write_marker(tsdb_legacy_t *l);
+// One bounded slice of the header reconstruction scan; true when finished
+// (the header, available and first_slot are then set).
+bool tsdb_legacy_scan_step(tsdb_legacy_t *l, uint32_t max_blocks, void *buf);
+// Remove sidecars (subdirectory slots first) — no-ops when absent.
+void tsdb_legacy_remove_sidecars(const char *path);
+// Remove the first sidecar still present (same order); false when none is.
+bool tsdb_legacy_remove_one_sidecar(const char *path);
 long tsdb_legacy_file_size(const tsdb_legacy_t *l);
 
 // ============================================================================
@@ -220,7 +298,7 @@ struct tsdb_s {
     // handle on a file that is open for writing.
     FILE *active;
 
-    tsdb_legacy_t *legacy;          // non-NULL while segs[0] is the legacy file
+    tsdb_legacy_t *legacy;          // the adopted 2.x file while it exists (see tsdb_convert.c)
     // A 2.x file is present but could not be adopted at open for a transient
     // reason (out of memory): the handle runs without its history, and never
     // deletes or converts it, until a later attempt adopts it.
@@ -284,8 +362,11 @@ bool tsdb_refuse_if_query_open(tsdb_t *db, const char *what);
 
 // --- tsdb_segment.c ---------------------------------------------------------
 void tsdb_seg_path(const tsdb_t *db, uint32_t seq, char *out, size_t out_len);
-// Scan the directory for segment files, validate each (header + tail block),
-// fill db->segs (after any legacy entry). Empty/invalid segments are removed.
+// File of a NORMAL or CONV table entry.
+void tsdb_entry_path(const tsdb_t *db, const tsdb_seg_t *seg, char *out, size_t out_len);
+void tsdb_conv_path(const tsdb_t *db, uint32_t rank, char *out, size_t out_len);
+// Scan the directory for segment files (.s and converted .c), validate each
+// (header + tail block), fill db->segs. Empty/invalid segments are removed.
 esp_err_t tsdb_seg_scan(tsdb_t *db);
 // Read a segment's column names/aliases (NULL-able outputs). Uses `f` when
 // given (the active segment's handle), else opens the file read-only.
@@ -298,9 +379,12 @@ esp_err_t tsdb_seg_create(tsdb_t *db, uint32_t first_ts);
 // Table maintenance
 esp_err_t tsdb_seg_table_push(tsdb_t *db, const tsdb_seg_t *seg);
 void tsdb_seg_table_pop_front(tsdb_t *db);
-// Unlink segs[0] (legacy or segment) and drop it from the table. false if it
-// is the active segment (never evicted physically) or the table is empty.
-bool tsdb_evict_oldest(tsdb_t *db);
+// Drop segs[0] from the table and unlink its file. false if it is the active
+// segment (never evicted physically) or the table is empty. A LEGACY piece
+// has no file of its own: it is dropped (the conversion skips its ranks and
+// removes the 2.x file once no live piece is left) — unless `whole_legacy`,
+// for the out-of-space paths, which remove the whole 2.x file at once.
+bool tsdb_evict_oldest(tsdb_t *db, bool whole_legacy);
 // Recompute head_skip from total_physical/max_records, unlinking fully
 // skipped segments.
 void tsdb_apply_capacity(tsdb_t *db);
@@ -327,6 +411,24 @@ static inline void tsdb_write_cache_invalidate(tsdb_t *db) {
     db->cache_dirty = false;
 }
 esp_err_t tsdb_write_cache_flush(tsdb_t *db);
+
+// --- tsdb_convert.c ---------------------------------------------------------
+// After the segment scan: the 2.x file's present ranks, less those already in
+// converted segments, become LEGACY table entries (cheap: a few block reads
+// for their time bounds).
+esp_err_t tsdb_conv_adopt(tsdb_t *db);
+// One bounded step of adoption retry / reconstruction / conversion (lock held).
+esp_err_t tsdb_conv_step(tsdb_t *db);
+static inline bool tsdb_conv_pending(const tsdb_t *db) {
+    return db->legacy != NULL || db->legacy_retry;
+}
+// Stop a conversion and remove the whole 2.x file (clear, out of space).
+void tsdb_conv_drop_legacy(tsdb_t *db);
+// Close (and unlink) a converted segment being written.
+void tsdb_conv_abort_chunk(tsdb_t *db);
+// Scratch block for internal reads: the pool's read buffer when contiguous,
+// else *heap (caller frees). NULL on out of memory.
+void *tsdb_scratch_block(tsdb_t *db, void **heap);
 
 // --- tsdb_core.c ------------------------------------------------------------
 uint32_t tsdb_total_writes(const tsdb_t *db);

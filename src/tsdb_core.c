@@ -85,12 +85,20 @@ static bool schema_equal(const tsdb_schema_t *a, uint8_t count, uint8_t base,
 
 uint32_t tsdb_total_writes(const tsdb_t *db) {
     if (db->nsegs == 0) return 0;
+    // Every entry carries its lifetime base, legacy pieces and converted
+    // segments included (the 2.x write count, less what came after them).
     const tsdb_seg_t *n = &db->segs[db->nsegs - 1];
-    if (n->seq == 0 && db->legacy) {
-        uint32_t w = db->legacy->header.total_writes;
-        return w >= n->records ? w : n->records;
-    }
     return n->lifetime_base + n->records;
+}
+
+void *tsdb_scratch_block(tsdb_t *db, void **heap) {
+    *heap = NULL;
+    void *buf = tsdb_get_buffer_ptr(&db->pool, db->read_buffer_offset, TSDB_BLOCK_SIZE);
+    if (buf == NULL) {
+        *heap = malloc(TSDB_BLOCK_SIZE);   // never a 1 KB stack buffer
+        buf = *heap;
+    }
+    return buf;
 }
 
 uint32_t tsdb_oldest_retained_ts(tsdb_t *db) {
@@ -101,30 +109,27 @@ uint32_t tsdb_oldest_retained_ts(tsdb_t *db) {
     // Pool read buffer when it is contiguous, else a heap block — never a
     // 1 KB stack buffer (stats are read from small tasks, including the
     // dongle's 4.6 KB main task at boot).
-    uint8_t *heapbuf = NULL;
-    uint8_t *buf = tsdb_get_buffer_ptr(&db->pool, db->read_buffer_offset, TSDB_BLOCK_SIZE);
-    if (buf == NULL) {
-        heapbuf = malloc(TSDB_BLOCK_SIZE);
-        if (heapbuf == NULL) return o->first_ts;
-        buf = heapbuf;
-    }
+    void *heapbuf;
+    uint8_t *buf = tsdb_scratch_block(db, &heapbuf);
+    if (buf == NULL) return o->first_ts;
 
     uint32_t ts = o->first_ts;
     uint32_t block; uint16_t off;
-    if (o->seq == 0 && db->legacy) {
-        tsdb_legacy_locate(db->legacy, db->head_skip, &block, &off);
-        fseek(db->legacy->file, tsdb_legacy_block_offset(db->legacy, block), SEEK_SET);
-        if (fread(buf, TSDB_BLOCK_SIZE, 1, db->legacy->file) == 1) ts = TSDB_BLOCK_TS(buf, off);
+    if (o->kind == TSDB_SEG_LEGACY) {
+        if (db->legacy) {
+            uint32_t t = tsdb_legacy_ts_at(db->legacy, o->rank + db->head_skip, buf);
+            if (t != 0) ts = t;
+        }
         free(heapbuf);
         return ts;
     }
     block = db->head_skip / o->rpb;
     off = (uint16_t)(db->head_skip % o->rpb);
-    FILE *f = (db->nsegs == 1) ? db->active : NULL;
+    FILE *f = (db->nsegs == 1 && o->kind == TSDB_SEG_NORMAL) ? db->active : NULL;
     bool own = false;
     if (f == NULL) {
         char path[160];
-        tsdb_seg_path(db, o->seq, path, sizeof(path));
+        tsdb_entry_path(db, o, path, sizeof(path));
         f = fopen(path, "rb");
         if (f == NULL) { free(heapbuf); return ts; }
         own = true;
@@ -236,7 +241,8 @@ tsdb_t *tsdb_open(const tsdb_config_t *config) {
         return NULL;
     }
 
-    // ---- 1. Legacy single file (pre-3.0) becomes segment 0, read-only.
+    // ---- 1. Legacy single file (pre-3.0): adopted read-only; tsdb_convert.c
+    //         moves it into segments in bounded steps after the open.
     tsdb_legacy_t *legacy = NULL;
     esp_err_t lr = tsdb_legacy_open(config->filepath, config, &legacy);
     if (lr != ESP_OK && lr != ESP_ERR_NOT_FOUND && lr != ESP_ERR_INVALID_RESPONSE) {
@@ -251,33 +257,31 @@ tsdb_t *tsdb_open(const tsdb_config_t *config) {
         db->legacy_retry = true;
     }
     if (lr == ESP_OK) {
-        if (legacy->available > 0) {
-            tsdb_seg_t seg;
-            memset(&seg, 0, sizeof(seg));
-            seg.seq = 0;
-            seg.records = legacy->available;
-            seg.first_ts = legacy->header.oldest_timestamp;
-            seg.last_ts = legacy->header.newest_timestamp;
-            seg.rpb = legacy->header.records_per_block;
-            seg.np = tsdb_legacy_columns(legacy);
-            seg.lifetime_base = 0;
-            seg.schema_gen = 0;
-            db->legacy = legacy;
-            tsdb_seg_table_push(db, &seg);
-        } else {
+        if (!legacy->needs_scan && legacy->available == 0 && !legacy->marker) {
             // Empty legacy file: nothing to adopt, drop it.
             char path[128];
             strncpy(path, legacy->path, sizeof(path));
             tsdb_legacy_close(legacy);
             tsdb_legacy_remove(path);
+        } else {
+            db->legacy = legacy;
+            legacy->conv.phase = legacy->needs_scan ? TSDB_CONV_SCAN : TSDB_CONV_START;
         }
     }
 
-    // ---- 2. Segment files.
+    // ---- 2. Segment files (converted ones included).
     if (tsdb_seg_scan(db) != ESP_OK) {
         ESP_LOGE(TAG, "Segment scan failed");
         teardown(db);
         return NULL;
+    }
+
+    // ---- 2b. What the 2.x file still holds, less what is already converted.
+    if (db->legacy && !db->legacy->needs_scan && tsdb_conv_adopt(db) != ESP_OK) {
+        ESP_LOGE(TAG, "Cannot adopt the pre-3.0 database now — opening without its history");
+        tsdb_legacy_close(db->legacy);
+        db->legacy = NULL;
+        db->legacy_retry = true;
     }
 
     // ---- 3. Current schema = config base columns + persisted runtime extras.
@@ -290,8 +294,11 @@ tsdb_t *tsdb_open(const tsdb_config_t *config) {
     }
 
     const tsdb_seg_t *newest = db->nsegs ? &db->segs[db->nsegs - 1] : NULL;
-    bool newest_is_segment = newest && newest->seq != 0;
-    if (newest_is_segment) {
+    bool newest_is_segment = newest && newest->kind == TSDB_SEG_NORMAL;
+    // Records converted from a 2.x file (the 2.x file itself gone) carry its
+    // columns, extras included, like a segment does.
+    bool newest_is_conv = newest && newest->kind == TSDB_SEG_CONV && db->legacy == NULL;
+    if (newest_is_segment || newest_is_conv) {
         char (*names)[TSDB_NAME_LEN] = calloc(newest->np, TSDB_NAME_LEN);
         char (*aliases)[TSDB_NAME_LEN] = calloc(newest->np, TSDB_NAME_LEN);
         uint8_t base = 0;
@@ -327,7 +334,9 @@ tsdb_t *tsdb_open(const tsdb_config_t *config) {
             memcpy(s->aliases[s->count], aliases[j], TSDB_NAME_LEN);
             s->count++;
         }
-        if (schema_equal(s, newest->np, base, names, aliases)) {
+        if (newest_is_conv) {
+            s->gen = 1;                            // never appended to: the next write starts a segment
+        } else if (schema_equal(s, newest->np, base, names, aliases)) {
             s->gen = newest->schema_gen;           // identical: keep appending to it
         } else {
             s->gen = newest->schema_gen + 1;       // next write starts a new segment
@@ -361,7 +370,7 @@ tsdb_t *tsdb_open(const tsdb_config_t *config) {
     // ---- 5. Hold the newest segment open for appends (only if it still has
     //         the current schema; otherwise the next write creates a new one).
     newest = db->nsegs ? &db->segs[db->nsegs - 1] : NULL;
-    if (newest && newest->seq != 0 && newest->schema_gen == s->gen) {
+    if (newest && newest->kind == TSDB_SEG_NORMAL && newest->schema_gen == s->gen) {
         char path[160];
         tsdb_seg_path(db, newest->seq, path, sizeof(path));
         db->active = fopen(path, "r+b");
@@ -463,17 +472,20 @@ esp_err_t tsdb_get_stats_h(tsdb_t *db, tsdb_stats_t *stats) {
     stats->extra_params = db->schema.count - db->schema.base_count;
     stats->buffer_pool_size = db->pool.total_size;
     stats->using_paged_allocation = db->pool.is_paged;
-    stats->segment_count = db->nsegs;
-
+    // Files: the 2.x file counts once however many pieces of it are live.
     uint32_t bytes = 0;
+    uint16_t files = 0;
     for (uint16_t i = 0; i < db->nsegs; i++) {
         const tsdb_seg_t *s = &db->segs[i];
-        if (s->seq == 0) {
-            if (db->legacy) bytes += (uint32_t) tsdb_legacy_file_size(db->legacy);
-        } else {
-            bytes += s->data_offset + ((s->records + s->rpb - 1) / s->rpb) * TSDB_BLOCK_SIZE;
-        }
+        if (s->kind == TSDB_SEG_LEGACY) continue;
+        files++;
+        bytes += s->data_offset + ((s->records + s->rpb - 1) / s->rpb) * TSDB_BLOCK_SIZE;
     }
+    if (db->legacy) {
+        files++;
+        bytes += (uint32_t) tsdb_legacy_file_size(db->legacy);
+    }
+    stats->segment_count = files;
     stats->storage_bytes = bytes;
 
     tsdb_unlock(db);
@@ -517,7 +529,7 @@ static esp_err_t schema_bump(tsdb_t *db) {
     if (db->cache_dirty) tsdb_write_cache_flush(db);
     tsdb_write_cache_invalidate(db);
     if (db->active) { fclose(db->active); db->active = NULL; }
-    if (db->nsegs > 0 && db->segs[db->nsegs - 1].seq != 0 && db->segs[db->nsegs - 1].records == 0) {
+    if (db->nsegs > 0 && db->segs[db->nsegs - 1].kind == TSDB_SEG_NORMAL && db->segs[db->nsegs - 1].records == 0) {
         char path[160];
         tsdb_seg_path(db, db->segs[db->nsegs - 1].seq, path, sizeof(path));
         unlink(path);

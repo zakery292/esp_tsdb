@@ -190,7 +190,7 @@ static void seg_files(int64_t *max_size, int *count) {
     if (lfs_dir_open(hfs_lfs(), &d, "/") == 0) {
         struct lfs_info info;
         while (lfs_dir_read(hfs_lfs(), &d, &info) > 0) {
-            if (strncmp(info.name, "energy.tsdb.s", 13) == 0) {
+            if (strncmp(info.name, "energy.tsdb.s", 13) == 0 || strncmp(info.name, "energy.tsdb.c", 13) == 0) {
                 (*count)++;
                 if ((int64_t) info.size > *max_size) *max_size = info.size;
             }
@@ -208,6 +208,7 @@ typedef struct {
     uint32_t fs_blocks, other_kb, interval, min_free_kb, guard_kb;
     uint32_t writes;
     double multiple;
+    uint32_t step_writes, crash_stride;   // convert: a record every N steps; power-cut sweep stride (0 = off)
 } opts_t;
 
 static uint32_t fw_max_records(uint32_t fs_total) {
@@ -270,6 +271,12 @@ static scan_t scan(tsdb_t *db) {
     hfs_counting = was;
     return s;
 }
+
+// The 2.x reference and exact-window checks (defined with the convert mode).
+typedef struct { bool ok; uint32_t n, want, bad_at; } win_t;
+static bool load_reference(const char *dir);
+static int legacy_leftovers(void);
+static win_t check_window(tsdb_t *db, uint32_t w, uint32_t w_alt, uint32_t cap, uint32_t iv);
 
 static uint64_t disk_usage(void) {
     uint64_t b = 0;
@@ -396,17 +403,14 @@ static void write_loop(tsdb_t *db, const tsdb_config_t *cfg, uint32_t writes, ui
 
         if (r->legacy_present) {
             bool still = stat(DB_PATH, &st) == 0;
-            uint64_t expect = (uint64_t) legacy_count + w + 1;
-            if (expect > cfg->max_records) expect = cfg->max_records;
             if (!still) {
-                printf("  legacy file removed at new write %u: retained %u -> %u, free %lld KB\n", w,
+                printf("  2.x file gone (fully converted) at new write %u: retained %u -> %u, free %lld KB\n", w,
                        retained_prev, s.total_records, (long long) hfs_free_bytes() / 1024);
                 r->legacy_present = false;
                 r->legacy_gone_at = w;
                 r->retained_before_gone = retained_prev;
                 r->retained_after_gone = s.total_records;
-                r->leftovers_after_gone = lfs_exists("/energy.tsdb.d") || lfs_exists("/energy.tsdb.h0") ||
-                                          lfs_exists("/energy.tsdb.h1");
+                r->leftovers_after_gone = legacy_leftovers() > 0;
             } else {
                 if (st.st_size < legacy_size && r->legacy_partial_at == 0) {
                     r->legacy_partial_at = w;
@@ -414,8 +418,13 @@ static void write_loop(tsdb_t *db, const tsdb_config_t *cfg, uint32_t writes, ui
                     r->retained_after_partial = s.total_records;
                 }
                 legacy_size = st.st_size;
-                if (r->legacy_partial_at == 0 && s.total_records != expect) r->history_mismatch++;
             }
+        }
+        if (legacy_count) {
+            // No adopted record leaves before the window passes it.
+            uint64_t expect = (uint64_t) legacy_count + w + 1;
+            if (expect > cfg->max_records) expect = cfg->max_records;
+            if (s.total_records != expect) r->history_mismatch++;
         }
         retained_prev = s.total_records;
 
@@ -462,12 +471,15 @@ static int run_upgrade(const char *legacy_dir, const opts_t *o) {
            legacy_dir, fs_total / 1024, o->other_kb, cfg.max_records, (long) st.st_size, imported,
            (long long) hfs_free_bytes() / 1024);
 
+    bool have_ref = load_reference(legacy_dir);
     tsdb_t *db = tsdb_open(&cfg);
     if (db == NULL) { printf("  [FAIL] tsdb_open\n"); return 1; }
     scan_t s0 = scan(db);
-    CHECK(s0.n == exp_n && s0.first == exp_first && s0.last == exp_last && s0.ordered && s0.values,
-          "adopted history: %u records %u..%u (want %u %u..%u), ordered %d, values %d",
-          s0.n, s0.first, s0.last, exp_n, exp_first, exp_last, s0.ordered, s0.values);
+    win_t w0 = have_ref ? check_window(db, 0, 0, cfg.max_records, o->interval) : (win_t){0};
+    CHECK(s0.n == exp_n && s0.first == exp_first && s0.last == exp_last && s0.ordered && s0.values && w0.ok,
+          "adopted history: %u records %u..%u (want %u %u..%u), ordered %d, values %d; exactly the records "
+          "the 2.x release reads back: %d",
+          s0.n, s0.first, s0.last, exp_n, exp_first, exp_last, s0.ordered, s0.values, w0.ok);
 
     uint32_t writes = o->writes ? o->writes : (uint32_t) (1.3 * cfg.max_records);
     uint32_t ts = exp_last + o->interval;
@@ -492,24 +504,26 @@ static int run_upgrade(const char *legacy_dir, const opts_t *o) {
           (long long) r.max_slack / 1024, (long long) r.max_over / 1024, r.max_over_at,
           (long long) r.max_seg_file / 1024);
     CHECK(r.history_mismatch == 0,
-          "while the legacy file is whole, every adopted record stays readable until the window passes it "
-          "(%u mismatches)", r.history_mismatch);
+          "every adopted record stays readable until the window passes it, at every one of the %u writes "
+          "(%u mismatches)", writes, r.history_mismatch);
     if (r.legacy_partial_at) {
-        days(r.legacy_partial_at, dd, sizeof(dd));
-        printf("  legacy file truncated (oldest part dropped) at new write %u (%s): retained %u -> %u\n",
-               r.legacy_partial_at, dd, r.retained_before_partial, r.retained_after_partial);
+        printf("  2.x file first cut (its tail converted) at new write %u\n", r.legacy_partial_at);
     }
     if (!r.legacy_present) {
         days(r.legacy_gone_at + 1, dd, sizeof(dd));
-        printf("  legacy history dropped after %u new records (%s): retained %u -> %u\n",
-               r.legacy_gone_at + 1, dd, r.retained_before_gone, r.retained_after_gone);
-        CHECK(!r.leftovers_after_gone, "legacy sidecars (.h0/.h1/.d) removed with the file");
+        printf("  2.x file fully converted after %u new records with no tsdb_maintain() calls (%s)\n",
+               r.legacy_gone_at + 1, dd);
+        CHECK(!r.leftovers_after_gone, "no sidecar or marker left once the 2.x file is gone");
     } else {
-        printf("  legacy file still present after %u writes\n", writes);
+        CHECK(false, "2.x file still present after %u writes", writes);
     }
     printf("  worst write: %llu erases, est %.0f ms (write %u); mean est %.1f ms\n",
            (unsigned long long) r.max_erases, r.max_ms, r.max_ms_at, r.sum_ms / (r.writes_ok ? r.writes_ok : 1));
 
+    // Exactly the 2.x history plus the new records, cut to the window.
+    win_t w1 = check_window(db, writes, writes, cfg.max_records, o->interval);
+    CHECK(w1.ok, "after %u writes a query returns exactly the newest %u of the 2.x history + the new records "
+                 "(%u, first bad at %u)", writes, w1.want, w1.n, w1.bad_at);
     // Power cut, then a full scan.
     tsdb_stats_t sb;
     tsdb_get_stats_h(db, &sb);
@@ -826,6 +840,11 @@ static void make_v2_file(const char *path, uint32_t n) {
     free(img);
 }
 
+// A pre-2.0.1 (V2) block layout. 2.x rewrote every block in place at open;
+// 3.0 transcodes each block as it reads it, so opening writes nothing: with
+// every flash program failing, the open still succeeds and reads every record.
+// Then the conversion moves the records into segments, and a power cut before
+// any of its mutating operations loses or duplicates none of them.
 static void fault_legacy_migration(void) {
     // The V2 layout only holds records whose old param offsets fit in the
     // block (r < 38 for the last column), so keep n small enough that every
@@ -835,23 +854,44 @@ static void fault_legacy_migration(void) {
     mount_fs(&o);
     make_v2_file(DB_PATH, n);
     tsdb_config_t cfg = small_config(1000);
-    hfs_fail_progs_after = 0;          // every program fails during the conversion
+    hfs_fail_progs_after = 0;          // every program fails
     tsdb_t *db = tsdb_open(&cfg);
-    hfs_fail_progs_after = -1;
     scan_t s0 = db ? scan(db) : (scan_t){0};
-    CHECK(db == NULL || s0.n == 0,
-          "legacy V2->V3 conversion: when it cannot be written, the file is not adopted (open %s, %u records)",
-          db ? "succeeds without it" : "fails", s0.n);
-    if (db) { tsdb_close_h(db); }
-    hfs_remount();
-    db = tsdb_open(&cfg);
-    scan_t s = db ? scan(db) : (scan_t){0};
-    // Either the file is intact and converted now, or it was discarded as a
-    // torn conversion: never adopted with unconverted blocks.
-    CHECK(db && s.values && s.ordered && (s.n == n || s.n == 0),
-          "legacy V2->V3 conversion: after the failure, the next open sees the converted records or none "
-          "(%u records, values %d)", s.n, s.values);
+    hfs_fail_progs_after = -1;
+    CHECK(db && s0.n == n && s0.values && s0.ordered,
+          "legacy V2 layout: tsdb_open writes nothing (every program failing) and reads all %u records (%u)", n, s0.n);
     if (db) tsdb_close_h(db);
+    // Conversion, with a power cut before each mutating operation in turn.
+    uint32_t ops = 0, bad = 0;
+    for (uint32_t k = 0; ; k++) {
+        mount_fs(&o);
+        make_v2_file(DB_PATH, n);
+        db = tsdb_open(&cfg);
+        uint64_t m0 = hfs_mut_ops;
+        jmp_buf jb;
+        hfs_crash_jmp = &jb;
+        bool crashed = false;
+        if (setjmp(jb) == 0) {
+            hfs_crash_after = k;
+            bool more = true;
+            for (int i = 0; i < 100 && more; i++) tsdb_maintain_h(db, &more);
+            hfs_crash_after = -1;
+        } else {
+            crashed = true;
+        }
+        hfs_crash_after = -1;
+        if (!crashed) ops = (uint32_t) (hfs_mut_ops - m0);
+        hfs_remount();
+        db = tsdb_open(&cfg);
+        bool more = true;
+        for (int i = 0; db && i < 100 && more; i++) tsdb_maintain_h(db, &more);
+        scan_t s = db ? scan(db) : (scan_t){0};
+        if (!(db && s.n == n && s.values && s.ordered && !more && !lfs_exists("/energy.tsdb"))) bad++;
+        if (db) tsdb_close_h(db);
+        if (!crashed) break;
+    }
+    CHECK(bad == 0, "legacy V2 layout: converted with a power cut before each of its %u mutating operations — "
+                    "all %u records every time, file gone (%u bad)", ops, n, bad);
 }
 
 static int run_faults(void) {
@@ -993,13 +1033,22 @@ static void legacy_nomem(const char *dir, const opts_t *o, const expect_t *e, co
         g_alloc_arm = false; g_alloc_fail_size = 0;
         scan_t s = db ? scan(db) : (scan_t){0};
         bool wrote = false;
+        scan_t s_retry = {0};
+        legacy_files_t f1 = {0};
         if (db) {
             int16_t v[NPARAM];
             fill(v, e->last + 300);
+            f1 = legacy_files();   // before the write: it also retries the adoption
             wrote = tsdb_write_h(db, e->last + 300, v) == ESP_OK;
+            s_retry = scan(db);
             tsdb_close_h(db);
+        } else {
+            f1 = legacy_files();
         }
-        legacy_files_t f1 = legacy_files();
+        uint32_t want_n = e->n + 1 > cfg->max_records ? cfg->max_records : e->n + 1;
+        CHECK(s_retry.n == want_n && s_retry.last == e->last + 300 && s_retry.ordered && s_retry.values,
+              "out of memory for %s: the next write retries the adoption — the whole history and the new record "
+              "(%u records ..%u)", cases[c].what, s_retry.n, s_retry.last);
         CHECK(db != NULL && wrote && (s.n == 0 || exact(&s, e)) && f1.main_size == f0.main_size &&
               f1.sidecars == f0.sidecars,
               "out of memory for %s (%zu B) at open: the database opens (%d) and takes writes (%d), "
@@ -1009,7 +1058,6 @@ static void legacy_nomem(const char *dir, const opts_t *o, const expect_t *e, co
         hfs_remount();
         db = tsdb_open(cfg);
         s = db ? scan(db) : (scan_t){0};
-        uint32_t want_n = e->n + 1 > cfg->max_records ? cfg->max_records : e->n + 1;
         uint32_t want_first = e->n + 1 > cfg->max_records ? e->first + 300 : e->first;
         CHECK(db && s.n == want_n && s.first == want_first && s.last == e->last + 300 && s.ordered && s.values,
               "the next open adopts the whole history plus the new record (%u records %u..%u)", s.n, s.first,
@@ -1048,6 +1096,408 @@ static void legacy_nomem(const char *dir, const opts_t *o, const expect_t *e, co
                     "not at all with its files untouched (%u bad; %u opens failed outright)", allocs, bad, nulls);
 }
 
+// Cost of one call, by the cost model.
+#define COSTED(ms_out, call) do { hfs_refresh_root_pairs(); hfs_counters_t b_ = hfs_ctr; call; \
+        hfs_counters_t d_ = delta(&b_, &hfs_ctr); (ms_out) = est_ms(&d_); } while (0)
+
+// Review B3: a 2.x file whose header is unreadable is reconstructed by
+// scanning every data block (2.5 MB on a full 16 MB unit). That scan must not
+// run inside tsdb_open (setup() on loopTask, under the 5 s task watchdog), and
+// must happen once, not at every boot. 400 ms is the bound used for "never
+// stalls a reader".
+static void legacy_bad_header(const char *dir, const opts_t *o, const expect_t *e, const tsdb_config_t *cfg) {
+    // A copy of the database with its magic overwritten (on the host: an
+    // in-place write at offset 0 on littlefs rewrites the whole file).
+    char bad[700], cmd[4096];
+    snprintf(bad, sizeof(bad), "%s.badhdr", dir);
+    snprintf(cmd, sizeof(cmd), "rm -rf '%s' && mkdir -p '%s' && cp -r '%s'/energy.tsdb* '%s'/ && "
+             "printf '\\357\\276\\255\\336' | dd of='%s/energy.tsdb' bs=1 count=4 conv=notrunc status=none",
+             bad, bad, dir, bad, bad);
+    if (system(cmd) != 0) { CHECK(false, "bad header: cannot prepare %s", bad); return; }
+    setup_legacy(bad, o);
+    double open1 = 0, open2 = 0, worst = 0, total = 0;
+    tsdb_t *db;
+    COSTED(open1, db = tsdb_open(cfg));
+    // Then the maintenance steps the writer runs; each is bounded too.
+    uint32_t steps = 0;
+    scan_t s = {0};
+    for (; db && steps < 4000; steps++) {
+        s = scan(db);
+        if (s.n >= e->n) break;
+        double ms;
+        bool more = false;
+        COSTED(ms, tsdb_maintain_h(db, &more));
+        if (ms > worst) worst = ms;
+        total += ms;
+    }
+    CHECK(db && open1 <= 400, "bad header: tsdb_open costs %.0f ms (no reconstruction scan inside it)", open1);
+    CHECK(db && exact(&s, e),
+          "bad header: the history is reconstructed whole (%u records %u..%u) after %u steps, %.0f ms in all, "
+          "the longest %.0f ms", s.n, s.first, s.last, steps, total, worst);
+    CHECK(worst <= 400, "bad header: no reconstruction step holds the database for more than 400 ms (%.0f)", worst);
+    hfs_remount();
+    COSTED(open2, db = tsdb_open(cfg));
+    s = db ? scan(db) : (scan_t){0};
+    CHECK(db && open2 <= 400 && exact(&s, e),
+          "bad header: the reconstruction is not repeated at the next boot (open %.0f ms, %u records)", open2, s.n);
+    if (db) tsdb_close_h(db);
+}
+
+// ---------------------------------------------------------------------------
+// convert: the 2.x file moved into segments
+// ---------------------------------------------------------------------------
+
+// The reference: every record the 2.x release itself reads back from this
+// database (gen_legacy's records.bin).
+typedef struct { uint32_t ts; int16_t v[NPARAM]; } __attribute__((packed)) rec_t;
+static rec_t *g_ref;
+static uint32_t g_ref_n;
+
+static bool load_reference(const char *dir) {
+    char p[600];
+    snprintf(p, sizeof(p), "%s/records.bin", dir);
+    FILE *f = fopen(p, "rb");
+    if (f == NULL) return false;
+    bool ok = fread(&g_ref_n, 4, 1, f) == 1;
+    free(g_ref);
+    g_ref = malloc((size_t) g_ref_n * sizeof(rec_t) + 1);
+    ok = ok && g_ref && fread(g_ref, sizeof(rec_t), g_ref_n, f) == g_ref_n;
+    fclose(f);
+    return ok;
+}
+
+// Record i of "the 2.x history, then w new records" (new ones every iv s).
+static void expected_rec(uint32_t i, uint32_t iv, rec_t *r) {
+    if (i < g_ref_n) { *r = g_ref[i]; return; }
+    r->ts = g_ref[g_ref_n - 1].ts + (i - g_ref_n + 1) * iv;
+    int16_t v[NPARAM];
+    fill(v, r->ts);
+    memcpy(r->v, v, sizeof(v));
+}
+
+// A full query must return exactly the newest min(n + w, cap) records of that
+// sequence, in order, with their values: nothing lost, nothing doubled.
+// `w_alt`: a write cut short by the power, which may or may not have landed.
+static win_t check_window_w(tsdb_t *db, uint32_t w, uint32_t cap, uint32_t iv) {
+    win_t r = {true, 0, 0, UINT32_MAX};
+    uint64_t total = (uint64_t) g_ref_n + w;
+    r.want = total > cap ? cap : (uint32_t) total;
+    uint32_t first = (uint32_t) (total - r.want);
+    tsdb_query_t q;
+    uint8_t cols[NPARAM] = {0, 1, 2, 3, 4, 5, 6};
+    bool was = hfs_counting;
+    hfs_counting = false;
+    if (tsdb_query_init_h(db, &q, 0, 0xFFFFFFFFu, cols, NPARAM) != ESP_OK) { hfs_counting = was; r.ok = false; return r; }
+    uint32_t ts;
+    int16_t v[NPARAM];
+    while (tsdb_query_next(&q, &ts, v) == ESP_OK) {
+        rec_t want;
+        if (r.n < r.want) {
+            expected_rec(first + r.n, iv, &want);
+            if (want.ts != ts || memcmp(want.v, v, sizeof(v)) != 0) {
+                if (r.bad_at == UINT32_MAX) r.bad_at = r.n;
+                r.ok = false;
+            }
+        }
+        r.n++;
+    }
+    tsdb_query_close(&q);
+    hfs_counting = was;
+    if (r.n != r.want) r.ok = false;
+    return r;
+}
+static win_t check_window(tsdb_t *db, uint32_t w, uint32_t w_alt, uint32_t cap, uint32_t iv) {
+    win_t r = check_window_w(db, w, cap, iv);
+    if (!r.ok && w_alt != w) {
+        win_t r2 = check_window_w(db, w_alt, cap, iv);
+        if (r2.ok) return r2;
+    }
+    return r;
+}
+
+// Lock holds, measured at the handle mutex (host shim hook).
+static hfs_counters_t g_hold_start;
+static double g_hold_max[2];        // [0] maintenance steps, [1] the writes themselves
+static int g_hold_kind;
+static double g_holds[8];           // the holds of the current call, in order
+static int g_nholds;
+void host_lock_event(int taken) {
+    if (taken) { g_hold_start = hfs_ctr; return; }
+    hfs_counters_t d = delta(&g_hold_start, &hfs_ctr);
+    double ms = est_ms(&d);
+    if (g_nholds < 8) g_holds[g_nholds++] = ms;
+}
+// tsdb_write_h holds the lock twice while a conversion is pending: the write,
+// then (separately) one maintenance step.
+static void account_holds(bool is_write) {
+    for (int i = 0; i < g_nholds; i++) {
+        int kind = (is_write && i == 0) ? 1 : 0;
+        if (g_holds[i] > g_hold_max[kind]) g_hold_max[kind] = g_holds[i];
+    }
+    g_nholds = 0;
+}
+
+typedef struct {
+    uint32_t steps, writes, errors, window_checks, window_bad, cuts;
+    double step_ms_total, step_ms_max, write_ms_max;
+    int64_t min_free, start_free;
+    bool in_write;
+    float step_ms[4096];
+} conv_run_t;
+
+static int cmp_float(const void *a, const void *b) {
+    float x = *(const float *) a, y = *(const float *) b;
+    return x < y ? -1 : x > y;
+}
+static double pct(conv_run_t *r, double q) {
+    uint32_t n = r->steps < 4096 ? r->steps : 4096;
+    if (n == 0) return 0;
+    qsort(r->step_ms, n, sizeof(float), cmp_float);
+    return r->step_ms[(uint32_t) (n * q)];
+}
+
+static int64_t legacy_len(void) {
+    struct lfs_info li;
+    bool was = hfs_counting;
+    hfs_counting = false;
+    int r = lfs_stat(hfs_lfs(), "/energy.tsdb", &li);
+    hfs_counting = was;
+    return r == 0 ? (int64_t) li.size : -1;
+}
+
+// The firmware's writer: maintenance steps back to back, a record every
+// `step_writes` steps (0 = none). `checks`: sample free space every step and
+// verify the whole window after every cut of the 2.x file.
+static void convert_drive(tsdb_t *db, const opts_t *o, uint32_t step_writes, uint32_t cap, uint32_t *w,
+                          conv_run_t *r, bool checks) {
+    bool more = true;
+    int64_t len = legacy_len();
+    while (more && r->steps < 100000) {
+        double ms;
+        esp_err_t er;
+        g_hold_kind = 0;
+        int phase = db->legacy ? db->legacy->conv.phase : -1;
+        hfs_refresh_root_pairs();
+        hfs_counters_t tb = hfs_ctr;
+        g_nholds = 0;
+        er = tsdb_maintain_h(db, &more);
+        account_holds(false);
+        hfs_counters_t td = delta(&tb, &hfs_ctr);
+        ms = est_ms(&td);
+        if (getenv("CONV_TRACE")) {
+            printf("    step %u phase %d: %.0f ms reads %llu progs %llu erases %llu commits %llu compacts %llu "
+                   "alloc_scans %llu, file %lld, free %lld KB\n", r->steps, phase, ms, (unsigned long long) td.reads,
+                   (unsigned long long) td.progs, (unsigned long long) td.erases,
+                   (unsigned long long) td.ev[LFS_H_COMMIT], (unsigned long long) td.ev[LFS_H_COMPACT],
+                   (unsigned long long) td.ev[LFS_H_ALLOC_SCAN], (long long) legacy_len(),
+                   (long long) hfs_free_bytes() / 1024);
+        }
+        g_hold_kind = 1;
+        if (r->steps < 4096) r->step_ms[r->steps] = (float) ms;
+        r->steps++;
+        r->step_ms_total += ms;
+        if (ms > r->step_ms_max) r->step_ms_max = ms;
+        if (er != ESP_OK) r->errors++;
+        if (step_writes && r->steps % step_writes == 0) {
+            rec_t nr;
+            expected_rec(g_ref_n + *w, o->interval, &nr);
+            int16_t nv[NPARAM];
+            memcpy(nv, nr.v, sizeof(nv));
+            r->in_write = true;
+            g_nholds = 0;
+            COSTED(ms, er = tsdb_write_h(db, nr.ts, nv));
+            account_holds(true);
+            r->in_write = false;
+            if (er == ESP_OK) (*w)++;
+            else r->errors++;
+            if (ms > r->write_ms_max) r->write_ms_max = ms;
+            more = true;
+        }
+        if (checks) {
+            int64_t fr = hfs_free_bytes();
+            if (fr < r->min_free) r->min_free = fr;
+            int64_t now = legacy_len();
+            if (now != len) {
+                len = now;
+                r->cuts++;
+                win_t wc = check_window(db, *w, *w, cap, o->interval);
+                r->window_checks++;
+                if (!wc.ok) {
+                    if (r->window_bad == 0) {
+                        printf("    window wrong after cut %u (file %lld B): %u records, want %u, first bad at %u\n",
+                               r->cuts, (long long) now, wc.n, wc.want, wc.bad_at);
+                    }
+                    r->window_bad++;
+                }
+            }
+        }
+    }
+}
+
+static void convert_full(const char *dir, const opts_t *o, const expect_t *e, const tsdb_config_t *cfg,
+                         uint32_t step_writes) {
+    setup_legacy(dir, o);
+    int64_t len0 = legacy_len();
+    double open_ms;
+    tsdb_t *db;
+    g_hold_kind = 1;
+    COSTED(open_ms, db = tsdb_open(cfg));
+    if (db == NULL) { CHECK(false, "convert: tsdb_open"); return; }
+    win_t w0 = check_window(db, 0, 0, cfg->max_records, o->interval);
+    CHECK(w0.ok, "adopted: exactly the %u records the 2.x release reads back (got %u, first bad at %u); "
+                 "open %.0f ms", g_ref_n, w0.n, w0.bad_at, open_ms);
+    static conv_run_t r;
+    memset(&r, 0, sizeof(r));
+    r.min_free = r.start_free = hfs_free_bytes();
+    g_hold_max[0] = g_hold_max[1] = 0;
+    uint32_t w = 0;
+    convert_drive(db, o, step_writes, cfg->max_records, &w, &r, true);
+    win_t w1 = check_window(db, w, w, cfg->max_records, o->interval);
+    char dd[96];
+    snprintf(dd, sizeof(dd), "%s", step_writes ? "with a record written every " : "no writes");
+    printf("  conversion of a %lld-byte 2.x file (%s%s%s): %u maintenance steps, %.0f ms in all by the cost "
+           "model; step mean %.0f ms, p95 %.0f ms, p99 %.0f ms, longest %.0f ms; longest lock hold: conversion steps %.0f ms, writes %.0f ms (a write "
+           "call incl. its step up to %.0f ms); free space %lld KB at start, min %lld KB\n",
+           (long long) len0, dd, step_writes ? "" : "", step_writes ? "n steps" : "", r.steps, r.step_ms_total,
+           r.step_ms_total / (r.steps ? r.steps : 1), pct(&r, 0.95), pct(&r, 0.99), r.step_ms_max, g_hold_max[0], g_hold_max[1], r.write_ms_max, (long long) r.start_free / 1024,
+           (long long) r.min_free / 1024);
+    CHECK(r.errors == 0 && legacy_len() < 0 && legacy_leftovers() == 0,
+          "converted: the 2.x file, its sidecars and the marker are gone (%u step errors)", r.errors);
+    CHECK(r.window_bad == 0 && w1.ok,
+          "after each of the %u cuts and at the end, a query returns exactly the 2.x history plus the %u new "
+          "records, newest %u (%u bad windows; final %u records)", r.cuts, w, cfg->max_records, r.window_bad, w1.n);
+    // The worst steps are littlefs root-directory compactions landing on the
+    // step's commit, as they land on plain writes (up to ~800 ms here, write
+    // and its step): bounded, rare; the 95th percentile is what readers see.
+    CHECK(g_hold_max[0] <= 800 && pct(&r, 0.95) <= 300,
+          "conversion steps hold the lock briefly: p95 %.0f ms (<= 300), longest %.0f ms (<= 800)", pct(&r, 0.95),
+          g_hold_max[0]);
+    CHECK(r.min_free >= (int64_t) o->min_free_kb * 1024, "min free space %lld KB (floor %u KB)",
+          (long long) r.min_free / 1024, o->min_free_kb);
+    hfs_remount();
+    db = tsdb_open(cfg);
+    win_t w2 = db ? check_window(db, w, w, cfg->max_records, o->interval) : (win_t){0};
+    CHECK(db && w2.ok, "after a reboot: the same %u records", w2.n);
+    if (db) tsdb_close_h(db);
+}
+
+// Power cut before each (or every stride-th) mutating operation of the
+// conversion, writes interleaved; after the reboot the window must be exact,
+// and finishing the conversion must leave it exact with nothing of the 2.x
+// file left.
+static void convert_crash_sweep(const char *dir, const opts_t *o, const tsdb_config_t *cfg, uint32_t step_writes,
+                                uint32_t stride) {
+    setup_legacy(dir, o);
+    tsdb_t *db = tsdb_open(cfg);
+    uint64_t m0 = hfs_mut_ops;
+    conv_run_t r = {0};
+    uint32_t w = 0;
+    convert_drive(db, o, step_writes, cfg->max_records, &w, &r, false);
+    uint32_t ops = (uint32_t) (hfs_mut_ops - m0);
+    tsdb_close_h(db);
+    uint32_t runs = 0, bad_after = 0, bad_final = 0, first_bad = UINT32_MAX, failed_open = 0;
+    for (uint32_t k = 0; k < ops; k += (k + stride < ops || k + 1 >= ops) ? stride : (ops - 1 - k)) {
+        runs++;
+        setup_legacy(dir, o);
+        db = tsdb_open(cfg);
+        conv_run_t rr = {0};
+        w = 0;
+        jmp_buf jb;
+        hfs_crash_jmp = &jb;
+        if (setjmp(jb) == 0) {
+            hfs_crash_after = k;
+            convert_drive(db, o, step_writes, cfg->max_records, &w, &rr, false);
+        }
+        hfs_crash_after = -1;
+        uint32_t w_alt = rr.in_write ? w + 1 : w;
+        hfs_remount();
+        db = tsdb_open(cfg);
+        if (db == NULL) { failed_open++; continue; }
+        win_t a = check_window(db, w, w_alt, cfg->max_records, o->interval);
+        if (!a.ok) {
+            bad_after++;
+            if (first_bad == UINT32_MAX) {
+                first_bad = k;
+                printf("    power cut before op %u: %u records after the reboot, want %u (first bad at %u)\n", k,
+                       a.n, a.want, a.bad_at);
+            }
+        }
+        uint32_t w_now = a.ok ? (a.n == check_window_w(db, w, cfg->max_records, o->interval).n && check_window_w(db, w, cfg->max_records, o->interval).ok ? w : w_alt) : w;
+        conv_run_t rf = {0};
+        convert_drive(db, o, 0, cfg->max_records, &w_now, &rf, false);
+        win_t b = check_window(db, w_now, w_now, cfg->max_records, o->interval);
+        if (!b.ok || legacy_len() >= 0 || legacy_leftovers() != 0) {
+            bad_final++;
+            if (first_bad == UINT32_MAX) {
+                first_bad = k;
+                printf("    power cut before op %u: after finishing, %u records want %u; 2.x file %lld B, %d leftovers\n",
+                       k, b.n, b.want, (long long) legacy_len(), legacy_leftovers());
+            }
+        }
+        tsdb_close_h(db);
+        if (stride == 0) break;
+    }
+    CHECK(bad_after == 0 && bad_final == 0 && failed_open == 0,
+          "power cut before %s%u of the conversion's %u mutating operations (fsync, truncate, unlink, create, "
+          "close; writes interleaved): every reboot reads exactly the history, and finishing leaves exactly it "
+          "with nothing of the 2.x file (%u bad after the reboot, %u after finishing, %u failed opens)",
+          stride > 1 ? "every n-th (n = " : "each ", stride > 1 ? stride : ops, ops, bad_after, bad_final, failed_open);
+    (void) runs;
+}
+
+// tsdb_close_h in the middle of a conversion (a firmware update, a reboot
+// command): closing commits whatever the converted segment being written
+// holds. Closing after every step in turn, then reopening and finishing,
+// must give the exact history every time.
+static void convert_close_midway(const char *dir, const opts_t *o, const tsdb_config_t *cfg, uint32_t stride) {
+    setup_legacy(dir, o);
+    tsdb_t *db = tsdb_open(cfg);
+    conv_run_t r = {0};
+    uint32_t w = 0;
+    convert_drive(db, o, 0, cfg->max_records, &w, &r, false);
+    uint32_t steps = r.steps;
+    tsdb_close_h(db);
+    uint32_t bad = 0, runs = 0;
+    for (uint32_t k = 1; k < steps; k += stride) {
+        runs++;
+        setup_legacy(dir, o);
+        db = tsdb_open(cfg);
+        bool more = true;
+        for (uint32_t i = 0; i < k && more; i++) tsdb_maintain_h(db, &more);
+        tsdb_close_h(db);
+        db = tsdb_open(cfg);
+        win_t a = db ? check_window(db, 0, 0, cfg->max_records, o->interval) : (win_t){0};
+        conv_run_t rf = {0};
+        uint32_t w0 = 0;
+        if (db) convert_drive(db, o, 0, cfg->max_records, &w0, &rf, false);
+        win_t b = db ? check_window(db, 0, 0, cfg->max_records, o->interval) : (win_t){0};
+        if (!a.ok || !b.ok || legacy_len() >= 0 || legacy_leftovers() != 0) {
+            if (bad == 0) printf("    closed after step %u: %u / %u records (want %u)\n", k, a.n, b.n, a.want);
+            bad++;
+        }
+        if (db) tsdb_close_h(db);
+    }
+    CHECK(bad == 0, "closed and reopened after %s%u of the %u conversion steps: the history is exact before and "
+                    "after finishing (%u bad)", stride > 1 ? "every " : "each ", stride > 1 ? stride : runs, steps, bad);
+}
+
+static int run_convert(const char *dir, const opts_t *o) {
+    expect_t e;
+    if (!read_expected(dir, &e) || !load_reference(dir)) { printf("cannot read %s/expected, records.bin\n", dir); return 1; }
+    tsdb_config_t cfg = fw_config(fw_max_records(o->fs_blocks * 4096));
+    printf("convert %s: 2.x reads back %u records %u..%u; max_records %u\n", dir, g_ref_n,
+           g_ref_n ? g_ref[0].ts : 0, g_ref_n ? g_ref[g_ref_n - 1].ts : 0, cfg.max_records);
+    CHECK(g_ref_n == e.n && g_ref[0].ts == e.first && g_ref[g_ref_n - 1].ts == e.last,
+          "reference list matches the generator (%u %u..%u)", e.n, e.first, e.last);
+    convert_full(dir, o, &e, &cfg, 0);
+    convert_full(dir, o, &e, &cfg, o->step_writes);
+    if (o->crash_stride) {
+        convert_crash_sweep(dir, o, &cfg, o->step_writes, o->crash_stride);
+        convert_close_midway(dir, o, &cfg, o->crash_stride);
+    }
+    return 0;
+}
+
 static int run_legacy(const char *dir, const opts_t *o) {
     expect_t e;
     if (!read_expected(dir, &e)) { printf("cannot read %s/expected\n", dir); return 1; }
@@ -1055,21 +1505,23 @@ static int run_legacy(const char *dir, const opts_t *o) {
     printf("legacy %s: %u records %u..%u, max_records %u\n", dir, e.n, e.first, e.last, cfg.max_records);
     legacy_clear_crash_sweep(dir, o, &e, &cfg);
     legacy_nomem(dir, o, &e, &cfg);
+    legacy_bad_header(dir, o, &e, &cfg);
     return 0;
 }
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: test_lfs_upgrade upgrade <legacy_dir> | legacy <legacy_dir> | fresh | faults [opts]\n");
+        fprintf(stderr, "usage: test_lfs_upgrade upgrade|legacy|convert <legacy_dir> | fresh | faults [opts]\n");
         return 2;
     }
     setvbuf(stdout, NULL, _IOLBF, 0);
-    opts_t o = {.fs_blocks = 864, .other_kb = 0, .interval = 300, .min_free_kb = 0, .writes = 0, .multiple = 2.2};
+    opts_t o = {.fs_blocks = 864, .other_kb = 0, .interval = 300, .min_free_kb = 0, .writes = 0, .multiple = 2.2,
+                .step_writes = 10, .crash_stride = 0};
     bool other_set = false, floor_set = false;
     const char *mode = argv[1];
     const char *dir = NULL;
     int i = 2;
-    if (strcmp(mode, "upgrade") == 0 || strcmp(mode, "legacy") == 0) {
+    if (strcmp(mode, "upgrade") == 0 || strcmp(mode, "legacy") == 0 || strcmp(mode, "convert") == 0) {
         if (argc < 3) return 2;
         dir = argv[2];
         i = 3;
@@ -1084,6 +1536,8 @@ int main(int argc, char **argv) {
         OPT("--interval", o.interval, (void) 0);
         OPT("--min-free-kb", o.min_free_kb, floor_set = true);
         OPT("--guard-kb", o.guard_kb, (void) 0);
+        OPT("--step-writes", o.step_writes, (void) 0);
+        OPT("--crash-stride", o.crash_stride, (void) 0);
 #undef OPT
         if (strcmp(a, "--multiple") == 0) { o.multiple = atof(v); i++; continue; }
         fprintf(stderr, "unknown option %s\n", a);
@@ -1099,6 +1553,7 @@ int main(int argc, char **argv) {
     int r;
     if (strcmp(mode, "upgrade") == 0) r = run_upgrade(dir, &o);
     else if (strcmp(mode, "legacy") == 0) r = run_legacy(dir, &o);
+    else if (strcmp(mode, "convert") == 0) r = run_convert(dir, &o);
     else if (strcmp(mode, "fresh") == 0) r = run_fresh(&o);
     else if (strcmp(mode, "faults") == 0) r = run_faults();
     else return 2;

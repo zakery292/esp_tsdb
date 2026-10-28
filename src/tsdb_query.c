@@ -60,19 +60,23 @@ static esp_err_t q_enter(tsdb_query_t *q, int i) {
     q->seg_rpb = seg->rpb;
     q->seg_np = seg->np;
     q->seg_data_offset = seg->data_offset;
-    q->seg_legacy = (seg->seq == 0);
+    q->seg_legacy = (seg->kind == TSDB_SEG_LEGACY);
+    q->seg_rank = seg->rank;
     q->needs_extras = false;
 
     // File handle: the legacy file and the active segment are read through
     // the handle's own FILE* (littlefs forbids a second handle on a file that
-    // is open for writing); frozen segments are opened read-only.
+    // is open for writing); frozen and converted segments are opened
+    // read-only. Nothing closes or truncates these while the query is open:
+    // it holds the lock, and its own task's writes and maintenance steps are
+    // refused until it closes.
     if (q->seg_legacy) {
         q->seg_file = db->legacy ? db->legacy->file : NULL;
-    } else if (i == db->nsegs - 1 && db->active != NULL) {
+    } else if (i == db->nsegs - 1 && seg->kind == TSDB_SEG_NORMAL && db->active != NULL) {
         q->seg_file = db->active;
     } else {
         char path[160];
-        tsdb_seg_path(db, seg->seq, path, sizeof(path));
+        tsdb_entry_path(db, seg, path, sizeof(path));
         q->seg_file = fopen(path, "rb");
         q->owns_file = (q->seg_file != NULL);
     }
@@ -83,7 +87,7 @@ static esp_err_t q_enter(tsdb_query_t *q, int i) {
     }
 
     // Column map: identity when the segment has the current schema.
-    q->seg_identity = (!q->seg_legacy && seg->schema_gen == db->schema.gen &&
+    q->seg_identity = (seg->kind == TSDB_SEG_NORMAL && seg->schema_gen == db->schema.gen &&
                        seg->np == db->schema.count);
     if (q->seg_identity) {
         for (uint8_t r = 0; r < q->num_params_to_fetch; r++) {
@@ -132,7 +136,7 @@ static esp_err_t q_enter_pos(tsdb_query_t *q, uint32_t pos) {
 // Locate physical record `phys` of the current segment: block + offset.
 static inline void q_locate(const tsdb_query_t *q, uint32_t phys, uint32_t *block, uint16_t *off) {
     if (q->seg_legacy) {
-        tsdb_legacy_locate(q->db->legacy, phys, block, off);
+        tsdb_legacy_locate(q->db->legacy, q->seg_rank + phys, block, off);
     } else {
         *block = phys / q->seg_rpb;
         *off = (uint16_t)(phys % q->seg_rpb);
@@ -143,8 +147,7 @@ static esp_err_t q_load(tsdb_query_t *q, uint32_t block) {
     if (q->block_loaded && q->cur_block == block) return ESP_OK;
     esp_err_t ret;
     if (q->seg_legacy) {
-        fseek(q->seg_file, tsdb_legacy_block_offset(q->db->legacy, block), SEEK_SET);
-        ret = fread(q->block_buffer, TSDB_BLOCK_SIZE, 1, q->seg_file) == 1 ? ESP_OK : ESP_ERR_NOT_FOUND;
+        ret = tsdb_legacy_read_block(q->db->legacy, block, q->block_buffer);
     } else {
         ret = tsdb_seg_read_block(q->seg_file, q->seg_data_offset, block, q->block_buffer);
     }
@@ -170,12 +173,12 @@ static uint32_t q_run(const tsdb_query_t *q, uint32_t pos) {
     uint32_t phys = (uint32_t)(pos - q->seg_start);
     uint32_t run;
     if (q->seg_legacy) {
-        run = tsdb_legacy_run(q->db->legacy, phys);
+        run = tsdb_legacy_run(q->db->legacy, q->seg_rank + phys);
     } else {
         run = q->seg_rpb - (phys % q->seg_rpb);
-        uint32_t left = q->seg_records - phys;
-        if (run > left) run = left;
     }
+    uint32_t left = q->seg_records - phys;
+    if (run > left) run = left;
     uint32_t left_total = q->total - pos;
     return run < left_total ? run : left_total;
 }
@@ -186,7 +189,7 @@ static void q_emit(tsdb_query_t *q, uint32_t phys, uint16_t off, int16_t *values
     uint8_t legacy_np = 0;
     if (q->needs_extras) {
         legacy_np = q->db->legacy->header.num_params;
-        tsdb_legacy_read_extras(q->db->legacy, phys, extras);
+        tsdb_legacy_read_extras(q->db->legacy, q->seg_rank + phys, extras);
     }
     for (uint8_t r = 0; r < q->num_params_to_fetch; r++) {
         int8_t c = q->col_map[r];

@@ -20,7 +20,7 @@ OUT=${OUT:-test_lfs_cost}
 # 3.x source set, or the 2.x one when TSDB_SRC points at an older release.
 SRCS=""
 for f in tsdb_core.c tsdb_write.c tsdb_query.c tsdb_buffer.c \
-         tsdb_legacy.c tsdb_segment.c tsdb_index.c tsdb_migrate.c; do
+         tsdb_legacy.c tsdb_segment.c tsdb_convert.c tsdb_index.c tsdb_migrate.c; do
   [ -f "$TSDB_SRC/$f" ] && SRCS="$SRCS $TSDB_SRC/$f"
 done
 mkdir -p .lfs_build

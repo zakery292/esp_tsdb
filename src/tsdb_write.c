@@ -5,6 +5,7 @@
 
 #include "tsdb_internal.h"
 #include "esp_log.h"
+#include "freertos/task.h"
 #include <unistd.h>
 #include <errno.h>
 
@@ -66,11 +67,10 @@ esp_err_t tsdb_write_cache_flush(tsdb_t *db) {
  */
 static bool make_room(tsdb_t *db, uint32_t room, const char *why) {
     uint32_t before = db->total_physical;
-    if (db->nsegs > 0 && db->segs[0].seq == 0) {
-        ESP_LOGE(TAG, "%s: evicting the adopted pre-3.0 database file (%lu records) to make room",
-                 why, (unsigned long) db->segs[0].records);
+    if (db->nsegs > 0 && db->segs[0].kind == TSDB_SEG_LEGACY) {
+        ESP_LOGE(TAG, "%s: removing the adopted pre-3.0 database file to make room", why);
     }
-    if (!tsdb_evict_oldest(db)) {
+    if (!tsdb_evict_oldest(db, true)) {
         ESP_LOGW(TAG, "%s and nothing left to evict", why);
         return false;
     }
@@ -103,7 +103,7 @@ static bool below_reserve(tsdb_t *db) {
  */
 static esp_err_t ensure_active(tsdb_t *db, uint32_t ts) {
     const tsdb_seg_t *a = db->nsegs ? &db->segs[db->nsegs - 1] : NULL;
-    bool usable = db->active != NULL && a != NULL && a->seq != 0 &&
+    bool usable = db->active != NULL && a != NULL && a->kind == TSDB_SEG_NORMAL &&
                   a->schema_gen == db->schema.gen &&
                   a->records < a->blocks_cap * (uint32_t) a->rpb;
     if (usable) return ESP_OK;
@@ -233,6 +233,20 @@ static esp_err_t tsdb_write_locked(tsdb_t *db, uint32_t timestamp, const int16_t
 // Public
 // ---------------------------------------------------------------------------
 
+// While a pre-3.0 file is being converted (or awaits a retried adoption),
+// every write also does one bounded step of it, so the conversion completes
+// without the application calling tsdb_maintain(). The step takes the lock
+// separately: a reader that queued behind the write gets it first (a mutex
+// handed back does not preempt an equal-priority waiter by itself, hence the
+// yield).
+static void maintenance_after_write(tsdb_t *db) {
+    taskYIELD();
+    esp_err_t r = tsdb_maintain_h(db, NULL);
+    if (r != ESP_OK && r != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "Maintenance step after a write: %d (retried at the next one)", r);
+    }
+}
+
 esp_err_t tsdb_write_h(tsdb_t *db, uint32_t timestamp, const int16_t *values) {
     if (db == NULL || !db->is_open) {
         ESP_LOGE(TAG, "Not initialized");
@@ -244,7 +258,9 @@ esp_err_t tsdb_write_h(tsdb_t *db, uint32_t timestamp, const int16_t *values) {
     TSDB_LOCK_OPEN_OR_RETURN(db, 5000, ESP_ERR_TIMEOUT);
     if (tsdb_refuse_if_query_open(db, __func__)) return ESP_ERR_INVALID_STATE;
     esp_err_t ret = tsdb_write_locked(db, timestamp, values, false);
+    bool maintain = tsdb_conv_pending(db);
     tsdb_unlock(db);
+    if (maintain) maintenance_after_write(db);
     return ret;
 }
 
@@ -308,7 +324,9 @@ esp_err_t tsdb_write_batch_h(tsdb_t *db, const uint32_t *timestamps,
         tsdb_apply_capacity(db);
     }
 
+    bool maintain = tsdb_conv_pending(db);
     tsdb_unlock(db);
+    if (maintain) maintenance_after_write(db);
     if (ret == ESP_OK) ESP_LOGI(TAG, "Batch write complete: %lu records", (unsigned long) done);
     return ret;
 }
