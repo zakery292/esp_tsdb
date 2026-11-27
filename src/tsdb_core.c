@@ -84,8 +84,12 @@ static bool tsdb_header_is_sane(const tsdb_header_t *h) {
     // max_records: cap at 100M (more than enough for years of 5min data)
     if (h->max_records > 100000000UL) return false;
 
-    // total_records can't exceed max_records (when set)
-    if (h->max_records > 0 && h->total_records > h->max_records * 2) return false;
+    // total_records is a lifetime counter, so any value is valid; the ring
+    // cursors are what max_records bounds (when set)
+    if (h->max_records > 0) {
+        if (h->oldest_record_idx >= h->max_records) return false;
+        if (h->newest_record_idx >= h->max_records) return false;
+    }
 
     // overflow record size, when overflow is enabled, must be plausible
     if (h->extra_param_count > 0) {
@@ -618,19 +622,26 @@ static esp_err_t tsdb_reconstruct_header(FILE *file, tsdb_header_t *header,
     }
 
     // Populate reconstructed header
-    header->total_records = total_records;
     header->oldest_record_idx = oldest_idx;
     header->newest_record_idx = newest_idx;
     header->oldest_timestamp = oldest_ts;
     header->newest_timestamp = newest_ts;
-    header->total_writes = total_records;  // Best guess
 
-    // Estimate evictions (if total records > max, we've wrapped around)
-    if (total_records > config->max_records) {
-        header->total_evictions = total_records - config->max_records;
+    if (header->max_records > 0 && total_records >= header->max_records) {
+        // Full ring: the write path takes the next slot from the lifetime
+        // counter, so derive one that points just past the newest record.
+        // The modulo keeps the cursors in range if the file holds more slots
+        // than the configured capacity.
+        uint32_t next_slot = (newest_idx + 1) % header->max_records;
+        header->total_records = header->max_records + next_slot;
+        header->oldest_record_idx = next_slot;
+        header->newest_record_idx = newest_idx % header->max_records;
+        header->total_evictions = next_slot;  // Best guess
     } else {
+        header->total_records = total_records;
         header->total_evictions = 0;
     }
+    header->total_writes = header->total_records;  // Best guess
 
     ESP_LOGW(TAG, "Header reconstructed: %lu records (%lu to %lu), %lu evictions",
              (unsigned long)total_records,
